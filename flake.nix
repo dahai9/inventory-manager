@@ -58,7 +58,7 @@
           version = "0.2.0";
           src = ./.;
 
-          # 自动管理 Cargo.lock
+          # 指向相对于 src 根目录的 Cargo.lock
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
 
           inherit nativeBuildInputs;
@@ -71,7 +71,7 @@
             npm run build
           '';
 
-          # 指定 Rust 代码所在的子目录
+          # 指定 Rust 代码所在的子目录 (相对于 src)
           buildAndTestSubdir = "src-tauri";
 
           postInstall = ''
