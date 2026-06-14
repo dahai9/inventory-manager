@@ -61,6 +61,11 @@
           # 指向相对于 src 根目录的 Cargo.lock
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
 
+          # Nix 要求在 src 根目录下看到 Cargo.lock 才能进行校验
+          prePatch = ''
+            ln -s src-tauri/Cargo.lock Cargo.lock
+          '';
+
           inherit nativeBuildInputs;
           buildInputs = libraries;
 
