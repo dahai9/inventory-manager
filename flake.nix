@@ -25,10 +25,10 @@
           librsvg
           libsoup_3
           libayatana-appindicator
+          alsa-lib
         ];
 
         packages = with pkgs; [
-          pkg-config
           dbus
           openssl
           glib
@@ -36,14 +36,18 @@
           libsoup_3
           webkitgtk_4_1
           librsvg
-          nodejs
-          (rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" ];
-          })
+          alsa-lib
         ];
       in
       {
         devShells.default = pkgs.mkShell {
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            (rust-bin.stable.latest.default.override {
+              extensions = [ "rust-src" "rust-analyzer" ];
+            })
+            nodejs
+          ];
           buildInputs = packages;
 
           shellHook = ''

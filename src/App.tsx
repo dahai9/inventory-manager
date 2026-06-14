@@ -33,14 +33,31 @@ function App() {
   const [retCol, setRetCol] = useState("");
   const [custCol, setCustCol] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [ignoreChars, setIgnoreChars] = useState<string>(() => {
+    return localStorage.getItem("ignoreChars") || "-, ";
+  });
 
   const barcodeRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    localStorage.setItem("ignoreChars", ignoreChars);
+  }, [ignoreChars]);
+
+  async function playAlertSound() {
+    try {
+      await invoke("play_beep");
+    } catch (e) {
+      console.error("Failed to play alert sound via backend", e);
+    }
+  }
 
   useEffect(() => {
     updateSummary();
     
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      // 捕获 Ctrl+S 或 Cmd+S，不区分大小写
+      if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
         handleQuickSave();
       }
@@ -82,6 +99,17 @@ function App() {
   async function handleScan(e: React.FormEvent) {
     e.preventDefault();
     if (!barcode) return;
+
+    // 校验是否包含忽略字符
+    const charsToIgnore = ignoreChars.split(",").map(c => c === " " ? " " : c.trim()).filter(c => c !== "");
+    const shouldIgnore = charsToIgnore.some(c => barcode.includes(c));
+
+    if (shouldIgnore) {
+      addLog(`检测到型号/非法字符，已忽略条码: ${barcode}`, "error");
+      await playAlertSound();
+      setBarcode("");
+      return;
+    }
 
     if (batchBarcodes.includes(barcode)) {
       addLog(`条码 ${barcode} 在当前批次中已存在`, "error");
@@ -188,11 +216,12 @@ function App() {
     try {
       const path = await save({
         filters: [{ name: "Excel", extensions: ["xlsx"] }],
-        defaultPath: "inventory_export.xlsx"
+        defaultPath: importPath || "inventory_export.xlsx"
       });
       if (path) {
         await invoke("export_data", { path });
         addLog("导出成功: " + path, "success");
+        setImportPath(path); // 更新当前路径，下次 Ctrl+S 即可自动保存
       }
     } catch (err) {
       addLog("导出失败: " + err, "error");
@@ -208,6 +237,7 @@ function App() {
       <div className="secondary-actions">
         <button onClick={handleImport}>导入数据</button>
         <button onClick={handleExport}>导出数据</button>
+        <button className="settings-btn" onClick={() => setShowSettings(true)}>设置</button>
       </div>
     </div>
   );
@@ -335,6 +365,28 @@ function App() {
             <div className="modal-buttons">
               <button onClick={confirmImport}>确认导入</button>
               <button onClick={() => setShowImportDialog(false)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>系统设置</h2>
+            <div className="modal-row">
+              <label>忽略字符 (逗号分隔):</label>
+              <input 
+                type="text" 
+                value={ignoreChars} 
+                onChange={(e) => setIgnoreChars(e.target.value)}
+                placeholder="例如: -,  "
+              />
+              <p className="hint">扫码时如果条码包含这些字符，将被视为型号并忽略，同时发出提示音。空格请直接输入（例如：<code>-, </code> 表示忽略减号和空格）。</p>
+            </div>
+            <div className="modal-buttons">
+              <button className="secondary" onClick={playAlertSound}>测试声音</button>
+              <button onClick={() => setShowSettings(false)}>关闭</button>
             </div>
           </div>
         </div>

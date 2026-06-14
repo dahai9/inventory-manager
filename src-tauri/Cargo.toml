@@ -27,4 +27,5 @@ rust_xlsxwriter = "0.95.0"
 anyhow = "1.0.102"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
+rodio = { version = "0.22.2", features = ["playback"] }
 
