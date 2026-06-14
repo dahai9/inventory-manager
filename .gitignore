@@ -103,7 +103,6 @@ dist
 
 # Rust
 /src-tauri/target
-Cargo.lock
 
 # Nix
 .direnv/
