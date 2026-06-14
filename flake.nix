@@ -72,7 +72,13 @@
           # 构建前端流程
           preBuild = ''
             export HOME=$(mktemp -d)
-            npm install
+            # 在 Nix 沙箱中，npm 需要一个可写的缓存目录
+            export npm_config_cache=$(mktemp -d)
+            # 如果没有网络，npm install 会失败。但在本地运行 nix run . 时
+            # 如果您之前运行过 npm install，某些环境可能会保留 node_modules
+            if [ ! -d "node_modules" ]; then
+              npm install --no-audit --no-fund
+            fi
             npm run build
           '';
 
