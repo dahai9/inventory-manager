@@ -39,6 +39,25 @@
             extensions = [ "rust-src" "rust-analyzer" ];
           })
         ];
+
+        # 1. 前端构建阶段
+        frontend = pkgs.buildNpmPackage {
+          pname = "inventory-manager-frontend";
+          version = "0.2.0";
+          src = ./.;
+          
+          # 这个 hash 是关键，它锁定了 npm 依赖
+          # 第一次构建会报错并给出正确的 hash，我们需要填入它
+          npmDepsHash = "sha256-rWAb/dyFjaFa8okKwa99jWFgvxhYW1s2YwNHRcmRp6o=";
+          
+          # 仅构建前端，跳过一些不必要的检查
+          dontNpmBuild = false;
+          
+          installPhase = ''
+            mkdir -p $out
+            cp -r dist/* $out/
+          '';
+        };
       in
       {
         # 开发环境 (nix develop)
@@ -52,41 +71,25 @@
           '';
         };
 
-        # 软件包定义 (nix build / nix run)
+        # 2. 最终软件包定义 (后端构建)
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "inventory-manager";
           version = "0.2.0";
           src = ./.;
 
-          # 指向相对于 src 根目录的 Cargo.lock
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
-
-          # Nix 要求在 src 根目录下看到 Cargo.lock 才能进行校验
-          prePatch = ''
-            ln -s src-tauri/Cargo.lock Cargo.lock
-          '';
 
           inherit nativeBuildInputs;
           buildInputs = libraries;
 
-          # 构建前端流程
+          # 将前端阶段生成的 dist 拷贝进来
           preBuild = ''
-            export HOME=$(mktemp -d)
-            # 在 Nix 沙箱中，npm 需要一个可写的缓存目录
-            export npm_config_cache=$(mktemp -d)
-            # 如果没有网络，npm install 会失败。但在本地运行 nix run . 时
-            # 如果您之前运行过 npm install，某些环境可能会保留 node_modules
-            if [ ! -d "node_modules" ]; then
-              npm install --no-audit --no-fund
-            fi
-            npm run build
+            cp -r ${frontend} dist
           '';
 
-          # 指定 Rust 代码所在的子目录 (相对于 src)
           buildAndTestSubdir = "src-tauri";
 
           postInstall = ''
-            # 确保二进制文件在运行时能找到必要的库 (针对 NixOS 非 FHS 环境)
             wrapProgram $out/bin/inventory-manager \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath libraries}"
           '';
