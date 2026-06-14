@@ -106,7 +106,6 @@ dist
 
 # Nix
 .direnv/
-flake.lock
 
 # macOS
 .DS_Store
