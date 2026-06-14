@@ -77,6 +77,7 @@
           version = "0.2.0";
           src = ./.;
 
+          cargoRoot = "src-tauri";
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
 
           inherit nativeBuildInputs;
@@ -86,6 +87,10 @@
           preBuild = ''
             cp -r ${frontend} dist
           '';
+
+          cargoBuildFlags = [
+            "--features=tauri/custom-protocol"
+          ];
 
           buildAndTestSubdir = "src-tauri";
 
