@@ -257,6 +257,68 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+async fn export_recipient_list(state: tauri::State<'_, AppState>, path: String, column: String) -> Result<(), String> {
+    let data = state.data.lock().unwrap();
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    let red_format = Format::new().set_font_color(Color::Red);
+
+    match column.as_str() {
+        "shipment_barcode" => {
+            worksheet.write(0, 0, "出货条码").map_err(|e| e.to_string())?;
+            worksheet.set_column_width(0, 30).map_err(|e| e.to_string())?;
+
+            let mut active_rows = Vec::new();
+            let mut returned_rows = Vec::new();
+            for barcode in data.shipments.keys() {
+                if data.returns.contains(barcode) {
+                    returned_rows.push(barcode);
+                } else {
+                    active_rows.push(barcode);
+                }
+            }
+            active_rows.sort();
+            returned_rows.sort();
+
+            let mut row_idx = 1;
+            for barcode in active_rows {
+                worksheet.write(row_idx, 0, barcode).map_err(|e| e.to_string())?;
+                row_idx += 1;
+            }
+            for barcode in returned_rows {
+                worksheet.write_with_format(row_idx, 0, barcode, &red_format).map_err(|e| e.to_string())?;
+                row_idx += 1;
+            }
+        }
+        "customer" => {
+            worksheet.write(0, 0, "客户").map_err(|e| e.to_string())?;
+            worksheet.set_column_width(0, 20).map_err(|e| e.to_string())?;
+
+            let mut rows: Vec<_> = data.shipments.values().collect();
+            rows.sort();
+            rows.dedup();
+            for (i, customer) in rows.into_iter().enumerate() {
+                worksheet.write((i + 1) as u32, 0, customer).map_err(|e| e.to_string())?;
+            }
+        }
+        "return_barcode" => {
+            worksheet.write(0, 0, "退货条码").map_err(|e| e.to_string())?;
+            worksheet.set_column_width(0, 30).map_err(|e| e.to_string())?;
+
+            let mut rows: Vec<_> = data.returns.iter().collect();
+            rows.sort();
+            for (i, barcode) in rows.into_iter().enumerate() {
+                worksheet.write((i + 1) as u32, 0, barcode).map_err(|e| e.to_string())?;
+            }
+        }
+        _ => return Err("未知的导出列".into()),
+    }
+
+    workbook.save(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mixer_handle = DeviceSinkBuilder::open_default_sink().ok();
@@ -296,6 +358,7 @@ pub fn run() {
             get_excel_columns,
             import_data,
             export_data,
+            export_recipient_list,
             play_beep
         ])
         .run(tauri::generate_context!())

@@ -43,12 +43,12 @@
         # 1. 前端构建阶段
         frontend = pkgs.buildNpmPackage {
           pname = "inventory-manager-frontend";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
           
           # 这个 hash 是关键，它锁定了 npm 依赖
           # 第一次构建会报错并给出正确的 hash，我们需要填入它
-          npmDepsHash = "sha256-rWAb/dyFjaFa8okKwa99jWFgvxhYW1s2YwNHRcmRp6o=";
+          npmDepsHash = "sha256-ZbtgntidIZ+kl0ZZemQorWDK/9aTrQpTuYXXBBoRGY0=";
           
           # 仅构建前端，跳过一些不必要的检查
           dontNpmBuild = false;
@@ -74,7 +74,7 @@
         # 2. 最终软件包定义 (后端构建)
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "inventory-manager";
-          version = "0.2.0";
+          version = "0.2.1";
           src = ./.;
 
           cargoRoot = "src-tauri";

@@ -5,6 +5,13 @@ import "./App.css";
 
 type View = "home" | "shipment_setup" | "recording";
 type Mode = "shipment" | "return";
+type RecipientListColumn = "shipment_barcode" | "customer" | "return_barcode";
+
+const recipientListColumns: { value: RecipientListColumn; label: string }[] = [
+  { value: "shipment_barcode", label: "出货条码" },
+  { value: "customer", label: "客户名称" },
+  { value: "return_barcode", label: "退货条码" },
+];
 
 interface CustomerStat {
   name: string;
@@ -33,6 +40,8 @@ function App() {
   const [retCol, setRetCol] = useState("");
   const [custCol, setCustCol] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [showRecipientListDialog, setShowRecipientListDialog] = useState(false);
+  const [recipientListColumn, setRecipientListColumn] = useState<RecipientListColumn>("shipment_barcode");
   const [showSettings, setShowSettings] = useState(false);
   const [ignoreChars, setIgnoreChars] = useState<string>(() => {
     return localStorage.getItem("ignoreChars") || "-, ";
@@ -228,6 +237,39 @@ function App() {
     }
   }
 
+  function getRecipientListDefaultPath() {
+    if (!importPath) return "inventory_export出货.xlsx";
+
+    const separatorIndex = Math.max(importPath.lastIndexOf("/"), importPath.lastIndexOf("\\"));
+    const directory = separatorIndex >= 0 ? importPath.slice(0, separatorIndex + 1) : "";
+    const filename = separatorIndex >= 0 ? importPath.slice(separatorIndex + 1) : importPath;
+    const extensionIndex = filename.toLowerCase().endsWith(".xlsx") ? filename.length - 5 : filename.lastIndexOf(".");
+
+    if (extensionIndex > 0) {
+      const basename = filename.slice(0, extensionIndex);
+      const extension = filename.slice(extensionIndex);
+      return `${directory}${basename.endsWith("出货") ? basename : `${basename}出货`}${extension}`;
+    }
+
+    return `${directory}${filename.endsWith("出货") ? filename : `${filename}出货`}.xlsx`;
+  }
+
+  async function confirmRecipientListExport() {
+    try {
+      const path = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: getRecipientListDefaultPath()
+      });
+      if (path) {
+        await invoke("export_recipient_list", { path, column: recipientListColumn });
+        addLog("收货清单导出成功: " + path, "success");
+        setShowRecipientListDialog(false);
+      }
+    } catch (err) {
+      addLog("收货清单导出失败: " + err, "error");
+    }
+  }
+
   const renderHome = () => (
     <div className="home-view">
       <div className="main-actions">
@@ -237,6 +279,7 @@ function App() {
       <div className="secondary-actions">
         <button onClick={handleImport}>导入数据</button>
         <button onClick={handleExport}>导出数据</button>
+        <button onClick={() => setShowRecipientListDialog(true)}>导出收货清单</button>
         <button className="settings-btn" onClick={() => setShowSettings(true)}>设置</button>
       </div>
     </div>
@@ -365,6 +408,28 @@ function App() {
             <div className="modal-buttons">
               <button onClick={confirmImport}>确认导入</button>
               <button onClick={() => setShowImportDialog(false)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRecipientListDialog && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>导出收货清单</h2>
+            <div className="modal-row">
+              <label>选择导出列:</label>
+              <select
+                value={recipientListColumn}
+                onChange={(e) => setRecipientListColumn(e.target.value as RecipientListColumn)}
+              >
+                {recipientListColumns.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
+              </select>
+              <p className="hint">用于发送给收货人的单列清单，默认文件名会追加“出货”。</p>
+            </div>
+            <div className="modal-buttons">
+              <button onClick={confirmRecipientListExport}>确认导出</button>
+              <button onClick={() => setShowRecipientListDialog(false)}>取消</button>
             </div>
           </div>
         </div>
