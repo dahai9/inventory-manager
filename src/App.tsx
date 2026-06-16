@@ -7,6 +7,8 @@ type View = "home" | "shipment_setup" | "recording";
 type Mode = "shipment" | "return";
 type RecipientListColumn = "shipment_barcode" | "customer" | "return_barcode";
 
+const CUSTOMER_STATEMENT_SUFFIX = "出退货清单";
+
 const recipientListColumns: { value: RecipientListColumn; label: string }[] = [
   { value: "shipment_barcode", label: "出货条码" },
   { value: "customer", label: "客户名称" },
@@ -31,14 +33,19 @@ function App() {
   const [customer, setCustomer] = useState("");
   const [barcode, setBarcode] = useState("");
   const [batchBarcodes, setBatchBarcodes] = useState<string[]>([]);
+  const [returnOwnerNotice, setReturnOwnerNotice] = useState<{ barcode: string; customer: string } | null>(null);
   const [log, setLog] = useState<{msg: string, type: 'success' | 'error'}[]>([]);
   const [summary, setSummary] = useState<Summary>({ total_shipments: 0, total_returns: 0, customer_stats: [] });
+  const [selectedCustomerNames, setSelectedCustomerNames] = useState<string[]>([]);
+  const [statementUnitPrice, setStatementUnitPrice] = useState("0");
   
   const [importPath, setImportPath] = useState<string | null>(null);
   const [columns, setColumns] = useState<string[]>([]);
   const [shipCol, setShipCol] = useState("");
   const [retCol, setRetCol] = useState("");
   const [custCol, setCustCol] = useState("");
+  const [showNewTableDialog, setShowNewTableDialog] = useState(false);
+  const [newTableName, setNewTableName] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [showRecipientListDialog, setShowRecipientListDialog] = useState(false);
   const [recipientListColumn, setRecipientListColumn] = useState<RecipientListColumn>("shipment_barcode");
@@ -96,6 +103,12 @@ function App() {
     }
   }, [view]);
 
+  useEffect(() => {
+    setSelectedCustomerNames(prev =>
+      prev.filter(name => summary.customer_stats.some(stat => stat.name === name))
+    );
+  }, [summary.customer_stats]);
+
   async function updateSummary() {
     const s = await invoke<Summary>("get_summary");
     setSummary(s);
@@ -115,6 +128,7 @@ function App() {
 
     if (shouldIgnore) {
       addLog(`检测到型号/非法字符，已忽略条码: ${barcode}`, "error");
+      setReturnOwnerNotice(null);
       await playAlertSound();
       setBarcode("");
       return;
@@ -122,17 +136,26 @@ function App() {
 
     if (batchBarcodes.includes(barcode)) {
       addLog(`条码 ${barcode} 在当前批次中已存在`, "error");
+      setReturnOwnerNotice(null);
       setBarcode("");
       return;
     }
 
     try {
-      await invoke(mode === "shipment" ? "check_shipment" : "check_return", { barcode });
+      if (mode === "shipment") {
+        await invoke("check_shipment", { barcode });
+        addLog(`已扫描: ${barcode}`, "success");
+        setReturnOwnerNotice(null);
+      } else {
+        const owner = await invoke<string>("check_return", { barcode });
+        addLog(`已扫描退货: ${barcode}，客户: ${owner}`, "success");
+        setReturnOwnerNotice({ barcode, customer: owner });
+      }
       setBatchBarcodes(prev => [barcode, ...prev]);
-      addLog(`已扫描: ${barcode}`, "success");
     } catch (err) {
       const errMsg = String(err);
       addLog(errMsg, "error");
+      setReturnOwnerNotice(null);
       if (mode === "return" && errMsg.includes("不是我们的货")) {
         await message(errMsg, { title: "扫码错误", kind: "error" });
       }
@@ -144,6 +167,7 @@ function App() {
 
   async function finishBatch() {
     if (batchBarcodes.length === 0) {
+      setReturnOwnerNotice(null);
       setView("home");
       return;
     }
@@ -158,11 +182,25 @@ function App() {
       );
       addLog(msg, "success");
       setBatchBarcodes([]);
+      setReturnOwnerNotice(null);
       updateSummary();
       setView("home");
     } catch (err) {
       addLog("录入失败: " + err, "error");
     }
+  }
+
+  function confirmDeleteBatchBarcode(targetBarcode: string, targetIndex: number) {
+    const confirmed = window.confirm(`确定从当前批次删除编码 ${targetBarcode} 吗？`);
+    if (!confirmed) {
+      barcodeRef.current?.focus();
+      return;
+    }
+
+    setBatchBarcodes(prev => prev.filter((_, index) => index !== targetIndex));
+    setReturnOwnerNotice(prev => prev?.barcode === targetBarcode ? null : prev);
+    addLog(`已删除当前批次编码: ${targetBarcode}`, "success");
+    barcodeRef.current?.focus();
   }
 
   async function handleImport() {
@@ -237,6 +275,87 @@ function App() {
     }
   }
 
+  async function saveCurrentDataBeforeNewTable() {
+    const hasUnsavedChanges = await invoke<boolean>("has_unsaved_changes");
+    if (!hasUnsavedChanges) return true;
+
+    const confirmed = window.confirm("当前存在尚未保存的数据，必须先保存后才能新建表格。现在保存吗？");
+    if (!confirmed) return false;
+
+    try {
+      if (importPath) {
+        await invoke("export_data", { path: importPath });
+        addLog("新建前已保存当前表格: " + importPath, "success");
+        return true;
+      }
+
+      const path = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: "inventory_export.xlsx"
+      });
+      if (!path) return false;
+
+      await invoke("export_data", { path });
+      setImportPath(path);
+      addLog("新建前已保存当前表格: " + path, "success");
+      return true;
+    } catch (err) {
+      addLog("新建前保存失败: " + err, "error");
+      return false;
+    }
+  }
+
+  async function handleNewTable() {
+    if (batchBarcodes.length > 0) {
+      const confirmed = window.confirm(`当前批次还有 ${batchBarcodes.length} 个编码未完成录入。请先完成录入并保存后再新建表格，是否现在完成录入？`);
+      if (confirmed) {
+        await finishBatch();
+      }
+      return;
+    }
+
+    const defaultName = splitCurrentPath().basename === "inventory_export" ? "" : splitCurrentPath().basename;
+    setNewTableName(defaultName);
+    setShowNewTableDialog(true);
+  }
+
+  async function confirmNewTable() {
+    const trimmedName = newTableName.trim();
+    if (!trimmedName) {
+      addLog("请输入新表格名称", "error");
+      return;
+    }
+
+    const saved = await saveCurrentDataBeforeNewTable();
+    if (!saved) return;
+
+    try {
+      const path = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: `${sanitizeFilenameSegment(trimmedName)}.xlsx`
+      });
+      if (!path) return;
+
+      await invoke("create_new_workbook", { path, tableName: trimmedName });
+      setImportPath(path);
+      setColumns(["出货条码", "客户", "退货条码"]);
+      setShipCol("出货条码");
+      setCustCol("客户");
+      setRetCol("退货条码");
+      setBatchBarcodes([]);
+      setSelectedCustomerNames([]);
+      setReturnOwnerNotice(null);
+      setCustomer("");
+      setBarcode("");
+      setView("home");
+      setShowNewTableDialog(false);
+      await updateSummary();
+      addLog("已新建表格: " + path, "success");
+    } catch (err) {
+      addLog("新建表格失败: " + err, "error");
+    }
+  }
+
   function getRecipientListDefaultPath() {
     if (!importPath) return "inventory_export出货.xlsx";
 
@@ -270,13 +389,108 @@ function App() {
     }
   }
 
+  function splitCurrentPath() {
+    if (!importPath) {
+      return { directory: "", basename: "inventory_export" };
+    }
+
+    const separatorIndex = Math.max(importPath.lastIndexOf("/"), importPath.lastIndexOf("\\"));
+    const directory = separatorIndex >= 0 ? importPath.slice(0, separatorIndex + 1) : "";
+    const filename = separatorIndex >= 0 ? importPath.slice(separatorIndex + 1) : importPath;
+    const extensionIndex = filename.toLowerCase().endsWith(".xlsx") ? filename.length - 5 : filename.lastIndexOf(".");
+    const basename = extensionIndex > 0 ? filename.slice(0, extensionIndex) : filename;
+
+    return { directory, basename: basename || "inventory_export" };
+  }
+
+  function sanitizeFilenameSegment(segment: string) {
+    const sanitized = segment.replace(/[\\/:*?"<>|\x00-\x1F]/g, "_").trim().replace(/^\.+|\.+$/g, "");
+    return sanitized || "未命名";
+  }
+
+  function getStatementDefaultPath(customerName: string) {
+    const { directory, basename } = splitCurrentPath();
+    return `${directory}${sanitizeFilenameSegment(basename)}_${sanitizeFilenameSegment(customerName)}_${CUSTOMER_STATEMENT_SUFFIX}.xlsx`;
+  }
+
+  function getStatementUnitPrice() {
+    const unitPrice = Number(statementUnitPrice);
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+      throw new Error("请输入有效的单价");
+    }
+    return unitPrice;
+  }
+
+  function toggleCustomerSelection(customerName: string, checked: boolean) {
+    setSelectedCustomerNames(prev => {
+      if (checked) {
+        return prev.includes(customerName) ? prev : [...prev, customerName];
+      }
+      return prev.filter(name => name !== customerName);
+    });
+  }
+
+  function toggleAllCustomers(checked: boolean) {
+    setSelectedCustomerNames(checked ? summary.customer_stats.map(stat => stat.name) : []);
+  }
+
+  async function exportCustomerStatement(customerName: string) {
+    try {
+      const unitPrice = getStatementUnitPrice();
+      const path = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: getStatementDefaultPath(customerName)
+      });
+      if (path) {
+        await invoke("export_customer_statement", { path, customer: customerName, unitPrice });
+        addLog(`出退货清单导出成功: ${path}`, "success");
+      }
+    } catch (err) {
+      addLog("出退货清单导出失败: " + err, "error");
+    }
+  }
+
+  async function exportSelectedCustomerStatements() {
+    if (selectedCustomerNames.length === 0) {
+      addLog("请先选择要导出的客户", "error");
+      return;
+    }
+
+    if (selectedCustomerNames.length === 1) {
+      await exportCustomerStatement(selectedCustomerNames[0]);
+      return;
+    }
+
+    try {
+      const unitPrice = getStatementUnitPrice();
+      const { directory, basename } = splitCurrentPath();
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: directory || undefined
+      });
+      if (selected && typeof selected === "string") {
+        const paths = await invoke<string[]>("export_customer_statements_to_dir", {
+          directory: selected,
+          baseName: basename,
+          customers: selectedCustomerNames,
+          unitPrice
+        });
+        addLog(`已导出 ${paths.length} 份出退货清单到: ${selected}`, "success");
+      }
+    } catch (err) {
+      addLog("批量导出出退货清单失败: " + err, "error");
+    }
+  }
+
   const renderHome = () => (
     <div className="home-view">
       <div className="main-actions">
-        <button className="large-btn ship" onClick={() => { setMode("shipment"); setView("shipment_setup"); }}>开始出货录入</button>
-        <button className="large-btn return" onClick={() => { setMode("return"); setView("recording"); setBatchBarcodes([]); }}>开始退货录入</button>
+        <button className="large-btn ship" onClick={() => { setMode("shipment"); setReturnOwnerNotice(null); setView("shipment_setup"); }}>开始出货录入</button>
+        <button className="large-btn return" onClick={() => { setMode("return"); setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始退货录入</button>
       </div>
       <div className="secondary-actions">
+        <button onClick={handleNewTable}>新建表格</button>
         <button onClick={handleImport}>导入数据</button>
         <button onClick={handleExport}>导出数据</button>
         <button onClick={() => setShowRecipientListDialog(true)}>导出收货清单</button>
@@ -299,7 +513,7 @@ function App() {
         />
       </div>
       <div className="setup-actions">
-        <button disabled={!customer} onClick={() => { setView("recording"); setBatchBarcodes([]); }}>开始录入</button>
+        <button disabled={!customer} onClick={() => { setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始录入</button>
         <button className="secondary" onClick={() => setView("home")}>取消</button>
       </div>
     </div>
@@ -323,10 +537,31 @@ function App() {
         <button type="submit">扫描</button>
       </form>
 
+      {mode === "return" && returnOwnerNotice && (
+        <div className="owner-notice">
+          <span className="owner-notice-label">归属提示</span>
+          <span className="owner-notice-code">{returnOwnerNotice.barcode}</span>
+          <span>是</span>
+          <strong>{returnOwnerNotice.customer}</strong>
+          <span>的货</span>
+        </div>
+      )}
+
       <div className="current-batch">
         <h3>当前批次条码:</h3>
         <div className="batch-list">
-          {batchBarcodes.map((bc, i) => <div key={i} className="batch-item">{bc}</div>)}
+          {batchBarcodes.map((bc, i) => (
+            <div key={`${bc}-${i}`} className="batch-item">
+              <span className="batch-code">{bc}</span>
+              <button
+                type="button"
+                className="delete-batch-btn"
+                onClick={() => confirmDeleteBatchBarcode(bc, i)}
+              >
+                删除
+              </button>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -336,11 +571,15 @@ function App() {
     </div>
   );
 
+  const selectedCustomerSet = new Set(selectedCustomerNames);
+  const allCustomersSelected = summary.customer_stats.length > 0 &&
+    summary.customer_stats.every(stat => selectedCustomerSet.has(stat.name));
+
   return (
     <div className="container">
       <h1>仓库出货退货管理系统</h1>
 
-      <div className="view-container">
+      <div className={`view-container ${view === "recording" ? "recording-container" : ""}`}>
         {view === "home" && renderHome()}
         {view === "shipment_setup" && renderShipmentSetup()}
         {view === "recording" && renderRecording()}
@@ -348,27 +587,72 @@ function App() {
 
       <div className="summary-section">
         <div className="summary-header">
-          <h3>总体统计</h3>
-          <span>总出货: {summary.total_shipments} | 总退货: {summary.total_returns}</span>
+          <div>
+            <h3>总体统计</h3>
+            <span>总出货: {summary.total_shipments} | 总退货: {summary.total_returns}</span>
+          </div>
+          <div className="summary-actions">
+            <label className="unit-price-field">
+              单价
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={statementUnitPrice}
+                onChange={(e) => setStatementUnitPrice(e.target.value)}
+              />
+            </label>
+            <button
+              type="button"
+              className="summary-export-btn"
+              disabled={selectedCustomerNames.length === 0}
+              onClick={exportSelectedCustomerStatements}
+            >
+              导出选中出退货清单
+            </button>
+          </div>
         </div>
         <div className="summary-table-container">
           <table className="summary-table">
             <thead>
               <tr>
+                <th className="select-col">
+                  <input
+                    type="checkbox"
+                    checked={allCustomersSelected}
+                    disabled={summary.customer_stats.length === 0}
+                    onChange={(e) => toggleAllCustomers(e.target.checked)}
+                    aria-label="选择全部客户"
+                  />
+                </th>
                 <th>客户</th>
                 <th>出货数量</th>
                 <th>退货数量</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
               {summary.customer_stats.map((stat) => (
                 <tr key={stat.name}>
+                  <td className="select-col">
+                    <input
+                      type="checkbox"
+                      checked={selectedCustomerSet.has(stat.name)}
+                      onChange={(e) => toggleCustomerSelection(stat.name, e.target.checked)}
+                      aria-label={`选择客户 ${stat.name}`}
+                    />
+                  </td>
                   <td>{stat.name}</td>
                   <td>{stat.shipment_count} 件</td>
                   <td className={stat.return_count > 0 ? "has-returns" : ""}>{stat.return_count} 件</td>
+                  <td>
+                    <button type="button" className="row-export-btn" onClick={() => exportCustomerStatement(stat.name)}>
+                      导出
+                    </button>
+                  </td>
                 </tr>
               ))}
-              {summary.customer_stats.length === 0 && <tr><td colSpan={3} style={{textAlign:'center'}}>暂无数据</td></tr>}
+              {summary.customer_stats.length === 0 && <tr><td colSpan={5} style={{textAlign:'center'}}>暂无数据</td></tr>}
             </tbody>
           </table>
         </div>
@@ -408,6 +692,29 @@ function App() {
             <div className="modal-buttons">
               <button onClick={confirmImport}>确认导入</button>
               <button onClick={() => setShowImportDialog(false)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showNewTableDialog && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>新建表格</h2>
+            <div className="modal-row">
+              <label>表格名称:</label>
+              <input
+                type="text"
+                value={newTableName}
+                onChange={(e) => setNewTableName(e.target.value)}
+                placeholder="例如: 6月出退货"
+                autoFocus
+              />
+              <p className="hint">新建前如果有未保存数据，会先要求保存；新表会创建为包含出货条码、客户、退货条码表头的 Excel 文件。</p>
+            </div>
+            <div className="modal-buttons">
+              <button onClick={confirmNewTable}>确认新建</button>
+              <button onClick={() => setShowNewTableDialog(false)}>取消</button>
             </div>
           </div>
         </div>
