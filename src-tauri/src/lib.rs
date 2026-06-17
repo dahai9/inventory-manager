@@ -64,6 +64,32 @@ fn check_return(state: tauri::State<AppState>, barcode: String) -> Result<String
     Ok(customer.clone())
 }
 
+#[derive(Serialize)]
+pub struct ReturnLookupResult {
+    pub barcode: String,
+    pub customer: String,
+    pub is_returned: bool,
+}
+
+#[tauri::command]
+fn lookup_return(
+    state: tauri::State<AppState>,
+    barcode: String,
+) -> Result<ReturnLookupResult, String> {
+    let data = state.data.lock().unwrap();
+    let customer = data
+        .shipments
+        .get(&barcode)
+        .ok_or_else(|| format!("找不到此货 {}, 不是我们的货", barcode))?;
+    let is_returned = data.returns.contains(&barcode);
+
+    Ok(ReturnLookupResult {
+        barcode: barcode.clone(),
+        customer: customer.clone(),
+        is_returned,
+    })
+}
+
 #[tauri::command]
 fn commit_shipment_batch(
     state: tauri::State<AppState>,
@@ -117,9 +143,7 @@ pub struct CustomerStat {
     pub return_count: usize,
 }
 
-#[tauri::command]
-fn get_summary(state: tauri::State<AppState>) -> Summary {
-    let data = state.data.lock().unwrap();
+fn build_summary(data: &AppData) -> Summary {
     let mut stats: HashMap<String, CustomerStat> = HashMap::new();
 
     for customer in data.shipments.values() {
@@ -154,6 +178,12 @@ fn get_summary(state: tauri::State<AppState>) -> Summary {
         total_returns: data.returns.len(),
         customer_stats,
     }
+}
+
+#[tauri::command]
+fn get_summary(state: tauri::State<AppState>) -> Summary {
+    let data = state.data.lock().unwrap();
+    build_summary(&data)
 }
 
 #[tauri::command]
@@ -761,6 +791,105 @@ fn write_customer_statement(
     Ok(())
 }
 
+fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Result<(), String> {
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    let title_format = Format::new().set_bold().set_font_size(14);
+    let header_format = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xD9EAF7))
+        .set_border(FormatBorder::Thin);
+    let integer_format = Format::new()
+        .set_num_format("0")
+        .set_border(FormatBorder::Thin);
+    let text_format = Format::new().set_border(FormatBorder::Thin);
+    let total_format = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xF2F2F2))
+        .set_border(FormatBorder::Thin);
+
+    worksheet
+        .merge_range(0, 0, 0, 5, "总出退货数量表", &title_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 0, "总出货", &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 1, summary.total_shipments as u32, &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 2, "退货总数", &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 3, summary.total_returns as u32, &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 4, "客户数", &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 5, summary.customer_stats.len() as u32, &total_format)
+        .map_err(|e| e.to_string())?;
+
+    let headers = ["客户", "出货数量", "退货数量"];
+    for (col, header) in headers.iter().enumerate() {
+        worksheet
+            .write_with_format(3, col as u16, *header, &header_format)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let mut current_row = 4u32;
+    for stat in &summary.customer_stats {
+        worksheet
+            .write_with_format(current_row, 0, &stat.name, &text_format)
+            .map_err(|e| e.to_string())?;
+        worksheet
+            .write_with_format(current_row, 1, stat.shipment_count as u32, &integer_format)
+            .map_err(|e| e.to_string())?;
+        worksheet
+            .write_with_format(current_row, 2, stat.return_count as u32, &integer_format)
+            .map_err(|e| e.to_string())?;
+        current_row += 1;
+    }
+
+    worksheet
+        .write_with_format(current_row, 0, "合计", &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(
+            current_row,
+            1,
+            summary.total_shipments as u32,
+            &total_format,
+        )
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(current_row, 2, summary.total_returns as u32, &total_format)
+        .map_err(|e| e.to_string())?;
+
+    worksheet
+        .set_column_width(0, 24)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(1, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(2, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(3, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(4, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(5, 12)
+        .map_err(|e| e.to_string())?;
+
+    workbook.save(path.into()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn export_customer_statement(
     state: tauri::State<'_, AppState>,
@@ -771,6 +900,16 @@ async fn export_customer_statement(
     let data = state.data.lock().unwrap();
     let row = customer_statement_row(&data, &customer)?;
     write_customer_statement(path, &[row], unit_price)
+}
+
+#[tauri::command]
+async fn export_total_quantity_table(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let data = state.data.lock().unwrap();
+    let summary = build_summary(&data);
+    write_total_quantity_table(path, &summary)
 }
 
 #[tauri::command]
@@ -844,6 +983,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_shipment,
             check_return,
+            lookup_return,
             commit_shipment_batch,
             commit_return_batch,
             get_summary,
@@ -852,6 +992,7 @@ pub fn run() {
             has_unsaved_changes,
             create_new_workbook,
             export_data,
+            export_total_quantity_table,
             export_recipient_list,
             export_customer_statement,
             export_customer_statements_to_dir,

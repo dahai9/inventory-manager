@@ -27,6 +27,12 @@ interface Summary {
   customer_stats: CustomerStat[];
 }
 
+interface ReturnLookupResult {
+  barcode: string;
+  customer: string;
+  is_returned: boolean;
+}
+
 function App() {
   const [view, setView] = useState<View>("home");
   const [mode, setMode] = useState<Mode>("shipment");
@@ -47,6 +53,9 @@ function App() {
   const [showNewTableDialog, setShowNewTableDialog] = useState(false);
   const [newTableName, setNewTableName] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
+  const [showReturnLookupDialog, setShowReturnLookupDialog] = useState(false);
+  const [returnLookupBarcode, setReturnLookupBarcode] = useState("");
+  const [returnLookupResult, setReturnLookupResult] = useState<ReturnLookupResult | null>(null);
   const [showRecipientListDialog, setShowRecipientListDialog] = useState(false);
   const [recipientListColumn, setRecipientListColumn] = useState<RecipientListColumn>("shipment_barcode");
   const [showSettings, setShowSettings] = useState(false);
@@ -389,6 +398,37 @@ function App() {
     }
   }
 
+  function openReturnLookupDialog() {
+    setReturnLookupBarcode("");
+    setReturnLookupResult(null);
+    setShowReturnLookupDialog(true);
+  }
+
+  async function handleReturnLookup(e?: React.FormEvent) {
+    e?.preventDefault();
+    const lookupBarcode = returnLookupBarcode.trim();
+    if (!lookupBarcode) {
+      addLog("请输入要查找的退货编码", "error");
+      return;
+    }
+
+    try {
+      const result = await invoke<ReturnLookupResult>("lookup_return", { barcode: lookupBarcode });
+      setReturnLookupResult(result);
+      addLog(
+        result.is_returned
+          ? `${lookupBarcode} 已退货，客户: ${result.customer}`
+          : `${lookupBarcode} 未退货，客户: ${result.customer}`,
+        "success"
+      );
+    } catch (err) {
+      setReturnLookupResult(null);
+      addLog("退货查找失败: " + err, "error");
+    } finally {
+      setReturnLookupBarcode("");
+    }
+  }
+
   function splitCurrentPath() {
     if (!importPath) {
       return { directory: "", basename: "inventory_export" };
@@ -411,6 +451,11 @@ function App() {
   function getStatementDefaultPath(customerName: string) {
     const { directory, basename } = splitCurrentPath();
     return `${directory}${sanitizeFilenameSegment(basename)}_${sanitizeFilenameSegment(customerName)}_${CUSTOMER_STATEMENT_SUFFIX}.xlsx`;
+  }
+
+  function getTotalQuantityTableDefaultPath() {
+    const { directory, basename } = splitCurrentPath();
+    return `${directory}${sanitizeFilenameSegment(basename)}_总出退货数量表.xlsx`;
   }
 
   function getStatementUnitPrice() {
@@ -483,6 +528,21 @@ function App() {
     }
   }
 
+  async function exportTotalQuantityTable() {
+    try {
+      const path = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: getTotalQuantityTableDefaultPath()
+      });
+      if (path) {
+        await invoke("export_total_quantity_table", { path });
+        addLog(`总出退货数量表导出成功: ${path}`, "success");
+      }
+    } catch (err) {
+      addLog("总出退货数量表导出失败: " + err, "error");
+    }
+  }
+
   const renderHome = () => (
     <div className="home-view">
       <div className="main-actions">
@@ -494,6 +554,7 @@ function App() {
         <button onClick={handleImport}>导入数据</button>
         <button onClick={handleExport}>导出数据</button>
         <button onClick={() => setShowRecipientListDialog(true)}>导出收货清单</button>
+        <button onClick={openReturnLookupDialog}>退货查找</button>
         <button className="settings-btn" onClick={() => setShowSettings(true)}>设置</button>
       </div>
     </div>
@@ -609,6 +670,14 @@ function App() {
               onClick={exportSelectedCustomerStatements}
             >
               导出选中出退货清单
+            </button>
+            <button
+              type="button"
+              className="summary-export-btn total"
+              disabled={summary.customer_stats.length === 0}
+              onClick={exportTotalQuantityTable}
+            >
+              导出总出退货数量表
             </button>
           </div>
         </div>
@@ -738,6 +807,46 @@ function App() {
               <button onClick={confirmRecipientListExport}>确认导出</button>
               <button onClick={() => setShowRecipientListDialog(false)}>取消</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showReturnLookupDialog && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>退货查找</h2>
+            <form onSubmit={handleReturnLookup} className="lookup-form">
+              <div className="modal-row">
+                <label>退货编码:</label>
+                <input
+                  type="text"
+                  value={returnLookupBarcode}
+                  onChange={(e) => setReturnLookupBarcode(e.target.value)}
+                  placeholder="输入或扫描编码"
+                  autoFocus
+                />
+              </div>
+              <div className="modal-buttons">
+                <button type="submit">查找</button>
+                <button type="button" onClick={() => setShowReturnLookupDialog(false)}>关闭</button>
+              </div>
+            </form>
+            {returnLookupResult && (
+              <div className={`lookup-result ${returnLookupResult.is_returned ? "returned" : "active"}`}>
+                <div>
+                  <span className="lookup-label">编码</span>
+                  <strong>{returnLookupResult.barcode}</strong>
+                </div>
+                <div>
+                  <span className="lookup-label">客户</span>
+                  <strong>{returnLookupResult.customer}</strong>
+                </div>
+                <div>
+                  <span className="lookup-label">状态</span>
+                  <strong>{returnLookupResult.is_returned ? "已退货" : "未退货"}</strong>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

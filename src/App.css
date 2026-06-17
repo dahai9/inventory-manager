@@ -272,6 +272,10 @@ h1 {
   background: #28a745;
 }
 
+.summary-export-btn.total {
+  background: #0d6efd;
+}
+
 .summary-export-btn:disabled {
   background: #aaa;
 }
@@ -390,6 +394,38 @@ button.secondary { background: #6c757d; }
   font-size: 0.85rem;
   color: #666;
   margin: 0;
+}
+
+.lookup-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.lookup-result {
+  margin-top: 1rem;
+  padding: 0.8rem 1rem;
+  border-radius: 8px;
+  border: 1px solid #ddd;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.lookup-result.returned {
+  background: #fff3cd;
+  border-color: #ffe69c;
+}
+
+.lookup-result.active {
+  background: #e7f5ff;
+  border-color: #b6d4fe;
+}
+
+.lookup-label {
+  display: inline-block;
+  min-width: 3em;
+  margin-right: 0.5rem;
+  color: #666;
 }
 
 .settings-btn {
