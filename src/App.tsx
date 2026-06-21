@@ -1,6 +1,24 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save, message } from "@tauri-apps/plugin-dialog";
+import {
+  Archive,
+  Bell,
+  Boxes,
+  Check,
+  ClipboardList,
+  FileOutput,
+  FilePlus2,
+  FolderOpen,
+  PackageCheck,
+  PackagePlus,
+  PanelTopOpen,
+  RotateCcw,
+  Search,
+  Settings,
+  Trash2,
+  Upload,
+} from "lucide-react";
 import "./App.css";
 
 type View = "home" | "shipment_setup" | "recording";
@@ -48,6 +66,12 @@ function getLocalDateValue(date = new Date()) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function getPathBasename(path: string | null) {
+  if (!path) return "未打开表格";
+  const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return separatorIndex >= 0 ? path.slice(separatorIndex + 1) : path;
 }
 
 function App() {
@@ -583,103 +607,171 @@ function App() {
     }
   }
 
-  const renderHome = () => (
-    <div className="home-view">
-      <div className="main-actions">
-        <button className="large-btn ship" onClick={() => { setMode("shipment"); setReturnOwnerNotice(null); setView("shipment_setup"); }}>开始出货录入</button>
-        <button className="large-btn return" onClick={() => { setMode("return"); setReturnTime(getLocalDateValue()); setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始退货录入</button>
-      </div>
-      <div className="secondary-actions">
-        <button onClick={handleNewTable}>新建表格</button>
-        <button onClick={handleImport}>导入数据</button>
-        <button onClick={handleExport}>导出数据</button>
-        <button onClick={() => setShowRecipientListDialog(true)}>导出收货清单</button>
-        <button onClick={openReturnLookupDialog}>退货查找</button>
-        <button className="settings-btn" onClick={() => setShowSettings(true)}>设置</button>
-      </div>
-    </div>
-  );
+  const beginReturnRecording = () => {
+    setMode("return");
+    setReturnTime(getLocalDateValue());
+    setReturnOwnerNotice(null);
+    setView("recording");
+    setBatchBarcodes([]);
+  };
 
-  const renderShipmentSetup = () => (
-    <div className="setup-view">
-      <h2>出货设置</h2>
-      <div className="input-group">
-        <label>输入客户名称:</label>
-        <input 
-          type="text" 
-          value={customer} 
-          onChange={(e) => setCustomer(e.target.value)}
-          placeholder="例如: 某某贸易有限公司"
-          autoFocus
-        />
-      </div>
-      <div className="setup-actions">
-        <button disabled={!customer} onClick={() => { setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始录入</button>
-        <button className="secondary" onClick={() => setView("home")}>取消</button>
-      </div>
-    </div>
-  );
+  const beginShipmentSetup = () => {
+    setMode("shipment");
+    setReturnOwnerNotice(null);
+    setView("shipment_setup");
+  };
 
-  const renderRecording = () => (
-    <div className="recording-view">
-      <div className="recording-header">
-        <h2>{mode === "shipment" ? `出货录入中 - ${customer}` : "退货录入中"}</h2>
-        {mode === "return" && (
-          <label className="return-time-field">
-            退货时间
-            <input
-              type="date"
-              value={returnTime}
-              onChange={(e) => setReturnTime(e.target.value)}
-            />
-          </label>
-        )}
-        <div className="batch-stats">当前批次已扫: <span>{batchBarcodes.length}</span> 件</div>
-      </div>
-      
-      <form onSubmit={handleScan} className="barcode-form">
-        <input 
-          ref={barcodeRef}
-          type="text" 
-          value={barcode} 
-          onChange={(e) => setBarcode(e.target.value)}
-          placeholder="请扫描条码..."
-        />
-        <button type="submit">扫描</button>
-      </form>
+  const isRecording = view === "recording";
+  const latestLogs = log.slice(0, 8);
 
-      {mode === "return" && returnOwnerNotice && (
-        <div className="owner-notice">
-          <span className="owner-notice-label">归属提示</span>
-          <span className="owner-notice-code">{returnOwnerNotice.barcode}</span>
-          <span>是</span>
-          <strong>{returnOwnerNotice.customer}</strong>
-          <span>的货</span>
+  const renderModePanel = () => (
+    <section className={`panel workbench-panel ${isRecording ? "is-recording" : ""}`}>
+      <div className="panel-heading">
+        <div>
+          <span className="eyebrow">扫码工作台</span>
+          <h2>{isRecording ? (mode === "shipment" ? "出货录入中" : "退货录入中") : "选择录入模式"}</h2>
+        </div>
+        <div className={`mode-pill ${isRecording ? mode : ""}`}>
+          {isRecording ? (mode === "shipment" ? "出货" : "退货") : "待开始"}
+        </div>
+      </div>
+
+      {!isRecording && (
+        <div className="mode-grid">
+          <button type="button" className="mode-card" onClick={beginShipmentSetup}>
+            <span className="mode-icon ship"><PackagePlus size={22} /></span>
+            <span>
+              <strong>出货录入</strong>
+              <small>选择客户后开始扫码</small>
+            </span>
+          </button>
+          <button type="button" className="mode-card" onClick={beginReturnRecording}>
+            <span className="mode-icon return"><RotateCcw size={22} /></span>
+            <span>
+              <strong>退货录入</strong>
+              <small>按退货日期管理批次</small>
+            </span>
+          </button>
         </div>
       )}
 
-      <div className="current-batch">
-        <h3>当前批次条码:</h3>
-        <div className="batch-list">
-          {batchBarcodes.map((bc, i) => (
-            <div key={`${bc}-${i}`} className="batch-item">
-              <span className="batch-code">{bc}</span>
-              <button
-                type="button"
-                className="delete-batch-btn"
-                onClick={() => confirmDeleteBatchBarcode(bc, i)}
-              >
-                删除
-              </button>
-            </div>
-          ))}
+      {view === "shipment_setup" && (
+        <div className="task-setup">
+          <label className="field">
+            <span>客户名称</span>
+            <input
+              type="text"
+              value={customer}
+              onChange={(e) => setCustomer(e.target.value)}
+              placeholder="例如: 某某贸易有限公司"
+              autoFocus
+            />
+          </label>
+          <div className="inline-actions">
+            <button
+              type="button"
+              className="btn primary"
+              disabled={!customer}
+              onClick={() => { setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}
+            >
+              <PackageCheck size={16} /> 开始扫码
+            </button>
+            <button type="button" className="btn ghost" onClick={() => setView("home")}>取消</button>
+          </div>
         </div>
-      </div>
+      )}
 
-      <div className="recording-actions">
-        <button className="finish-btn" onClick={finishBatch}>完成录入</button>
-      </div>
-    </div>
+      {isRecording && (
+        <div className="recording-workspace">
+          <div className="recording-status">
+            <div className="status-item">
+              <span>当前模式</span>
+              <strong>{mode === "shipment" ? "出货录入" : "退货录入"}</strong>
+            </div>
+            {mode === "shipment" ? (
+              <div className="status-item wide">
+                <span>客户</span>
+                <strong>{customer || "未设置客户"}</strong>
+              </div>
+            ) : (
+              <label className="status-item date-field">
+                <span>退货时间</span>
+                <input
+                  type="date"
+                  value={returnTime}
+                  onChange={(e) => setReturnTime(e.target.value)}
+                />
+              </label>
+            )}
+            <div className="status-item count">
+              <span>当前批次</span>
+              <strong>{batchBarcodes.length} 件</strong>
+            </div>
+          </div>
+
+          <form onSubmit={handleScan} className="scan-form">
+            <div className="scan-input-wrap">
+              <Archive size={20} />
+              <input
+                ref={barcodeRef}
+                type="text"
+                value={barcode}
+                onChange={(e) => setBarcode(e.target.value)}
+                placeholder="请扫描或输入条码"
+              />
+            </div>
+            <button type="submit" className="btn primary scan-submit">
+              <PanelTopOpen size={17} /> 扫描
+            </button>
+          </form>
+
+          {mode === "return" && returnOwnerNotice && (
+            <div className="owner-notice">
+              <span className="owner-notice-label">归属</span>
+              <span className="owner-notice-code">{returnOwnerNotice.barcode}</span>
+              <span>属于</span>
+              <strong>{returnOwnerNotice.customer}</strong>
+            </div>
+          )}
+
+          <div className="batch-panel">
+            <div className="batch-header">
+              <h3>当前批次条码</h3>
+              <span>{batchBarcodes.length} 条</span>
+            </div>
+            <div className="batch-list">
+              {batchBarcodes.map((bc, i) => (
+                <div key={`${bc}-${i}`} className="batch-item">
+                  <span className="batch-index">{batchBarcodes.length - i}</span>
+                  <span className="batch-code">{bc}</span>
+                  <button
+                    type="button"
+                    className="icon-danger-btn"
+                    onClick={() => confirmDeleteBatchBarcode(bc, i)}
+                    aria-label={`删除编码 ${bc}`}
+                    title="删除"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              ))}
+              {batchBarcodes.length === 0 && (
+                <div className="empty-batch">当前批次还没有条码</div>
+              )}
+            </div>
+          </div>
+
+          <div className="recording-actions">
+            <button type="button" className="btn primary finish-btn" onClick={finishBatch}>
+              <Check size={17} /> 完成录入
+            </button>
+            <button type="button" className="btn ghost" onClick={() => { setReturnOwnerNotice(null); setView("home"); }}>
+              返回工作台
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 
   const selectedCustomerSet = new Set(selectedCustomerNames);
@@ -687,106 +779,165 @@ function App() {
     summary.customer_stats.every(stat => selectedCustomerSet.has(stat.name));
 
   return (
-    <div className="container">
-      <h1>仓库出货退货管理系统</h1>
-
-      <div className={`view-container ${view === "recording" ? "recording-container" : ""}`}>
-        {view === "home" && renderHome()}
-        {view === "shipment_setup" && renderShipmentSetup()}
-        {view === "recording" && renderRecording()}
-      </div>
-
-      <div className="summary-section">
-        <div className="summary-header">
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand-block">
+          <div className="brand-mark"><Boxes size={22} /></div>
           <div>
-            <h3>总体统计</h3>
-            <span>总出货: {summary.total_shipments} | 总退货: {summary.total_returns} | 成功交货: {summary.total_delivered}</span>
-          </div>
-          <div className="summary-actions">
-            <label className="unit-price-field">
-              单价
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={statementUnitPrice}
-                onChange={(e) => setStatementUnitPrice(e.target.value)}
-              />
-            </label>
-            <button
-              type="button"
-              className="summary-export-btn"
-              disabled={selectedCustomerNames.length === 0}
-              onClick={exportSelectedCustomerStatements}
-            >
-              导出选中出退货清单
-            </button>
-            <button
-              type="button"
-              className="summary-export-btn total"
-              disabled={summary.customer_stats.length === 0}
-              onClick={exportTotalQuantityTable}
-            >
-              导出总出退货数量表
-            </button>
+            <h1>仓库出退货操作台</h1>
+            <p>{getPathBasename(importPath)}</p>
           </div>
         </div>
-        <div className="summary-table-container">
-          <table className="summary-table">
-            <thead>
-              <tr>
-                <th className="select-col">
-                  <input
-                    type="checkbox"
-                    checked={allCustomersSelected}
-                    disabled={summary.customer_stats.length === 0}
-                    onChange={(e) => toggleAllCustomers(e.target.checked)}
-                    aria-label="选择全部客户"
-                  />
-                </th>
-                <th>客户</th>
-                <th>出货数量</th>
-                <th>退货数量</th>
-                <th>成功交货数量</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {summary.customer_stats.map((stat) => (
-                <tr key={stat.name}>
-                  <td className="select-col">
-                    <input
-                      type="checkbox"
-                      checked={selectedCustomerSet.has(stat.name)}
-                      onChange={(e) => toggleCustomerSelection(stat.name, e.target.checked)}
-                      aria-label={`选择客户 ${stat.name}`}
-                    />
-                  </td>
-                  <td>{stat.name}</td>
-                  <td>{stat.shipment_count} 件</td>
-                  <td className={stat.return_count > 0 ? "has-returns" : ""}>{stat.return_count} 件</td>
-                  <td>{stat.delivered_count} 件</td>
-                  <td>
-                    <button type="button" className="row-export-btn" onClick={() => exportCustomerStatement(stat.name)}>
-                      导出
-                    </button>
-                  </td>
-                </tr>
-              ))}
-              {summary.customer_stats.length === 0 && <tr><td colSpan={6} style={{textAlign:'center'}}>暂无数据</td></tr>}
-            </tbody>
-          </table>
+        <div className="topbar-actions">
+          <button type="button" className="btn secondary" onClick={handleNewTable}><FilePlus2 size={16} /> 新建</button>
+          <button type="button" className="btn secondary" onClick={handleImport}><FolderOpen size={16} /> 导入</button>
+          <button type="button" className="btn secondary" onClick={handleExport}><FileOutput size={16} /> 导出</button>
+          <button type="button" className="btn icon-btn" onClick={() => setShowSettings(true)} aria-label="设置" title="设置">
+            <Settings size={17} />
+          </button>
         </div>
-      </div>
+      </header>
 
-      <div className="log-panel">
-        <h4>操作日志</h4>
-        <div className="log-list">
-          {log.map((entry, i) => (
-            <div key={i} className={`log-entry ${entry.type}`}>{entry.msg}</div>
-          ))}
+      <main className="workspace-grid">
+        <section className="metric-grid">
+          <div className="metric-card">
+            <span>总出货</span>
+            <strong>{summary.total_shipments}</strong>
+          </div>
+          <div className="metric-card returns">
+            <span>总退货</span>
+            <strong>{summary.total_returns}</strong>
+          </div>
+          <div className="metric-card delivered">
+            <span>成功交货</span>
+            <strong>{summary.total_delivered}</strong>
+          </div>
+        </section>
+
+        <div className="workspace-main">
+          {renderModePanel()}
+
+          <section className="panel recent-panel">
+            <div className="panel-heading compact">
+              <h2>最近操作</h2>
+            </div>
+            <div className="recent-list">
+              {latestLogs.map((entry, i) => (
+                <div key={i} className={`recent-entry ${entry.type}`}>
+                  <span className="status-dot" />
+                  <p>{entry.msg}</p>
+                </div>
+              ))}
+              {latestLogs.length === 0 && <div className="empty-log">暂无操作记录</div>}
+            </div>
+          </section>
+
+          <section className="panel data-panel">
+            <div className="panel-heading table-heading">
+              <div>
+                <span className="eyebrow">客户数据</span>
+                <h2>出退货统计</h2>
+              </div>
+              <div className="summary-actions">
+                <label className="unit-price-field">
+                  <span>单价</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={statementUnitPrice}
+                    onChange={(e) => setStatementUnitPrice(e.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={selectedCustomerNames.length === 0}
+                  onClick={exportSelectedCustomerStatements}
+                >
+                  <FileOutput size={16} /> 导出选中
+                </button>
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={summary.customer_stats.length === 0}
+                  onClick={exportTotalQuantityTable}
+                >
+                  <ClipboardList size={16} /> 总数量表
+                </button>
+              </div>
+            </div>
+
+            <div className="summary-table-container">
+              <table className="summary-table">
+                <thead>
+                  <tr>
+                    <th className="select-col">
+                      <input
+                        type="checkbox"
+                        checked={allCustomersSelected}
+                        disabled={summary.customer_stats.length === 0}
+                        onChange={(e) => toggleAllCustomers(e.target.checked)}
+                        aria-label="选择全部客户"
+                      />
+                    </th>
+                    <th>客户</th>
+                    <th className="number-col">出货</th>
+                    <th className="number-col">退货</th>
+                    <th className="number-col">成功交货</th>
+                    <th className="action-col">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {summary.customer_stats.map((stat) => (
+                    <tr key={stat.name}>
+                      <td className="select-col">
+                        <input
+                          type="checkbox"
+                          checked={selectedCustomerSet.has(stat.name)}
+                          onChange={(e) => toggleCustomerSelection(stat.name, e.target.checked)}
+                          aria-label={`选择客户 ${stat.name}`}
+                        />
+                      </td>
+                      <td className="customer-cell">{stat.name}</td>
+                      <td className="number-col">{stat.shipment_count}</td>
+                      <td className="number-col">
+                        <span className={stat.return_count > 0 ? "return-badge" : ""}>{stat.return_count}</span>
+                      </td>
+                      <td className="number-col">{stat.delivered_count}</td>
+                      <td className="action-col">
+                        <button type="button" className="btn table-btn" onClick={() => exportCustomerStatement(stat.name)}>
+                          <FileOutput size={14} /> 导出
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {summary.customer_stats.length === 0 && (
+                    <tr><td colSpan={6} className="empty-table">暂无数据</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
         </div>
-      </div>
+
+        <aside className="side-rail">
+          <section className="panel quick-tools">
+            <div className="panel-heading compact">
+              <h2>快捷工具</h2>
+            </div>
+            <button type="button" className="tool-row" onClick={openReturnLookupDialog}>
+              <Search size={17} /> 退货查找
+            </button>
+            <button type="button" className="tool-row" onClick={() => setShowRecipientListDialog(true)}>
+              <FileOutput size={17} /> 导出收货清单
+            </button>
+            <button type="button" className="tool-row" onClick={playAlertSound}>
+              <Bell size={17} /> 测试提示音
+            </button>
+          </section>
+        </aside>
+      </main>
 
       {showImportDialog && (
         <div className="modal-overlay">
@@ -818,8 +969,8 @@ function App() {
               </select>
             </div>
             <div className="modal-buttons">
-              <button onClick={confirmImport}>确认导入</button>
-              <button onClick={() => setShowImportDialog(false)}>取消</button>
+              <button className="btn primary" onClick={confirmImport}><Upload size={16} /> 确认导入</button>
+              <button className="btn ghost" onClick={() => setShowImportDialog(false)}>取消</button>
             </div>
           </div>
         </div>
@@ -841,8 +992,8 @@ function App() {
               <p className="hint">新建前如果有未保存数据，会先要求保存；新表会创建为包含出货条码、客户、退货条码、退货时间表头的 Excel 文件。</p>
             </div>
             <div className="modal-buttons">
-              <button onClick={confirmNewTable}>确认新建</button>
-              <button onClick={() => setShowNewTableDialog(false)}>取消</button>
+              <button className="btn primary" onClick={confirmNewTable}><FilePlus2 size={16} /> 创建表格</button>
+              <button className="btn ghost" onClick={() => setShowNewTableDialog(false)}>取消</button>
             </div>
           </div>
         </div>
@@ -863,8 +1014,8 @@ function App() {
               <p className="hint">用于发送给收货人的清单；选择退货条码时会同时导出退货时间。</p>
             </div>
             <div className="modal-buttons">
-              <button onClick={confirmRecipientListExport}>确认导出</button>
-              <button onClick={() => setShowRecipientListDialog(false)}>取消</button>
+              <button className="btn primary" onClick={confirmRecipientListExport}><FileOutput size={16} /> 确认导出</button>
+              <button className="btn ghost" onClick={() => setShowRecipientListDialog(false)}>取消</button>
             </div>
           </div>
         </div>
@@ -886,8 +1037,8 @@ function App() {
                 />
               </div>
               <div className="modal-buttons">
-                <button type="submit">查找</button>
-                <button type="button" onClick={() => setShowReturnLookupDialog(false)}>关闭</button>
+                <button type="submit" className="btn primary"><Search size={16} /> 查找</button>
+                <button type="button" className="btn ghost" onClick={() => setShowReturnLookupDialog(false)}>关闭</button>
               </div>
             </form>
             {returnLookupResult && (
@@ -931,8 +1082,8 @@ function App() {
               <p className="hint">扫码时如果条码包含这些字符，将被视为型号并忽略，同时发出提示音。空格请直接输入（例如：<code>-, </code> 表示忽略减号和空格）。</p>
             </div>
             <div className="modal-buttons">
-              <button className="secondary" onClick={playAlertSound}>测试声音</button>
-              <button onClick={() => setShowSettings(false)}>关闭</button>
+              <button className="btn secondary" onClick={playAlertSound}><Bell size={16} /> 测试声音</button>
+              <button className="btn ghost" onClick={() => setShowSettings(false)}>关闭</button>
             </div>
           </div>
         </div>
