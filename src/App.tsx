@@ -12,18 +12,27 @@ const CUSTOMER_STATEMENT_SUFFIX = "出退货清单";
 const recipientListColumns: { value: RecipientListColumn; label: string }[] = [
   { value: "shipment_barcode", label: "出货条码" },
   { value: "customer", label: "客户名称" },
-  { value: "return_barcode", label: "退货条码" },
+  { value: "return_barcode", label: "退货条码和时间" },
 ];
 
 interface CustomerStat {
   name: string;
   shipment_count: number;
   return_count: number;
+  delivered_count: number;
+}
+
+interface ReturnTimeStat {
+  return_time: string;
+  customer: string;
+  return_count: number;
 }
 
 interface Summary {
   total_shipments: number;
   total_returns: number;
+  total_delivered: number;
+  return_time_stats: ReturnTimeStat[];
   customer_stats: CustomerStat[];
 }
 
@@ -31,6 +40,14 @@ interface ReturnLookupResult {
   barcode: string;
   customer: string;
   is_returned: boolean;
+  return_time: string | null;
+}
+
+function getLocalDateValue(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function App() {
@@ -41,7 +58,7 @@ function App() {
   const [batchBarcodes, setBatchBarcodes] = useState<string[]>([]);
   const [returnOwnerNotice, setReturnOwnerNotice] = useState<{ barcode: string; customer: string } | null>(null);
   const [log, setLog] = useState<{msg: string, type: 'success' | 'error'}[]>([]);
-  const [summary, setSummary] = useState<Summary>({ total_shipments: 0, total_returns: 0, customer_stats: [] });
+  const [summary, setSummary] = useState<Summary>({ total_shipments: 0, total_returns: 0, total_delivered: 0, return_time_stats: [], customer_stats: [] });
   const [selectedCustomerNames, setSelectedCustomerNames] = useState<string[]>([]);
   const [statementUnitPrice, setStatementUnitPrice] = useState("0");
   
@@ -49,7 +66,9 @@ function App() {
   const [columns, setColumns] = useState<string[]>([]);
   const [shipCol, setShipCol] = useState("");
   const [retCol, setRetCol] = useState("");
+  const [retTimeCol, setRetTimeCol] = useState("");
   const [custCol, setCustCol] = useState("");
+  const [returnTime, setReturnTime] = useState(getLocalDateValue);
   const [showNewTableDialog, setShowNewTableDialog] = useState(false);
   const [newTableName, setNewTableName] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
@@ -185,9 +204,13 @@ function App() {
     if (!confirmed) return;
 
     try {
+      if (mode === "return" && !returnTime) {
+        addLog("请选择退货时间", "error");
+        return;
+      }
       const msg = await invoke<string>(
         mode === "shipment" ? "commit_shipment_batch" : "commit_return_batch",
-        mode === "shipment" ? { customer, barcodes: batchBarcodes } : { barcodes: batchBarcodes }
+        mode === "shipment" ? { customer, barcodes: batchBarcodes } : { barcodes: batchBarcodes, returnTime }
       );
       addLog(msg, "success");
       setBatchBarcodes([]);
@@ -226,10 +249,12 @@ function App() {
         // 自动识别列
         let autoShip = "";
         let autoRet = "";
+        let autoRetTime = "";
         let autoCust = "";
 
         const shipKeywords = ["出货", "条码", "barcode", "shipment", "sn", "序列号"];
         const retKeywords = ["退货", "return", "退回"];
+        const retTimeKeywords = ["退货时间", "退货日期", "return time", "return date", "returned at"];
         const custKeywords = ["客户", "姓名", "name", "customer", "client", "收货"];
 
         for (const col of cols) {
@@ -237,8 +262,14 @@ function App() {
           if (!autoShip && shipKeywords.some(k => lowerCol.includes(k)) && !lowerCol.includes("退货")) {
             autoShip = col;
           }
-          if (!autoRet && retKeywords.some(k => lowerCol.includes(k))) {
+          if (!autoRet && retKeywords.some(k => lowerCol.includes(k)) && !lowerCol.includes("时间") && !lowerCol.includes("日期")) {
             autoRet = col;
+          }
+          if (!autoRetTime && (
+            retTimeKeywords.some(k => lowerCol.includes(k)) ||
+            (lowerCol.includes("退货") && (lowerCol.includes("时间") || lowerCol.includes("日期")))
+          )) {
+            autoRetTime = col;
           }
           if (!autoCust && custKeywords.some(k => lowerCol.includes(k))) {
             autoCust = col;
@@ -247,6 +278,7 @@ function App() {
 
         setShipCol(autoShip || cols[0] || "");
         setRetCol(autoRet || (cols.length > 1 ? cols[1] : (cols[0] || "")));
+        setRetTimeCol(autoRetTime);
         setCustCol(autoCust || (cols.length > 2 ? cols[2] : (cols[0] || "")));
         
         setShowImportDialog(true);
@@ -259,7 +291,13 @@ function App() {
   async function confirmImport() {
     if (!importPath || !shipCol || !retCol || !custCol) return;
     try {
-      await invoke("import_data", { path: importPath, shipCol, returnCol: retCol, customerCol: custCol });
+      await invoke("import_data", {
+        path: importPath,
+        shipCol,
+        returnCol: retCol,
+        returnTimeCol: retTimeCol || null,
+        customerCol: custCol
+      });
       addLog("数据导入成功", "success");
       setShowImportDialog(false);
       updateSummary();
@@ -347,10 +385,11 @@ function App() {
 
       await invoke("create_new_workbook", { path, tableName: trimmedName });
       setImportPath(path);
-      setColumns(["出货条码", "客户", "退货条码"]);
+      setColumns(["出货条码", "客户", "退货条码", "退货时间"]);
       setShipCol("出货条码");
       setCustCol("客户");
       setRetCol("退货条码");
+      setRetTimeCol("退货时间");
       setBatchBarcodes([]);
       setSelectedCustomerNames([]);
       setReturnOwnerNotice(null);
@@ -366,7 +405,8 @@ function App() {
   }
 
   function getRecipientListDefaultPath() {
-    if (!importPath) return "inventory_export出货.xlsx";
+    const suffix = recipientListColumn === "return_barcode" ? "退货" : "出货";
+    if (!importPath) return `inventory_export${suffix}.xlsx`;
 
     const separatorIndex = Math.max(importPath.lastIndexOf("/"), importPath.lastIndexOf("\\"));
     const directory = separatorIndex >= 0 ? importPath.slice(0, separatorIndex + 1) : "";
@@ -376,10 +416,10 @@ function App() {
     if (extensionIndex > 0) {
       const basename = filename.slice(0, extensionIndex);
       const extension = filename.slice(extensionIndex);
-      return `${directory}${basename.endsWith("出货") ? basename : `${basename}出货`}${extension}`;
+      return `${directory}${basename.endsWith(suffix) ? basename : `${basename}${suffix}`}${extension}`;
     }
 
-    return `${directory}${filename.endsWith("出货") ? filename : `${filename}出货`}.xlsx`;
+    return `${directory}${filename.endsWith(suffix) ? filename : `${filename}${suffix}`}.xlsx`;
   }
 
   async function confirmRecipientListExport() {
@@ -417,7 +457,7 @@ function App() {
       setReturnLookupResult(result);
       addLog(
         result.is_returned
-          ? `${lookupBarcode} 已退货，客户: ${result.customer}`
+          ? `${lookupBarcode} 已退货，客户: ${result.customer}${result.return_time ? `，退货时间: ${result.return_time}` : ""}`
           : `${lookupBarcode} 未退货，客户: ${result.customer}`,
         "success"
       );
@@ -547,7 +587,7 @@ function App() {
     <div className="home-view">
       <div className="main-actions">
         <button className="large-btn ship" onClick={() => { setMode("shipment"); setReturnOwnerNotice(null); setView("shipment_setup"); }}>开始出货录入</button>
-        <button className="large-btn return" onClick={() => { setMode("return"); setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始退货录入</button>
+        <button className="large-btn return" onClick={() => { setMode("return"); setReturnTime(getLocalDateValue()); setReturnOwnerNotice(null); setView("recording"); setBatchBarcodes([]); }}>开始退货录入</button>
       </div>
       <div className="secondary-actions">
         <button onClick={handleNewTable}>新建表格</button>
@@ -584,6 +624,16 @@ function App() {
     <div className="recording-view">
       <div className="recording-header">
         <h2>{mode === "shipment" ? `出货录入中 - ${customer}` : "退货录入中"}</h2>
+        {mode === "return" && (
+          <label className="return-time-field">
+            退货时间
+            <input
+              type="date"
+              value={returnTime}
+              onChange={(e) => setReturnTime(e.target.value)}
+            />
+          </label>
+        )}
         <div className="batch-stats">当前批次已扫: <span>{batchBarcodes.length}</span> 件</div>
       </div>
       
@@ -650,7 +700,7 @@ function App() {
         <div className="summary-header">
           <div>
             <h3>总体统计</h3>
-            <span>总出货: {summary.total_shipments} | 总退货: {summary.total_returns}</span>
+            <span>总出货: {summary.total_shipments} | 总退货: {summary.total_returns} | 成功交货: {summary.total_delivered}</span>
           </div>
           <div className="summary-actions">
             <label className="unit-price-field">
@@ -697,6 +747,7 @@ function App() {
                 <th>客户</th>
                 <th>出货数量</th>
                 <th>退货数量</th>
+                <th>成功交货数量</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -714,6 +765,7 @@ function App() {
                   <td>{stat.name}</td>
                   <td>{stat.shipment_count} 件</td>
                   <td className={stat.return_count > 0 ? "has-returns" : ""}>{stat.return_count} 件</td>
+                  <td>{stat.delivered_count} 件</td>
                   <td>
                     <button type="button" className="row-export-btn" onClick={() => exportCustomerStatement(stat.name)}>
                       导出
@@ -721,7 +773,7 @@ function App() {
                   </td>
                 </tr>
               ))}
-              {summary.customer_stats.length === 0 && <tr><td colSpan={5} style={{textAlign:'center'}}>暂无数据</td></tr>}
+              {summary.customer_stats.length === 0 && <tr><td colSpan={6} style={{textAlign:'center'}}>暂无数据</td></tr>}
             </tbody>
           </table>
         </div>
@@ -758,6 +810,13 @@ function App() {
                 {columns.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
+            <div className="modal-row">
+              <label>退货时间列:</label>
+              <select value={retTimeCol} onChange={(e) => setRetTimeCol(e.target.value)}>
+                <option value="">无/旧表未记录</option>
+                {columns.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
             <div className="modal-buttons">
               <button onClick={confirmImport}>确认导入</button>
               <button onClick={() => setShowImportDialog(false)}>取消</button>
@@ -779,7 +838,7 @@ function App() {
                 placeholder="例如: 6月出退货"
                 autoFocus
               />
-              <p className="hint">新建前如果有未保存数据，会先要求保存；新表会创建为包含出货条码、客户、退货条码表头的 Excel 文件。</p>
+              <p className="hint">新建前如果有未保存数据，会先要求保存；新表会创建为包含出货条码、客户、退货条码、退货时间表头的 Excel 文件。</p>
             </div>
             <div className="modal-buttons">
               <button onClick={confirmNewTable}>确认新建</button>
@@ -801,7 +860,7 @@ function App() {
               >
                 {recipientListColumns.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
               </select>
-              <p className="hint">用于发送给收货人的单列清单，默认文件名会追加“出货”。</p>
+              <p className="hint">用于发送给收货人的清单；选择退货条码时会同时导出退货时间。</p>
             </div>
             <div className="modal-buttons">
               <button onClick={confirmRecipientListExport}>确认导出</button>
@@ -845,6 +904,12 @@ function App() {
                   <span className="lookup-label">状态</span>
                   <strong>{returnLookupResult.is_returned ? "已退货" : "未退货"}</strong>
                 </div>
+                {returnLookupResult.is_returned && (
+                  <div>
+                    <span className="lookup-label">时间</span>
+                    <strong>{returnLookupResult.return_time || "未记录"}</strong>
+                  </div>
+                )}
               </div>
             )}
           </div>

@@ -2,7 +2,8 @@ use calamine::{open_workbook_auto, Reader};
 use rodio::{source::SineWave, DeviceSinkBuilder, MixerDeviceSink, Source};
 use rust_xlsxwriter::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,7 +14,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 pub struct AppData {
     // barcode -> customer (owner)
     pub shipments: HashMap<String, String>,
-    pub returns: HashSet<String>,
+    // barcode -> return time
+    pub returns: HashMap<String, String>,
     pub is_dirty: bool,
 }
 
@@ -58,7 +60,7 @@ fn check_return(state: tauri::State<AppState>, barcode: String) -> Result<String
         .shipments
         .get(&barcode)
         .ok_or_else(|| format!("找不到此货 {}, 不是我们的货", barcode))?;
-    if data.returns.contains(&barcode) {
+    if data.returns.contains_key(&barcode) {
         return Err(format!("此货 {} 已经扫描过退货", barcode));
     }
     Ok(customer.clone())
@@ -69,6 +71,7 @@ pub struct ReturnLookupResult {
     pub barcode: String,
     pub customer: String,
     pub is_returned: bool,
+    pub return_time: Option<String>,
 }
 
 #[tauri::command]
@@ -81,12 +84,14 @@ fn lookup_return(
         .shipments
         .get(&barcode)
         .ok_or_else(|| format!("找不到此货 {}, 不是我们的货", barcode))?;
-    let is_returned = data.returns.contains(&barcode);
+    let return_time = data.returns.get(&barcode).cloned();
+    let is_returned = return_time.is_some();
 
     Ok(ReturnLookupResult {
         barcode: barcode.clone(),
         customer: customer.clone(),
         is_returned,
+        return_time,
     })
 }
 
@@ -114,12 +119,18 @@ fn commit_shipment_batch(
 fn commit_return_batch(
     state: tauri::State<AppState>,
     barcodes: Vec<String>,
+    return_time: String,
 ) -> Result<String, String> {
+    let return_time = return_time.trim().to_string();
+    if return_time.is_empty() {
+        return Err("请选择退货时间".into());
+    }
+
     let mut data = state.data.lock().unwrap();
     let mut added = 0;
     for bc in barcodes {
-        if data.shipments.contains_key(&bc) && !data.returns.contains(&bc) {
-            data.returns.insert(bc);
+        if data.shipments.contains_key(&bc) && !data.returns.contains_key(&bc) {
+            data.returns.insert(bc, return_time.clone());
             added += 1;
         }
     }
@@ -133,7 +144,16 @@ fn commit_return_batch(
 pub struct Summary {
     pub total_shipments: usize,
     pub total_returns: usize,
+    pub total_delivered: usize,
+    pub return_time_stats: Vec<ReturnTimeCustomerStat>,
     pub customer_stats: Vec<CustomerStat>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ReturnTimeCustomerStat {
+    pub return_time: String,
+    pub customer: String,
+    pub return_count: usize,
 }
 
 #[derive(Serialize)]
@@ -141,6 +161,7 @@ pub struct CustomerStat {
     pub name: String,
     pub shipment_count: usize,
     pub return_count: usize,
+    pub delivered_count: usize,
 }
 
 fn build_summary(data: &AppData) -> Summary {
@@ -153,11 +174,12 @@ fn build_summary(data: &AppData) -> Summary {
                 name: customer.clone(),
                 shipment_count: 0,
                 return_count: 0,
+                delivered_count: 0,
             })
             .shipment_count += 1;
     }
 
-    for barcode in &data.returns {
+    for barcode in data.returns.keys() {
         if let Some(customer) = data.shipments.get(barcode) {
             stats
                 .entry(customer.clone())
@@ -165,17 +187,29 @@ fn build_summary(data: &AppData) -> Summary {
                     name: customer.clone(),
                     shipment_count: 0,
                     return_count: 0,
+                    delivered_count: 0,
                 })
                 .return_count += 1;
         }
     }
 
     let mut customer_stats: Vec<_> = stats.into_values().collect();
+    for stat in &mut customer_stats {
+        stat.delivered_count = stat.shipment_count.saturating_sub(stat.return_count);
+    }
     customer_stats.sort_by(|a, b| b.shipment_count.cmp(&a.shipment_count));
 
     Summary {
         total_shipments: data.shipments.len(),
         total_returns: data.returns.len(),
+        total_delivered: data.shipments.len().saturating_sub(data.returns.len()),
+        return_time_stats: build_return_time_customer_stats(data.returns.iter().filter_map(
+            |(barcode, return_time)| {
+                data.shipments
+                    .get(barcode)
+                    .map(|customer| (return_time.as_str(), customer.as_str()))
+            },
+        )),
         customer_stats,
     }
 }
@@ -212,6 +246,7 @@ async fn import_data(
     path: String,
     ship_col: String,
     return_col: String,
+    return_time_col: Option<String>,
     customer_col: String,
 ) -> Result<(), String> {
     let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
@@ -244,6 +279,15 @@ async fn import_data(
         .iter()
         .position(|c| c == &customer_col)
         .ok_or("未找到客户列")?;
+    let return_time_idx = match return_time_col.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(col) => Some(
+            header
+                .iter()
+                .position(|c| c == col)
+                .ok_or("未找到退货时间列")?,
+        ),
+    };
 
     let mut data = state.data.lock().unwrap();
     data.shipments.clear();
@@ -271,6 +315,12 @@ async fn import_data(
             .unwrap_or_default()
             .trim()
             .to_string();
+        let return_time_val = return_time_idx
+            .and_then(|idx| row.get(idx))
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
 
         if !customer_val.is_empty() {
             last_customer = customer_val;
@@ -280,7 +330,7 @@ async fn import_data(
             data.shipments.insert(ship_val, last_customer.clone());
         }
         if !return_val.is_empty() {
-            data.returns.insert(return_val);
+            data.returns.insert(return_val, return_time_val);
         }
     }
     Ok(())
@@ -322,6 +372,9 @@ fn write_empty_inventory_workbook(
     worksheet
         .write_with_format(0, 2, "退货条码", &header_format)
         .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(0, 3, "退货时间", &header_format)
+        .map_err(|e| e.to_string())?;
 
     worksheet
         .set_column_width(0, 30)
@@ -331,6 +384,9 @@ fn write_empty_inventory_workbook(
         .map_err(|e| e.to_string())?;
     worksheet
         .set_column_width(2, 30)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(3, 18)
         .map_err(|e| e.to_string())?;
 
     workbook.save(path.into()).map_err(|e| e.to_string())?;
@@ -358,6 +414,137 @@ async fn create_new_workbook(
     Ok(())
 }
 
+fn compare_return_times(a_time: &str, b_time: &str) -> Ordering {
+    let a_missing_time = a_time.trim().is_empty();
+    let b_missing_time = b_time.trim().is_empty();
+    a_missing_time
+        .cmp(&b_missing_time)
+        .then_with(|| a_time.cmp(b_time))
+}
+
+fn compare_return_fields(a_barcode: &str, a_time: &str, b_barcode: &str, b_time: &str) -> Ordering {
+    compare_return_times(a_time, b_time).then_with(|| a_barcode.cmp(b_barcode))
+}
+
+fn build_return_time_customer_stats<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<ReturnTimeCustomerStat> {
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for (return_time, customer) in entries {
+        *counts
+            .entry((return_time.trim().to_string(), customer.trim().to_string()))
+            .or_insert(0) += 1;
+    }
+
+    let mut stats: Vec<_> = counts
+        .into_iter()
+        .map(
+            |((return_time, customer), return_count)| ReturnTimeCustomerStat {
+                return_time,
+                customer,
+                return_count,
+            },
+        )
+        .collect();
+    stats.sort_by(|a, b| {
+        compare_return_times(&a.return_time, &b.return_time)
+            .then_with(|| a.customer.cmp(&b.customer))
+    });
+    stats
+}
+
+fn return_time_display_label(return_time: &str) -> String {
+    let return_time = return_time.trim();
+    if return_time.is_empty() {
+        return "未记录时间".to_string();
+    }
+
+    let mut parts = return_time.split('-');
+    if let (Some(_year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    {
+        if let (Ok(month), Ok(day)) = (month.parse::<u32>(), day.parse::<u32>()) {
+            return format!("{month}月{day}日");
+        }
+    }
+
+    return_time.to_string()
+}
+
+fn write_return_time_customer_stats(
+    worksheet: &mut Worksheet,
+    start_row: u32,
+    stats: &[ReturnTimeCustomerStat],
+    header_format: &Format,
+    text_format: &Format,
+    integer_format: &Format,
+    total_format: &Format,
+) -> Result<u32, String> {
+    if stats.is_empty() {
+        return Ok(start_row);
+    }
+
+    worksheet
+        .write_with_format(start_row, 0, "退货时间统计", header_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(start_row, 1, "客户", header_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(start_row, 2, "数量", header_format)
+        .map_err(|e| e.to_string())?;
+
+    let mut current_row = start_row + 1;
+    let mut i = 0;
+    while i < stats.len() {
+        let return_time = stats[i].return_time.as_str();
+        let group_start = i;
+        let mut group_total = 0usize;
+        while i < stats.len() && stats[i].return_time == return_time {
+            group_total += stats[i].return_count;
+            i += 1;
+        }
+
+        if i - group_start > 1 {
+            worksheet
+                .write_with_format(
+                    current_row,
+                    0,
+                    return_time_display_label(return_time),
+                    total_format,
+                )
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write_with_format(current_row, 1, "合计", total_format)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write_with_format(current_row, 2, group_total as u32, total_format)
+                .map_err(|e| e.to_string())?;
+            current_row += 1;
+        }
+
+        for stat in &stats[group_start..i] {
+            worksheet
+                .write_with_format(
+                    current_row,
+                    0,
+                    return_time_display_label(&stat.return_time),
+                    text_format,
+                )
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write_with_format(current_row, 1, &stat.customer, text_format)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write_with_format(current_row, 2, stat.return_count as u32, integer_format)
+                .map_err(|e| e.to_string())?;
+            current_row += 1;
+        }
+    }
+
+    Ok(current_row)
+}
+
 #[tauri::command]
 async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
     let mut data = state.data.lock().unwrap();
@@ -376,6 +563,9 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
     worksheet
         .write(0, 2, "退货条码")
         .map_err(|e| e.to_string())?;
+    worksheet
+        .write(0, 3, "退货时间")
+        .map_err(|e| e.to_string())?;
 
     worksheet
         .set_column_width(0, 30)
@@ -385,6 +575,9 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
         .map_err(|e| e.to_string())?;
     worksheet
         .set_column_width(2, 30)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(3, 18)
         .map_err(|e| e.to_string())?;
 
     // Group shipments by customer
@@ -403,20 +596,37 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
     for cust in customers {
         let barcodes = &shipments_by_cust[cust];
         let start_row = row_idx;
+
+        let mut active_barcodes = Vec::new();
+        let mut returned_barcodes = Vec::new();
         for barcode in barcodes {
-            if data.returns.contains(barcode) {
-                worksheet
-                    .write_with_format(row_idx as u32, 0, barcode, &red_format)
-                    .map_err(|e| e.to_string())?;
+            if let Some(return_time) = data.returns.get(barcode) {
+                returned_barcodes.push((barcode, return_time));
             } else {
-                worksheet
-                    .write(row_idx as u32, 0, barcode)
-                    .map_err(|e| e.to_string())?;
+                active_barcodes.push(barcode);
             }
+        }
+        active_barcodes.sort();
+        returned_barcodes.sort_by(|(a_barcode, a_time), (b_barcode, b_time)| {
+            compare_return_fields(a_barcode, a_time, b_barcode, b_time)
+        });
+
+        for barcode in active_barcodes {
+            worksheet
+                .write(row_idx as u32, 0, barcode)
+                .map_err(|e| e.to_string())?;
             row_idx += 1;
         }
 
-        if barcodes.len() > 1 {
+        for (barcode, _) in returned_barcodes {
+            worksheet
+                .write_with_format(row_idx as u32, 0, barcode, &red_format)
+                .map_err(|e| e.to_string())?;
+            row_idx += 1;
+        }
+
+        let row_count = row_idx - start_row;
+        if row_count > 1 {
             worksheet
                 .merge_range(
                     start_row as u32,
@@ -427,20 +637,25 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
                     &center_format,
                 )
                 .map_err(|e| e.to_string())?;
-        } else if barcodes.len() == 1 {
+        } else if row_count == 1 {
             worksheet
                 .write_with_format(start_row as u32, 1, cust, &center_format)
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    // Write returns list independently in Column C
+    // Write returns list independently in Columns C-D.
     let mut returns_vec: Vec<_> = data.returns.iter().collect();
-    returns_vec.sort();
+    returns_vec.sort_by(|(a_barcode, a_time), (b_barcode, b_time)| {
+        compare_return_fields(a_barcode, a_time, b_barcode, b_time)
+    });
 
-    for (i, barcode) in returns_vec.into_iter().enumerate() {
+    for (i, (barcode, return_time)) in returns_vec.into_iter().enumerate() {
         worksheet
             .write((i + 1) as u32, 2, barcode)
+            .map_err(|e| e.to_string())?;
+        worksheet
+            .write((i + 1) as u32, 3, return_time)
             .map_err(|e| e.to_string())?;
     }
 
@@ -472,7 +687,7 @@ async fn export_recipient_list(
             let mut active_rows = Vec::new();
             let mut returned_rows = Vec::new();
             for barcode in data.shipments.keys() {
-                if data.returns.contains(barcode) {
+                if data.returns.contains_key(barcode) {
                     returned_rows.push(barcode);
                 } else {
                     active_rows.push(barcode);
@@ -515,14 +730,25 @@ async fn export_recipient_list(
                 .write(0, 0, "退货条码")
                 .map_err(|e| e.to_string())?;
             worksheet
+                .write(0, 1, "退货时间")
+                .map_err(|e| e.to_string())?;
+            worksheet
                 .set_column_width(0, 30)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .set_column_width(1, 18)
                 .map_err(|e| e.to_string())?;
 
             let mut rows: Vec<_> = data.returns.iter().collect();
-            rows.sort();
-            for (i, barcode) in rows.into_iter().enumerate() {
+            rows.sort_by(|(a_barcode, a_time), (b_barcode, b_time)| {
+                compare_return_fields(a_barcode, a_time, b_barcode, b_time)
+            });
+            for (i, (barcode, return_time)) in rows.into_iter().enumerate() {
                 worksheet
                     .write((i + 1) as u32, 0, barcode)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write((i + 1) as u32, 1, return_time)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -536,9 +762,14 @@ async fn export_recipient_list(
 struct CustomerStatementRow {
     customer: String,
     shipment_barcodes: Vec<String>,
-    return_barcodes: Vec<String>,
+    return_entries: Vec<ReturnEntry>,
     shipment_count: usize,
     return_count: usize,
+}
+
+struct ReturnEntry {
+    barcode: String,
+    return_time: String,
 }
 
 fn customer_statement_row(data: &AppData, customer: &str) -> Result<CustomerStatementRow, String> {
@@ -555,33 +786,38 @@ fn customer_statement_row(data: &AppData, customer: &str) -> Result<CustomerStat
         .collect();
     shipment_barcodes.sort();
 
-    let mut return_barcodes: Vec<_> = data
+    let mut return_entries: Vec<_> = data
         .returns
         .iter()
-        .filter_map(|barcode| {
+        .filter_map(|(barcode, return_time)| {
             if data
                 .shipments
                 .get(barcode)
                 .is_some_and(|owner| owner == customer)
             {
-                Some(barcode.clone())
+                Some(ReturnEntry {
+                    barcode: barcode.clone(),
+                    return_time: return_time.clone(),
+                })
             } else {
                 None
             }
         })
         .collect();
-    return_barcodes.sort();
+    return_entries.sort_by(|a, b| {
+        compare_return_fields(&a.barcode, &a.return_time, &b.barcode, &b.return_time)
+    });
 
-    if shipment_barcodes.is_empty() && return_barcodes.is_empty() {
+    if shipment_barcodes.is_empty() && return_entries.is_empty() {
         return Err(format!("客户 {} 没有可导出的出退货数据", customer));
     }
 
     Ok(CustomerStatementRow {
         customer: customer.to_string(),
         shipment_count: shipment_barcodes.len(),
-        return_count: return_barcodes.len(),
+        return_count: return_entries.len(),
         shipment_barcodes,
-        return_barcodes,
+        return_entries,
     })
 }
 
@@ -633,9 +869,14 @@ fn write_customer_statement(
 
     let total_shipments: usize = rows.iter().map(|row| row.shipment_count).sum();
     let total_returns: usize = rows.iter().map(|row| row.return_count).sum();
+    let return_time_stats = build_return_time_customer_stats(rows.iter().flat_map(|row| {
+        row.return_entries
+            .iter()
+            .map(|entry| (entry.return_time.as_str(), row.customer.as_str()))
+    }));
 
     worksheet
-        .merge_range(0, 0, 0, 6, "出退货清单", &title_format)
+        .merge_range(0, 0, 0, 7, "出退货清单", &title_format)
         .map_err(|e| e.to_string())?;
     worksheet
         .write_with_format(1, 0, "总数", &total_format)
@@ -650,6 +891,19 @@ fn write_customer_statement(
         .write_with_format(1, 3, total_returns as u32, &total_format)
         .map_err(|e| e.to_string())?;
 
+    let mut detail_header_row = 3u32;
+    if !return_time_stats.is_empty() {
+        detail_header_row = write_return_time_customer_stats(
+            &mut *worksheet,
+            detail_header_row,
+            &return_time_stats,
+            &header_format,
+            &text_format,
+            &integer_format,
+            &total_format,
+        )?;
+    }
+
     let headers = [
         "客户",
         "出货数量",
@@ -658,19 +912,20 @@ fn write_customer_statement(
         "最终货款",
         "出货编码",
         "退货编码",
+        "退货时间",
     ];
     for (col, header) in headers.iter().enumerate() {
         worksheet
-            .write_with_format(3, col as u16, *header, &header_format)
+            .write_with_format(detail_header_row, col as u16, *header, &header_format)
             .map_err(|e| e.to_string())?;
     }
 
-    let mut current_row = 4u32;
+    let mut current_row = detail_header_row + 1;
     for row in rows {
         let num_barcodes = row
             .shipment_barcodes
             .len()
-            .max(row.return_barcodes.len())
+            .max(row.return_entries.len())
             .max(1);
         let start_row = current_row;
         let end_row = current_row + num_barcodes as u32 - 1;
@@ -751,13 +1006,19 @@ fn write_customer_statement(
                     .map_err(|e| e.to_string())?;
             }
 
-            if let Some(barcode) = row.return_barcodes.get(i) {
+            if let Some(entry) = row.return_entries.get(i) {
                 worksheet
-                    .write_with_format(r, 6, barcode, &text_format)
+                    .write_with_format(r, 6, &entry.barcode, &text_format)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write_with_format(r, 7, &entry.return_time, &text_format)
                     .map_err(|e| e.to_string())?;
             } else {
                 worksheet
                     .write_with_format(r, 6, "", &text_format)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write_with_format(r, 7, "", &text_format)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -786,6 +1047,9 @@ fn write_customer_statement(
     worksheet
         .set_column_width(6, 34)
         .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(7, 18)
+        .map_err(|e| e.to_string())?;
 
     workbook.save(path.into()).map_err(|e| e.to_string())?;
     Ok(())
@@ -810,7 +1074,7 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
         .set_border(FormatBorder::Thin);
 
     worksheet
-        .merge_range(0, 0, 0, 5, "总出退货数量表", &title_format)
+        .merge_range(0, 0, 0, 7, "总出退货数量表", &title_format)
         .map_err(|e| e.to_string())?;
     worksheet
         .write_with_format(1, 0, "总出货", &total_format)
@@ -830,15 +1094,34 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
     worksheet
         .write_with_format(1, 5, summary.customer_stats.len() as u32, &total_format)
         .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 6, "成功交货", &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(1, 7, summary.total_delivered as u32, &total_format)
+        .map_err(|e| e.to_string())?;
 
-    let headers = ["客户", "出货数量", "退货数量"];
+    let mut detail_header_row = 3u32;
+    if !summary.return_time_stats.is_empty() {
+        detail_header_row = write_return_time_customer_stats(
+            &mut *worksheet,
+            detail_header_row,
+            &summary.return_time_stats,
+            &header_format,
+            &text_format,
+            &integer_format,
+            &total_format,
+        )?;
+    }
+
+    let headers = ["客户", "出货数量", "退货数量", "成功交货数量"];
     for (col, header) in headers.iter().enumerate() {
         worksheet
-            .write_with_format(3, col as u16, *header, &header_format)
+            .write_with_format(detail_header_row, col as u16, *header, &header_format)
             .map_err(|e| e.to_string())?;
     }
 
-    let mut current_row = 4u32;
+    let mut current_row = detail_header_row + 1;
     for stat in &summary.customer_stats {
         worksheet
             .write_with_format(current_row, 0, &stat.name, &text_format)
@@ -848,6 +1131,9 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
             .map_err(|e| e.to_string())?;
         worksheet
             .write_with_format(current_row, 2, stat.return_count as u32, &integer_format)
+            .map_err(|e| e.to_string())?;
+        worksheet
+            .write_with_format(current_row, 3, stat.delivered_count as u32, &integer_format)
             .map_err(|e| e.to_string())?;
         current_row += 1;
     }
@@ -865,6 +1151,14 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
         .map_err(|e| e.to_string())?;
     worksheet
         .write_with_format(current_row, 2, summary.total_returns as u32, &total_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(
+            current_row,
+            3,
+            summary.total_delivered as u32,
+            &total_format,
+        )
         .map_err(|e| e.to_string())?;
 
     worksheet
@@ -884,6 +1178,12 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
         .map_err(|e| e.to_string())?;
     worksheet
         .set_column_width(5, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(6, 12)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(7, 12)
         .map_err(|e| e.to_string())?;
 
     workbook.save(path.into()).map_err(|e| e.to_string())?;

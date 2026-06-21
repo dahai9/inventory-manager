@@ -120,6 +120,8 @@ h1 {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 1.5rem;
+  gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .batch-stats {
@@ -130,6 +132,21 @@ h1 {
   font-weight: bold;
   color: #007bff;
   font-size: 1.8rem;
+}
+
+.return-time-field {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  white-space: nowrap;
+}
+
+.return-time-field input {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 1rem;
 }
 
 .barcode-form {
