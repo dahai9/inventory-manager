@@ -12,11 +12,17 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct AppData {
-    // barcode -> customer (owner)
-    pub shipments: HashMap<String, String>,
+    // barcode -> shipment record
+    pub shipments: HashMap<String, ShipmentRecord>,
     // barcode -> return time
     pub returns: HashMap<String, String>,
     pub is_dirty: bool,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct ShipmentRecord {
+    pub customer: String,
+    pub shipment_time: String,
 }
 
 pub struct AppState {
@@ -56,20 +62,21 @@ fn check_shipment(state: tauri::State<AppState>, barcode: String) -> Result<(), 
 #[tauri::command]
 fn check_return(state: tauri::State<AppState>, barcode: String) -> Result<String, String> {
     let data = state.data.lock().unwrap();
-    let customer = data
+    let shipment = data
         .shipments
         .get(&barcode)
         .ok_or_else(|| format!("找不到此货 {}, 不是我们的货", barcode))?;
     if data.returns.contains_key(&barcode) {
         return Err(format!("此货 {} 已经扫描过退货", barcode));
     }
-    Ok(customer.clone())
+    Ok(shipment.customer.clone())
 }
 
 #[derive(Serialize)]
 pub struct ReturnLookupResult {
     pub barcode: String,
     pub customer: String,
+    pub shipment_time: String,
     pub is_returned: bool,
     pub return_time: Option<String>,
 }
@@ -80,7 +87,7 @@ fn lookup_return(
     barcode: String,
 ) -> Result<ReturnLookupResult, String> {
     let data = state.data.lock().unwrap();
-    let customer = data
+    let shipment = data
         .shipments
         .get(&barcode)
         .ok_or_else(|| format!("找不到此货 {}, 不是我们的货", barcode))?;
@@ -89,7 +96,8 @@ fn lookup_return(
 
     Ok(ReturnLookupResult {
         barcode: barcode.clone(),
-        customer: customer.clone(),
+        customer: shipment.customer.clone(),
+        shipment_time: shipment.shipment_time.clone(),
         is_returned,
         return_time,
     })
@@ -99,13 +107,29 @@ fn lookup_return(
 fn commit_shipment_batch(
     state: tauri::State<AppState>,
     customer: String,
+    shipment_time: String,
     barcodes: Vec<String>,
 ) -> Result<String, String> {
+    let customer = customer.trim().to_string();
+    if customer.is_empty() {
+        return Err("请输入客户名称".into());
+    }
+    let shipment_time = shipment_time.trim().to_string();
+    if shipment_time.is_empty() {
+        return Err("请选择出货时间".into());
+    }
+
     let mut data = state.data.lock().unwrap();
     let mut added = 0;
     for bc in barcodes {
         if !data.shipments.contains_key(&bc) {
-            data.shipments.insert(bc, customer.clone());
+            data.shipments.insert(
+                bc,
+                ShipmentRecord {
+                    customer: customer.clone(),
+                    shipment_time: shipment_time.clone(),
+                },
+            );
             added += 1;
         }
     }
@@ -167,11 +191,11 @@ pub struct CustomerStat {
 fn build_summary(data: &AppData) -> Summary {
     let mut stats: HashMap<String, CustomerStat> = HashMap::new();
 
-    for customer in data.shipments.values() {
+    for shipment in data.shipments.values() {
         stats
-            .entry(customer.clone())
+            .entry(shipment.customer.clone())
             .or_insert(CustomerStat {
-                name: customer.clone(),
+                name: shipment.customer.clone(),
                 shipment_count: 0,
                 return_count: 0,
                 delivered_count: 0,
@@ -180,11 +204,11 @@ fn build_summary(data: &AppData) -> Summary {
     }
 
     for barcode in data.returns.keys() {
-        if let Some(customer) = data.shipments.get(barcode) {
+        if let Some(shipment) = data.shipments.get(barcode) {
             stats
-                .entry(customer.clone())
+                .entry(shipment.customer.clone())
                 .or_insert(CustomerStat {
-                    name: customer.clone(),
+                    name: shipment.customer.clone(),
                     shipment_count: 0,
                     return_count: 0,
                     delivered_count: 0,
@@ -207,7 +231,7 @@ fn build_summary(data: &AppData) -> Summary {
             |(barcode, return_time)| {
                 data.shipments
                     .get(barcode)
-                    .map(|customer| (return_time.as_str(), customer.as_str()))
+                    .map(|shipment| (return_time.as_str(), shipment.customer.as_str()))
             },
         )),
         customer_stats,
@@ -245,6 +269,7 @@ async fn import_data(
     state: tauri::State<'_, AppState>,
     path: String,
     ship_col: String,
+    shipment_time_col: Option<String>,
     return_col: String,
     return_time_col: Option<String>,
     customer_col: String,
@@ -279,6 +304,15 @@ async fn import_data(
         .iter()
         .position(|c| c == &customer_col)
         .ok_or("未找到客户列")?;
+    let shipment_time_idx = match shipment_time_col.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(col) => Some(
+            header
+                .iter()
+                .position(|c| c == col)
+                .ok_or("未找到出货时间列")?,
+        ),
+    };
     let return_time_idx = match return_time_col.as_deref().map(str::trim) {
         Some("") | None => None,
         Some(col) => Some(
@@ -315,6 +349,12 @@ async fn import_data(
             .unwrap_or_default()
             .trim()
             .to_string();
+        let shipment_time_val = shipment_time_idx
+            .and_then(|idx| row.get(idx))
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let return_time_val = return_time_idx
             .and_then(|idx| row.get(idx))
             .map(|v| v.to_string())
@@ -327,7 +367,13 @@ async fn import_data(
         }
 
         if !ship_val.is_empty() {
-            data.shipments.insert(ship_val, last_customer.clone());
+            data.shipments.insert(
+                ship_val,
+                ShipmentRecord {
+                    customer: last_customer.clone(),
+                    shipment_time: shipment_time_val,
+                },
+            );
         }
         if !return_val.is_empty() {
             data.returns.insert(return_val, return_time_val);
@@ -370,10 +416,13 @@ fn write_empty_inventory_workbook(
         .write_with_format(0, 1, "客户", &header_format)
         .map_err(|e| e.to_string())?;
     worksheet
-        .write_with_format(0, 2, "退货条码", &header_format)
+        .write_with_format(0, 2, "出货时间", &header_format)
         .map_err(|e| e.to_string())?;
     worksheet
-        .write_with_format(0, 3, "退货时间", &header_format)
+        .write_with_format(0, 3, "退货条码", &header_format)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write_with_format(0, 4, "退货时间", &header_format)
         .map_err(|e| e.to_string())?;
 
     worksheet
@@ -383,10 +432,13 @@ fn write_empty_inventory_workbook(
         .set_column_width(1, 20)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(2, 30)
+        .set_column_width(2, 18)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(3, 18)
+        .set_column_width(3, 30)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(4, 18)
         .map_err(|e| e.to_string())?;
 
     workbook.save(path.into()).map_err(|e| e.to_string())?;
@@ -424,6 +476,16 @@ fn compare_return_times(a_time: &str, b_time: &str) -> Ordering {
 
 fn compare_return_fields(a_barcode: &str, a_time: &str, b_barcode: &str, b_time: &str) -> Ordering {
     compare_return_times(a_time, b_time).then_with(|| a_barcode.cmp(b_barcode))
+}
+
+#[derive(Clone)]
+struct ShipmentEntry {
+    barcode: String,
+    shipment_time: String,
+}
+
+fn compare_shipment_fields(a: &ShipmentEntry, b: &ShipmentEntry) -> Ordering {
+    compare_return_times(&a.shipment_time, &b.shipment_time).then_with(|| a.barcode.cmp(&b.barcode))
 }
 
 fn build_return_time_customer_stats<'a>(
@@ -561,10 +623,13 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
         .map_err(|e| e.to_string())?;
     worksheet.write(0, 1, "客户").map_err(|e| e.to_string())?;
     worksheet
-        .write(0, 2, "退货条码")
+        .write(0, 2, "出货时间")
         .map_err(|e| e.to_string())?;
     worksheet
-        .write(0, 3, "退货时间")
+        .write(0, 3, "退货条码")
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .write(0, 4, "退货时间")
         .map_err(|e| e.to_string())?;
 
     worksheet
@@ -574,19 +639,25 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
         .set_column_width(1, 20)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(2, 30)
+        .set_column_width(2, 18)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(3, 18)
+        .set_column_width(3, 30)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(4, 18)
         .map_err(|e| e.to_string())?;
 
     // Group shipments by customer
-    let mut shipments_by_cust: HashMap<String, Vec<String>> = HashMap::new();
-    for (barcode, customer) in &data.shipments {
+    let mut shipments_by_cust: HashMap<String, Vec<ShipmentEntry>> = HashMap::new();
+    for (barcode, shipment) in &data.shipments {
         shipments_by_cust
-            .entry(customer.clone())
+            .entry(shipment.customer.clone())
             .or_default()
-            .push(barcode.clone());
+            .push(ShipmentEntry {
+                barcode: barcode.clone(),
+                shipment_time: shipment.shipment_time.clone(),
+            });
     }
 
     let mut row_idx = 1;
@@ -594,33 +665,39 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
     customers.sort();
 
     for cust in customers {
-        let barcodes = &shipments_by_cust[cust];
+        let entries = &shipments_by_cust[cust];
         let start_row = row_idx;
 
         let mut active_barcodes = Vec::new();
         let mut returned_barcodes = Vec::new();
-        for barcode in barcodes {
-            if let Some(return_time) = data.returns.get(barcode) {
-                returned_barcodes.push((barcode, return_time));
+        for entry in entries {
+            if let Some(return_time) = data.returns.get(&entry.barcode) {
+                returned_barcodes.push((entry, return_time));
             } else {
-                active_barcodes.push(barcode);
+                active_barcodes.push(entry);
             }
         }
-        active_barcodes.sort();
-        returned_barcodes.sort_by(|(a_barcode, a_time), (b_barcode, b_time)| {
-            compare_return_fields(a_barcode, a_time, b_barcode, b_time)
+        active_barcodes.sort_by(|a, b| compare_shipment_fields(a, b));
+        returned_barcodes.sort_by(|(a_entry, a_time), (b_entry, b_time)| {
+            compare_return_fields(&a_entry.barcode, a_time, &b_entry.barcode, b_time)
         });
 
-        for barcode in active_barcodes {
+        for entry in active_barcodes {
             worksheet
-                .write(row_idx as u32, 0, barcode)
+                .write(row_idx as u32, 0, &entry.barcode)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write(row_idx as u32, 2, &entry.shipment_time)
                 .map_err(|e| e.to_string())?;
             row_idx += 1;
         }
 
-        for (barcode, _) in returned_barcodes {
+        for (entry, _) in returned_barcodes {
             worksheet
-                .write_with_format(row_idx as u32, 0, barcode, &red_format)
+                .write_with_format(row_idx as u32, 0, &entry.barcode, &red_format)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .write(row_idx as u32, 2, &entry.shipment_time)
                 .map_err(|e| e.to_string())?;
             row_idx += 1;
         }
@@ -644,7 +721,7 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
         }
     }
 
-    // Write returns list independently in Columns C-D.
+    // Write returns list independently in Columns D-E.
     let mut returns_vec: Vec<_> = data.returns.iter().collect();
     returns_vec.sort_by(|(a_barcode, a_time), (b_barcode, b_time)| {
         compare_return_fields(a_barcode, a_time, b_barcode, b_time)
@@ -652,10 +729,10 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
 
     for (i, (barcode, return_time)) in returns_vec.into_iter().enumerate() {
         worksheet
-            .write((i + 1) as u32, 2, barcode)
+            .write((i + 1) as u32, 3, barcode)
             .map_err(|e| e.to_string())?;
         worksheet
-            .write((i + 1) as u32, 3, return_time)
+            .write((i + 1) as u32, 4, return_time)
             .map_err(|e| e.to_string())?;
     }
 
@@ -681,31 +758,47 @@ async fn export_recipient_list(
                 .write(0, 0, "出货条码")
                 .map_err(|e| e.to_string())?;
             worksheet
+                .write(0, 1, "出货时间")
+                .map_err(|e| e.to_string())?;
+            worksheet
                 .set_column_width(0, 30)
+                .map_err(|e| e.to_string())?;
+            worksheet
+                .set_column_width(1, 18)
                 .map_err(|e| e.to_string())?;
 
             let mut active_rows = Vec::new();
             let mut returned_rows = Vec::new();
-            for barcode in data.shipments.keys() {
+            for (barcode, shipment) in &data.shipments {
+                let entry = ShipmentEntry {
+                    barcode: barcode.clone(),
+                    shipment_time: shipment.shipment_time.clone(),
+                };
                 if data.returns.contains_key(barcode) {
-                    returned_rows.push(barcode);
+                    returned_rows.push(entry);
                 } else {
-                    active_rows.push(barcode);
+                    active_rows.push(entry);
                 }
             }
-            active_rows.sort();
-            returned_rows.sort();
+            active_rows.sort_by(compare_shipment_fields);
+            returned_rows.sort_by(compare_shipment_fields);
 
             let mut row_idx = 1;
-            for barcode in active_rows {
+            for entry in active_rows {
                 worksheet
-                    .write(row_idx, 0, barcode)
+                    .write(row_idx, 0, &entry.barcode)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write(row_idx, 1, &entry.shipment_time)
                     .map_err(|e| e.to_string())?;
                 row_idx += 1;
             }
-            for barcode in returned_rows {
+            for entry in returned_rows {
                 worksheet
-                    .write_with_format(row_idx, 0, barcode, &red_format)
+                    .write_with_format(row_idx, 0, &entry.barcode, &red_format)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write(row_idx, 1, &entry.shipment_time)
                     .map_err(|e| e.to_string())?;
                 row_idx += 1;
             }
@@ -716,7 +809,11 @@ async fn export_recipient_list(
                 .set_column_width(0, 20)
                 .map_err(|e| e.to_string())?;
 
-            let mut rows: Vec<_> = data.shipments.values().collect();
+            let mut rows: Vec<_> = data
+                .shipments
+                .values()
+                .map(|shipment| shipment.customer.as_str())
+                .collect();
             rows.sort();
             rows.dedup();
             for (i, customer) in rows.into_iter().enumerate() {
@@ -761,7 +858,7 @@ async fn export_recipient_list(
 
 struct CustomerStatementRow {
     customer: String,
-    shipment_barcodes: Vec<String>,
+    shipment_entries: Vec<ShipmentEntry>,
     return_entries: Vec<ReturnEntry>,
     shipment_count: usize,
     return_count: usize,
@@ -773,18 +870,21 @@ struct ReturnEntry {
 }
 
 fn customer_statement_row(data: &AppData, customer: &str) -> Result<CustomerStatementRow, String> {
-    let mut shipment_barcodes: Vec<_> = data
+    let mut shipment_entries: Vec<_> = data
         .shipments
         .iter()
-        .filter_map(|(barcode, owner)| {
-            if owner == customer {
-                Some(barcode.clone())
+        .filter_map(|(barcode, shipment)| {
+            if shipment.customer == customer {
+                Some(ShipmentEntry {
+                    barcode: barcode.clone(),
+                    shipment_time: shipment.shipment_time.clone(),
+                })
             } else {
                 None
             }
         })
         .collect();
-    shipment_barcodes.sort();
+    shipment_entries.sort_by(compare_shipment_fields);
 
     let mut return_entries: Vec<_> = data
         .returns
@@ -793,7 +893,7 @@ fn customer_statement_row(data: &AppData, customer: &str) -> Result<CustomerStat
             if data
                 .shipments
                 .get(barcode)
-                .is_some_and(|owner| owner == customer)
+                .is_some_and(|shipment| shipment.customer == customer)
             {
                 Some(ReturnEntry {
                     barcode: barcode.clone(),
@@ -808,15 +908,15 @@ fn customer_statement_row(data: &AppData, customer: &str) -> Result<CustomerStat
         compare_return_fields(&a.barcode, &a.return_time, &b.barcode, &b.return_time)
     });
 
-    if shipment_barcodes.is_empty() && return_entries.is_empty() {
+    if shipment_entries.is_empty() && return_entries.is_empty() {
         return Err(format!("客户 {} 没有可导出的出退货数据", customer));
     }
 
     Ok(CustomerStatementRow {
         customer: customer.to_string(),
-        shipment_count: shipment_barcodes.len(),
+        shipment_count: shipment_entries.len(),
         return_count: return_entries.len(),
-        shipment_barcodes,
+        shipment_entries,
         return_entries,
     })
 }
@@ -876,7 +976,7 @@ fn write_customer_statement(
     }));
 
     worksheet
-        .merge_range(0, 0, 0, 7, "出退货清单", &title_format)
+        .merge_range(0, 0, 0, 8, "出退货清单", &title_format)
         .map_err(|e| e.to_string())?;
     worksheet
         .write_with_format(1, 0, "总数", &total_format)
@@ -911,6 +1011,7 @@ fn write_customer_statement(
         "单价",
         "最终货款",
         "出货编码",
+        "出货时间",
         "退货编码",
         "退货时间",
     ];
@@ -923,7 +1024,7 @@ fn write_customer_statement(
     let mut current_row = detail_header_row + 1;
     for row in rows {
         let num_barcodes = row
-            .shipment_barcodes
+            .shipment_entries
             .len()
             .max(row.return_entries.len())
             .max(1);
@@ -996,29 +1097,35 @@ fn write_customer_statement(
 
         for i in 0..num_barcodes {
             let r = start_row + i as u32;
-            if let Some(barcode) = row.shipment_barcodes.get(i) {
+            if let Some(entry) = row.shipment_entries.get(i) {
                 worksheet
-                    .write_with_format(r, 5, barcode, &text_format)
+                    .write_with_format(r, 5, &entry.barcode, &text_format)
+                    .map_err(|e| e.to_string())?;
+                worksheet
+                    .write_with_format(r, 6, &entry.shipment_time, &text_format)
                     .map_err(|e| e.to_string())?;
             } else {
                 worksheet
                     .write_with_format(r, 5, "", &text_format)
                     .map_err(|e| e.to_string())?;
+                worksheet
+                    .write_with_format(r, 6, "", &text_format)
+                    .map_err(|e| e.to_string())?;
             }
 
             if let Some(entry) = row.return_entries.get(i) {
                 worksheet
-                    .write_with_format(r, 6, &entry.barcode, &text_format)
+                    .write_with_format(r, 7, &entry.barcode, &text_format)
                     .map_err(|e| e.to_string())?;
                 worksheet
-                    .write_with_format(r, 7, &entry.return_time, &text_format)
+                    .write_with_format(r, 8, &entry.return_time, &text_format)
                     .map_err(|e| e.to_string())?;
             } else {
                 worksheet
-                    .write_with_format(r, 6, "", &text_format)
+                    .write_with_format(r, 7, "", &text_format)
                     .map_err(|e| e.to_string())?;
                 worksheet
-                    .write_with_format(r, 7, "", &text_format)
+                    .write_with_format(r, 8, "", &text_format)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1045,10 +1152,13 @@ fn write_customer_statement(
         .set_column_width(5, 34)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(6, 34)
+        .set_column_width(6, 18)
         .map_err(|e| e.to_string())?;
     worksheet
-        .set_column_width(7, 18)
+        .set_column_width(7, 34)
+        .map_err(|e| e.to_string())?;
+    worksheet
+        .set_column_width(8, 18)
         .map_err(|e| e.to_string())?;
 
     workbook.save(path.into()).map_err(|e| e.to_string())?;
