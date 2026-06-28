@@ -488,6 +488,25 @@ fn compare_shipment_fields(a: &ShipmentEntry, b: &ShipmentEntry) -> Ordering {
     compare_return_times(&a.shipment_time, &b.shipment_time).then_with(|| a.barcode.cmp(&b.barcode))
 }
 
+fn recipient_shipment_rows(data: &AppData) -> Vec<ShipmentEntry> {
+    let mut rows: Vec<_> = data
+        .shipments
+        .iter()
+        .filter_map(|(barcode, shipment)| {
+            if data.returns.contains_key(barcode) {
+                None
+            } else {
+                Some(ShipmentEntry {
+                    barcode: barcode.clone(),
+                    shipment_time: shipment.shipment_time.clone(),
+                })
+            }
+        })
+        .collect();
+    rows.sort_by(compare_shipment_fields);
+    rows
+}
+
 fn build_return_time_customer_stats<'a>(
     entries: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Vec<ReturnTimeCustomerStat> {
@@ -750,7 +769,6 @@ async fn export_recipient_list(
     let data = state.data.lock().unwrap();
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
-    let red_format = Format::new().set_font_color(Color::Red);
 
     match column.as_str() {
         "shipment_barcode" => {
@@ -767,35 +785,10 @@ async fn export_recipient_list(
                 .set_column_width(1, 18)
                 .map_err(|e| e.to_string())?;
 
-            let mut active_rows = Vec::new();
-            let mut returned_rows = Vec::new();
-            for (barcode, shipment) in &data.shipments {
-                let entry = ShipmentEntry {
-                    barcode: barcode.clone(),
-                    shipment_time: shipment.shipment_time.clone(),
-                };
-                if data.returns.contains_key(barcode) {
-                    returned_rows.push(entry);
-                } else {
-                    active_rows.push(entry);
-                }
-            }
-            active_rows.sort_by(compare_shipment_fields);
-            returned_rows.sort_by(compare_shipment_fields);
-
             let mut row_idx = 1;
-            for entry in active_rows {
+            for entry in recipient_shipment_rows(&data) {
                 worksheet
                     .write(row_idx, 0, &entry.barcode)
-                    .map_err(|e| e.to_string())?;
-                worksheet
-                    .write(row_idx, 1, &entry.shipment_time)
-                    .map_err(|e| e.to_string())?;
-                row_idx += 1;
-            }
-            for entry in returned_rows {
-                worksheet
-                    .write_with_format(row_idx, 0, &entry.barcode, &red_format)
                     .map_err(|e| e.to_string())?;
                 worksheet
                     .write(row_idx, 1, &entry.shipment_time)
@@ -1410,4 +1403,34 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shipment(customer: &str, shipment_time: &str) -> ShipmentRecord {
+        ShipmentRecord {
+            customer: customer.to_string(),
+            shipment_time: shipment_time.to_string(),
+        }
+    }
+
+    #[test]
+    fn recipient_shipment_rows_excludes_returned_products() {
+        let mut data = AppData::default();
+        data.shipments
+            .insert("SHIP-2".to_string(), shipment("客户A", "2026-06-02"));
+        data.shipments
+            .insert("SHIP-1".to_string(), shipment("客户A", "2026-06-01"));
+        data.shipments
+            .insert("RETURNED".to_string(), shipment("客户A", "2026-06-03"));
+        data.returns
+            .insert("RETURNED".to_string(), "2026-06-04".to_string());
+
+        let rows = recipient_shipment_rows(&data);
+        let barcodes: Vec<_> = rows.iter().map(|row| row.barcode.as_str()).collect();
+
+        assert_eq!(barcodes, ["SHIP-1", "SHIP-2"]);
+    }
 }

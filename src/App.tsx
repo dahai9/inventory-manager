@@ -1055,7 +1055,7 @@ function App() {
               >
                 {recipientListColumns.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
               </select>
-              <p className="hint">用于发送给收货人的清单；选择出货条码或退货条码时会同时导出对应时间。</p>
+              <p className="hint">用于发送给收货人的清单；出货条码只导出未退货产品，退货条码会同时导出退货时间。</p>
             </div>
             <div className="modal-buttons">
               <button className="btn primary" onClick={confirmRecipientListExport}><FileOutput size={16} /> 确认导出</button>
