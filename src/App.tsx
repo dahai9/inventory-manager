@@ -62,11 +62,14 @@ interface ReturnLookupResult {
   return_time: string | null;
 }
 
-function getLocalDateValue(date = new Date()) {
+function getLocalDateTimeValue(date = new Date()) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
 }
 
 function getPathBasename(path: string | null) {
@@ -94,8 +97,8 @@ function App() {
   const [retCol, setRetCol] = useState("");
   const [retTimeCol, setRetTimeCol] = useState("");
   const [custCol, setCustCol] = useState("");
-  const [shipmentTime, setShipmentTime] = useState(getLocalDateValue);
-  const [returnTime, setReturnTime] = useState(getLocalDateValue);
+  const [shipmentTime, setShipmentTime] = useState(getLocalDateTimeValue);
+  const [returnTime, setReturnTime] = useState(getLocalDateTimeValue);
   const [showNewTableDialog, setShowNewTableDialog] = useState(false);
   const [newTableName, setNewTableName] = useState("");
   const [showImportDialog, setShowImportDialog] = useState(false);
@@ -627,7 +630,7 @@ function App() {
 
   const beginReturnRecording = () => {
     setMode("return");
-    setReturnTime(getLocalDateValue());
+    setReturnTime(getLocalDateTimeValue());
     setReturnOwnerNotice(null);
     setView("recording");
     setBatchBarcodes([]);
@@ -635,7 +638,7 @@ function App() {
 
   const beginShipmentSetup = () => {
     setMode("shipment");
-    setShipmentTime(getLocalDateValue());
+    setShipmentTime(getLocalDateTimeValue());
     setReturnOwnerNotice(null);
     setView("shipment_setup");
   };
@@ -668,7 +671,7 @@ function App() {
             <span className="mode-icon return"><RotateCcw size={22} /></span>
             <span>
               <strong>退货录入</strong>
-              <small>按退货日期管理批次</small>
+              <small>按退货时间管理批次</small>
             </span>
           </button>
         </div>
@@ -689,7 +692,8 @@ function App() {
           <label className="field">
             <span>出货时间</span>
             <input
-              type="date"
+              type="datetime-local"
+              step="1"
               value={shipmentTime}
               onChange={(e) => setShipmentTime(e.target.value)}
             />
@@ -724,7 +728,8 @@ function App() {
                 <label className="status-item date-field">
                   <span>出货时间</span>
                   <input
-                    type="date"
+                    type="datetime-local"
+                    step="1"
                     value={shipmentTime}
                     onChange={(e) => setShipmentTime(e.target.value)}
                   />
@@ -734,7 +739,8 @@ function App() {
               <label className="status-item date-field">
                 <span>退货时间</span>
                 <input
-                  type="date"
+                  type="datetime-local"
+                  step="1"
                   value={returnTime}
                   onChange={(e) => setReturnTime(e.target.value)}
                 />

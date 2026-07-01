@@ -314,7 +314,7 @@ button {
   margin-top: 14px;
   padding: 14px;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(160px, 220px) auto;
+  grid-template-columns: minmax(260px, 1fr) minmax(210px, 250px) auto;
   align-items: end;
   gap: 12px;
   background: #f8fafc;
@@ -376,11 +376,11 @@ button {
 }
 
 .recording-status.shipment {
-  grid-template-columns: 150px minmax(0, 1fr) minmax(150px, 190px) 150px;
+  grid-template-columns: 150px minmax(0, 1fr) minmax(210px, 250px) 150px;
 }
 
 .recording-status.return {
-  grid-template-columns: 150px minmax(150px, 190px) 150px;
+  grid-template-columns: 150px minmax(210px, 250px) 150px;
 }
 
 .status-item {

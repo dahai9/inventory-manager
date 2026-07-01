@@ -1,4 +1,4 @@
-use calamine::{open_workbook_auto, Reader};
+use calamine::{open_workbook_auto, Data, Reader};
 use rodio::{source::SineWave, DeviceSinkBuilder, MixerDeviceSink, Source};
 use rust_xlsxwriter::*;
 use serde::{Deserialize, Serialize};
@@ -114,7 +114,7 @@ fn commit_shipment_batch(
     if customer.is_empty() {
         return Err("请输入客户名称".into());
     }
-    let shipment_time = shipment_time.trim().to_string();
+    let shipment_time = normalize_record_time(&shipment_time);
     if shipment_time.is_empty() {
         return Err("请选择出货时间".into());
     }
@@ -145,7 +145,7 @@ fn commit_return_batch(
     barcodes: Vec<String>,
     return_time: String,
 ) -> Result<String, String> {
-    let return_time = return_time.trim().to_string();
+    let return_time = normalize_record_time(&return_time);
     if return_time.is_empty() {
         return Err("请选择退货时间".into());
     }
@@ -264,6 +264,77 @@ async fn get_excel_columns(path: String) -> Result<Vec<String>, String> {
     }
 }
 
+fn is_ascii_date_bytes(bytes: &[u8]) -> bool {
+    bytes.len() == 10
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit()
+}
+
+fn is_ascii_datetime_minutes_bytes(bytes: &[u8]) -> bool {
+    bytes.len() == 16
+        && is_ascii_date_bytes(&bytes[..10])
+        && bytes[10] == b' '
+        && bytes[11].is_ascii_digit()
+        && bytes[12].is_ascii_digit()
+        && bytes[13] == b':'
+        && bytes[14].is_ascii_digit()
+        && bytes[15].is_ascii_digit()
+}
+
+fn is_ascii_datetime_seconds_bytes(bytes: &[u8]) -> bool {
+    bytes.len() == 19
+        && is_ascii_datetime_minutes_bytes(&bytes[..16])
+        && bytes[16] == b':'
+        && bytes[17].is_ascii_digit()
+        && bytes[18].is_ascii_digit()
+}
+
+fn normalize_record_time(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let mut value = value.replace('T', " ");
+    if value.len() >= 20 && value.ends_with('Z') {
+        value.pop();
+    }
+
+    let bytes = value.as_bytes();
+    if is_ascii_date_bytes(bytes) {
+        return format!("{value} 00:00:00");
+    }
+    if bytes.len() >= 19 && is_ascii_datetime_seconds_bytes(&bytes[..19]) {
+        return value[..19].to_string();
+    }
+    if is_ascii_datetime_minutes_bytes(bytes) {
+        return format!("{value}:00");
+    }
+    value
+}
+
+fn excel_datetime_to_seconds(value: calamine::ExcelDateTime) -> String {
+    let (year, month, day, hour, minute, second, _) = value.to_ymd_hms_milli();
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn cell_to_time_text(cell: &Data) -> String {
+    match cell {
+        Data::DateTime(value) => excel_datetime_to_seconds(*value),
+        Data::DateTimeIso(value) | Data::String(value) => normalize_record_time(value),
+        Data::Empty => String::new(),
+        _ => normalize_record_time(&cell.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn import_data(
     state: tauri::State<'_, AppState>,
@@ -351,13 +422,13 @@ async fn import_data(
             .to_string();
         let shipment_time_val = shipment_time_idx
             .and_then(|idx| row.get(idx))
-            .map(|v| v.to_string())
+            .map(cell_to_time_text)
             .unwrap_or_default()
             .trim()
             .to_string();
         let return_time_val = return_time_idx
             .and_then(|idx| row.get(idx))
-            .map(|v| v.to_string())
+            .map(cell_to_time_text)
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -1432,5 +1503,29 @@ mod tests {
         let barcodes: Vec<_> = rows.iter().map(|row| row.barcode.as_str()).collect();
 
         assert_eq!(barcodes, ["SHIP-1", "SHIP-2"]);
+    }
+
+    #[test]
+    fn normalize_record_time_preserves_seconds() {
+        assert_eq!(
+            normalize_record_time("2026-07-01T09:08:07"),
+            "2026-07-01 09:08:07"
+        );
+        assert_eq!(
+            normalize_record_time("2026-07-01 09:08"),
+            "2026-07-01 09:08:00"
+        );
+        assert_eq!(normalize_record_time("2026-07-01"), "2026-07-01 00:00:00");
+    }
+
+    #[test]
+    fn excel_datetime_cells_import_with_seconds() {
+        let cell = Data::DateTime(calamine::ExcelDateTime::new(
+            45943.541,
+            calamine::ExcelDateTimeType::DateTime,
+            false,
+        ));
+
+        assert_eq!(cell_to_time_text(&cell), "2025-10-13 12:59:02");
     }
 }
