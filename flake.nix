@@ -43,7 +43,7 @@
         # 1. 前端构建阶段
         frontend = pkgs.buildNpmPackage {
           pname = "inventory-manager-frontend";
-          version = "0.2.5";
+          version = "0.2.6";
           src = ./.;
           
           # 这个 hash 是关键，它锁定了 npm 依赖
@@ -74,7 +74,7 @@
         # 2. 最终软件包定义 (后端构建)
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "inventory-manager";
-          version = "0.2.5";
+          version = "0.2.6";
           src = ./.;
 
           cargoRoot = "src-tauri";
