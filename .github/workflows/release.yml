@@ -11,6 +11,8 @@ jobs:
   publish-tauri:
     permissions:
       contents: write
+    env:
+      INVENTORY_LICENSE_PUBLIC_KEY: N_gh4iltf8xgxm_Sx32aldM284sZROs7WvwBe0lze7s
     strategy:
       fail-fast: false
       matrix:
