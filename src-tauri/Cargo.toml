@@ -28,3 +28,7 @@ anyhow = "1.0.102"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
 rodio = { version = "0.22.2", features = ["playback"] }
+base64 = "0.22.1"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha2 = "0.10.9"

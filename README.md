@@ -15,6 +15,49 @@
   - 自动记录退货数量。
 - **实时统计**: 界面顶部实时显示已出货和已退货的数量。
 - **导出 XLSX**: 将当前所有的出货和退货记录导出到新的 Excel 文件。
+- **离线激活**: 程序启动后先校验本机授权，未激活时只能查看机器码并输入激活码。
+
+## 激活设计
+
+激活码采用离线签名授权：桌面程序只内置 Ed25519 公钥，发码方保留私钥。激活码内容包含产品标识、授权编号、客户名、本机机器码、签发日期和可选到期日。程序会把验证通过的激活码保存到 Tauri 应用数据目录，后续启动和业务操作都会再次验签。
+
+业务命令会在 Rust 后端统一检查授权状态，所以仅修改前端页面不能绕过正常使用限制。
+
+### 发码流程
+
+1. 生成一组发码密钥，只在发码机器执行一次:
+   ```bash
+   cd src-tauri
+   cargo run --example license_keygen -- init-keypair
+   ```
+2. 保存输出的 `private_key_seed`，不要提交到仓库。将输出的 `public_key` 用于正式构建:
+   ```bash
+   INVENTORY_LICENSE_PUBLIC_KEY=<public_key> npm run tauri build
+   ```
+   Release 构建如果没有设置 `INVENTORY_LICENSE_PUBLIC_KEY` 会失败，避免正式包误用开发密钥。
+   Nix 打包使用:
+   ```bash
+   INVENTORY_LICENSE_PUBLIC_KEY=<public_key> nix build --impure
+   ```
+3. 客户打开程序后复制“本机机器码”，发码方生成激活码:
+   ```bash
+   cd src-tauri
+   cargo run --example license_keygen -- issue \
+     --private-key <private_key_seed> \
+     --machine <客户机器码> \
+     --customer <客户名称> \
+     --expires 2027-12-31
+   ```
+4. 客户把输出的激活码粘贴到程序激活页即可使用。省略 `--expires` 表示永久授权。
+
+本地 debug 运行内置了开发公钥，可用下面的固定开发 seed 发测试激活码；不要用于正式发版:
+```bash
+cd src-tauri
+cargo run --example license_keygen -- issue \
+  --private-key KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio \
+  --machine <本机机器码> \
+  --customer 本地测试
+```
 
 ## 开发与运行
 

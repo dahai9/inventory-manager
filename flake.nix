@@ -15,6 +15,13 @@
           inherit system overlays;
         };
 
+        licensePublicKey =
+          let
+            envKey = builtins.getEnv "INVENTORY_LICENSE_PUBLIC_KEY";
+          in
+          if envKey != "" then envKey
+          else throw "Set INVENTORY_LICENSE_PUBLIC_KEY=<public_key> and run nix build --impure";
+
         # 运行时需要的库
         libraries = with pkgs; [
           webkitgtk_4_1
@@ -48,7 +55,7 @@
           
           # 这个 hash 是关键，它锁定了 npm 依赖
           # 第一次构建会报错并给出正确的 hash，我们需要填入它
-          npmDepsHash = "sha256-dhcMCKpti6sTHx/pGFFMI1yQaqRCl8S78v/tXPckVF4=";
+          npmDepsHash = "sha256-+gex0+ZHZDosuYdqN1TJdVWt9aQoD5DQOwkPXkuv+z0=";
           
           # 仅构建前端，跳过一些不必要的检查
           dontNpmBuild = false;
@@ -79,6 +86,8 @@
 
           cargoRoot = "src-tauri";
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
+
+          INVENTORY_LICENSE_PUBLIC_KEY = licensePublicKey;
 
           inherit nativeBuildInputs;
           buildInputs = libraries;

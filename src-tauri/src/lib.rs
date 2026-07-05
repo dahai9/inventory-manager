@@ -1,3 +1,5 @@
+pub mod activation;
+
 use calamine::{open_workbook_auto, Data, Reader};
 use rodio::{source::SineWave, DeviceSinkBuilder, MixerDeviceSink, Source};
 use rust_xlsxwriter::*;
@@ -31,7 +33,26 @@ pub struct AppState {
 }
 
 #[tauri::command]
-fn play_beep(state: tauri::State<AppState>) {
+fn get_activation_status(app: tauri::AppHandle) -> activation::ActivationStatus {
+    activation::activation_status(&app)
+}
+
+#[tauri::command]
+fn activate_license(
+    app: tauri::AppHandle,
+    activation_code: String,
+) -> Result<activation::ActivationStatus, String> {
+    activation::activate_license(&app, &activation_code)
+}
+
+#[tauri::command]
+fn deactivate_license(app: tauri::AppHandle) -> Result<activation::ActivationStatus, String> {
+    activation::deactivate_license(&app)
+}
+
+#[tauri::command]
+fn play_beep(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    activation::require_activated(&app)?;
     if let Some(handle) = &state.mixer_handle {
         // 使用 2000Hz 的高频音，非常尖锐，适合嘈杂环境
         // 播放两个连续的短促尖鸣声
@@ -48,10 +69,16 @@ fn play_beep(state: tauri::State<AppState>) {
         handle.mixer().add(beep1);
         handle.mixer().add(beep2);
     }
+    Ok(())
 }
 
 #[tauri::command]
-fn check_shipment(state: tauri::State<AppState>, barcode: String) -> Result<(), String> {
+fn check_shipment(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    barcode: String,
+) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     if data.shipments.contains_key(&barcode) {
         return Err(format!("此货 {} 已经扫描过出货", barcode));
@@ -60,7 +87,12 @@ fn check_shipment(state: tauri::State<AppState>, barcode: String) -> Result<(), 
 }
 
 #[tauri::command]
-fn check_return(state: tauri::State<AppState>, barcode: String) -> Result<String, String> {
+fn check_return(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    barcode: String,
+) -> Result<String, String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     let shipment = data
         .shipments
@@ -83,9 +115,11 @@ pub struct ReturnLookupResult {
 
 #[tauri::command]
 fn lookup_return(
+    app: tauri::AppHandle,
     state: tauri::State<AppState>,
     barcode: String,
 ) -> Result<ReturnLookupResult, String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     let shipment = data
         .shipments
@@ -105,11 +139,13 @@ fn lookup_return(
 
 #[tauri::command]
 fn commit_shipment_batch(
+    app: tauri::AppHandle,
     state: tauri::State<AppState>,
     customer: String,
     shipment_time: String,
     barcodes: Vec<String>,
 ) -> Result<String, String> {
+    activation::require_activated(&app)?;
     let customer = customer.trim().to_string();
     if customer.is_empty() {
         return Err("请输入客户名称".into());
@@ -141,10 +177,12 @@ fn commit_shipment_batch(
 
 #[tauri::command]
 fn commit_return_batch(
+    app: tauri::AppHandle,
     state: tauri::State<AppState>,
     barcodes: Vec<String>,
     return_time: String,
 ) -> Result<String, String> {
+    activation::require_activated(&app)?;
     let return_time = normalize_record_time(&return_time);
     if return_time.is_empty() {
         return Err("请选择退货时间".into());
@@ -239,13 +277,15 @@ fn build_summary(data: &AppData) -> Summary {
 }
 
 #[tauri::command]
-fn get_summary(state: tauri::State<AppState>) -> Summary {
+fn get_summary(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<Summary, String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
-    build_summary(&data)
+    Ok(build_summary(&data))
 }
 
 #[tauri::command]
-async fn get_excel_columns(path: String) -> Result<Vec<String>, String> {
+async fn get_excel_columns(app: tauri::AppHandle, path: String) -> Result<Vec<String>, String> {
+    activation::require_activated(&app)?;
     let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let sheet_name = workbook
         .sheet_names()
@@ -337,6 +377,7 @@ fn cell_to_time_text(cell: &Data) -> String {
 
 #[tauri::command]
 async fn import_data(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     ship_col: String,
@@ -345,6 +386,7 @@ async fn import_data(
     return_time_col: Option<String>,
     customer_col: String,
 ) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
     let sheet_name = workbook
         .sheet_names()
@@ -517,16 +559,22 @@ fn write_empty_inventory_workbook(
 }
 
 #[tauri::command]
-fn has_unsaved_changes(state: tauri::State<AppState>) -> bool {
-    state.data.lock().unwrap().is_dirty
+fn has_unsaved_changes(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<bool, String> {
+    activation::require_activated(&app)?;
+    Ok(state.data.lock().unwrap().is_dirty)
 }
 
 #[tauri::command]
 async fn create_new_workbook(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     table_name: String,
 ) -> Result<(), String> {
+    activation::require_activated(&app)?;
     write_empty_inventory_workbook(path, &table_name)?;
 
     let mut data = state.data.lock().unwrap();
@@ -698,7 +746,12 @@ fn write_return_time_customer_stats(
 }
 
 #[tauri::command]
-async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+async fn export_data(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let mut data = state.data.lock().unwrap();
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -833,10 +886,12 @@ async fn export_data(state: tauri::State<'_, AppState>, path: String) -> Result<
 
 #[tauri::command]
 async fn export_recipient_list(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     column: String,
 ) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
@@ -1366,11 +1421,13 @@ fn write_total_quantity_table(path: impl Into<PathBuf>, summary: &Summary) -> Re
 
 #[tauri::command]
 async fn export_customer_statement(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
     customer: String,
     unit_price: f64,
 ) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     let row = customer_statement_row(&data, &customer)?;
     write_customer_statement(path, &[row], unit_price)
@@ -1378,9 +1435,11 @@ async fn export_customer_statement(
 
 #[tauri::command]
 async fn export_total_quantity_table(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    activation::require_activated(&app)?;
     let data = state.data.lock().unwrap();
     let summary = build_summary(&data);
     write_total_quantity_table(path, &summary)
@@ -1388,12 +1447,14 @@ async fn export_total_quantity_table(
 
 #[tauri::command]
 async fn export_customer_statements_to_dir(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     directory: String,
     base_name: String,
     customers: Vec<String>,
     unit_price: f64,
 ) -> Result<Vec<String>, String> {
+    activation::require_activated(&app)?;
     if customers.is_empty() {
         return Err("请先选择要导出的客户".into());
     }
@@ -1455,6 +1516,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_activation_status,
+            activate_license,
+            deactivate_license,
             check_shipment,
             check_return,
             lookup_return,

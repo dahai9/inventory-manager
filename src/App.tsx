@@ -7,15 +7,20 @@ import {
   Boxes,
   Check,
   ClipboardList,
+  Copy,
   FileOutput,
   FilePlus2,
   FolderOpen,
+  KeyRound,
+  LogOut,
   PackageCheck,
   PackagePlus,
   PanelTopOpen,
+  RefreshCw,
   RotateCcw,
   Search,
   Settings,
+  ShieldCheck,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -62,6 +67,23 @@ interface ReturnLookupResult {
   return_time: string | null;
 }
 
+interface ActivationStatus {
+  activated: boolean;
+  machine_code: string;
+  customer: string | null;
+  license_id: string | null;
+  expires_at: string | null;
+  message: string;
+}
+
+const emptySummary: Summary = {
+  total_shipments: 0,
+  total_returns: 0,
+  total_delivered: 0,
+  return_time_stats: [],
+  customer_stats: [],
+};
+
 function getLocalDateTimeValue(date = new Date()) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -79,6 +101,11 @@ function getPathBasename(path: string | null) {
 }
 
 function App() {
+  const [activationStatus, setActivationStatus] = useState<ActivationStatus | null>(null);
+  const [activationCode, setActivationCode] = useState("");
+  const [activationMessage, setActivationMessage] = useState<{ msg: string; type: "success" | "error" } | null>(null);
+  const [activationLoading, setActivationLoading] = useState(true);
+  const [isActivating, setIsActivating] = useState(false);
   const [view, setView] = useState<View>("home");
   const [mode, setMode] = useState<Mode>("shipment");
   const [customer, setCustomer] = useState("");
@@ -86,7 +113,7 @@ function App() {
   const [batchBarcodes, setBatchBarcodes] = useState<string[]>([]);
   const [returnOwnerNotice, setReturnOwnerNotice] = useState<{ barcode: string; customer: string } | null>(null);
   const [log, setLog] = useState<{msg: string, type: 'success' | 'error'}[]>([]);
-  const [summary, setSummary] = useState<Summary>({ total_shipments: 0, total_returns: 0, total_delivered: 0, return_time_stats: [], customer_stats: [] });
+  const [summary, setSummary] = useState<Summary>(emptySummary);
   const [selectedCustomerNames, setSelectedCustomerNames] = useState<string[]>([]);
   const [statementUnitPrice, setStatementUnitPrice] = useState("0");
   
@@ -115,6 +142,18 @@ function App() {
   const barcodeRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    refreshActivationStatus();
+  }, []);
+
+  useEffect(() => {
+    if (activationStatus?.activated) {
+      updateSummary();
+    } else {
+      setSummary(emptySummary);
+    }
+  }, [activationStatus?.activated]);
+
+  useEffect(() => {
     localStorage.setItem("ignoreChars", ignoreChars);
   }, [ignoreChars]);
 
@@ -127,7 +166,7 @@ function App() {
   }
 
   useEffect(() => {
-    updateSummary();
+    if (!activationStatus?.activated) return;
     
     const handleKeyDown = (e: KeyboardEvent) => {
       // 捕获 Ctrl+S 或 Cmd+S，不区分大小写
@@ -139,7 +178,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [importPath]); // Re-bind when importPath changes to ensure handleQuickSave uses the latest
+  }, [importPath, activationStatus?.activated]); // Re-bind when importPath changes to ensure handleQuickSave uses the latest
 
   async function handleQuickSave() {
     if (importPath) {
@@ -167,9 +206,86 @@ function App() {
     );
   }, [summary.customer_stats]);
 
+  async function refreshActivationStatus() {
+    setActivationLoading(true);
+    try {
+      const status = await invoke<ActivationStatus>("get_activation_status");
+      setActivationStatus(status);
+      setActivationMessage(status.activated ? null : { msg: status.message, type: "error" });
+    } catch (err) {
+      setActivationStatus({
+        activated: false,
+        machine_code: "读取失败",
+        customer: null,
+        license_id: null,
+        expires_at: null,
+        message: String(err),
+      });
+      setActivationMessage({ msg: "读取激活状态失败: " + err, type: "error" });
+    } finally {
+      setActivationLoading(false);
+    }
+  }
+
+  async function handleActivationSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!activationCode.trim()) {
+      setActivationMessage({ msg: "请输入激活码", type: "error" });
+      return;
+    }
+
+    setIsActivating(true);
+    try {
+      const status = await invoke<ActivationStatus>("activate_license", { activationCode });
+      setActivationStatus(status);
+      setActivationCode("");
+      setActivationMessage({ msg: "激活成功", type: "success" });
+    } catch (err) {
+      setActivationMessage({ msg: "激活失败: " + err, type: "error" });
+    } finally {
+      setIsActivating(false);
+    }
+  }
+
+  async function handleCopyMachineCode() {
+    const machineCode = activationStatus?.machine_code || "";
+    if (!machineCode || machineCode === "读取失败") return;
+
+    try {
+      await navigator.clipboard.writeText(machineCode);
+      setActivationMessage({ msg: "机器码已复制", type: "success" });
+    } catch (err) {
+      setActivationMessage({ msg: "复制失败: " + err, type: "error" });
+    }
+  }
+
+  async function handleDeactivate() {
+    const confirmed = window.confirm("确定取消当前激活吗？取消后需要重新输入激活码才能使用。");
+    if (!confirmed) return;
+
+    try {
+      const status = await invoke<ActivationStatus>("deactivate_license");
+      setActivationStatus(status);
+      setActivationMessage({ msg: status.message, type: "success" });
+      setImportPath(null);
+      setLog([]);
+      setSummary(emptySummary);
+    } catch (err) {
+      addLog("取消激活失败: " + err, "error");
+    }
+  }
+
   async function updateSummary() {
-    const s = await invoke<Summary>("get_summary");
-    setSummary(s);
+    try {
+      const s = await invoke<Summary>("get_summary");
+      setSummary(s);
+    } catch (err) {
+      const message = String(err);
+      addLog("统计刷新失败: " + message, "error");
+      if (message.includes("激活")) {
+        refreshActivationStatus();
+      }
+    }
   }
 
   function addLog(msg: string, type: "success" | "error") {
@@ -646,6 +762,61 @@ function App() {
   const isRecording = view === "recording";
   const latestLogs = log.slice(0, 8);
 
+  const renderActivationScreen = () => (
+    <div className="activation-shell">
+      <section className="activation-panel">
+        <div className="activation-head">
+          <div className="brand-block">
+            <div className="brand-mark"><KeyRound size={22} /></div>
+            <div>
+              <h1>程序激活</h1>
+              <p>仓库出退货操作台</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn icon-btn"
+            onClick={refreshActivationStatus}
+            aria-label="刷新激活状态"
+            title="刷新"
+          >
+            <RefreshCw size={17} />
+          </button>
+        </div>
+
+        <div className="activation-machine">
+          <span>本机机器码</span>
+          <strong>{activationStatus?.machine_code || "读取中"}</strong>
+          <button type="button" className="btn secondary" onClick={handleCopyMachineCode}>
+            <Copy size={16} /> 复制
+          </button>
+        </div>
+
+        <form className="activation-form" onSubmit={handleActivationSubmit}>
+          <label className="field">
+            <span>激活码</span>
+            <textarea
+              value={activationCode}
+              onChange={(e) => setActivationCode(e.target.value)}
+              placeholder="输入激活码"
+              autoFocus
+            />
+          </label>
+          {activationMessage && (
+            <div className={`activation-message ${activationMessage.type}`}>
+              {activationMessage.msg}
+            </div>
+          )}
+          <div className="activation-actions">
+            <button type="submit" className="btn primary" disabled={isActivating}>
+              <ShieldCheck size={17} /> {isActivating ? "正在激活" : "激活程序"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+
   const renderModePanel = () => (
     <section className={`panel workbench-panel ${isRecording ? "is-recording" : ""}`}>
       <div className="panel-heading">
@@ -821,6 +992,28 @@ function App() {
   const allCustomersSelected = summary.customer_stats.length > 0 &&
     summary.customer_stats.every(stat => selectedCustomerSet.has(stat.name));
 
+  if (activationLoading) {
+    return (
+      <div className="activation-shell">
+        <section className="activation-panel">
+          <div className="activation-head">
+            <div className="brand-block">
+              <div className="brand-mark"><KeyRound size={22} /></div>
+              <div>
+                <h1>程序激活</h1>
+                <p>正在读取激活状态</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  if (!activationStatus?.activated) {
+    return renderActivationScreen();
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -828,7 +1021,7 @@ function App() {
           <div className="brand-mark"><Boxes size={22} /></div>
           <div>
             <h1>仓库出退货操作台</h1>
-            <p>{getPathBasename(importPath)}</p>
+            <p>{getPathBasename(importPath)} · {activationStatus.customer || "已激活"}</p>
           </div>
         </div>
         <div className="topbar-actions">
@@ -1135,8 +1328,33 @@ function App() {
               />
               <p className="hint">扫码时如果条码包含这些字符，将被视为型号并忽略，同时发出提示音。空格请直接输入（例如：<code>-, </code> 表示忽略减号和空格）。</p>
             </div>
+            <div className="license-card">
+              <div className="license-card-head">
+                <ShieldCheck size={18} />
+                <strong>授权状态</strong>
+              </div>
+              <dl>
+                <div>
+                  <dt>客户</dt>
+                  <dd>{activationStatus.customer || "未记录"}</dd>
+                </div>
+                <div>
+                  <dt>授权编号</dt>
+                  <dd>{activationStatus.license_id || "未记录"}</dd>
+                </div>
+                <div>
+                  <dt>到期日</dt>
+                  <dd>{activationStatus.expires_at || "永久"}</dd>
+                </div>
+                <div>
+                  <dt>机器码</dt>
+                  <dd>{activationStatus.machine_code}</dd>
+                </div>
+              </dl>
+            </div>
             <div className="modal-buttons">
               <button className="btn secondary" onClick={playAlertSound}><Bell size={16} /> 测试声音</button>
+              <button className="btn secondary" onClick={handleDeactivate}><LogOut size={16} /> 取消激活</button>
               <button className="btn ghost" onClick={() => setShowSettings(false)}>关闭</button>
             </div>
           </div>
