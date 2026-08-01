@@ -25,6 +25,7 @@ import {
   Upload,
 } from "lucide-react";
 import "./App.css";
+import InventoryWorkspace from "./v2/InventoryWorkspace";
 
 type View = "home" | "shipment_setup" | "recording";
 type Mode = "shipment" | "return";
@@ -107,6 +108,7 @@ function App() {
   const [activationLoading, setActivationLoading] = useState(true);
   const [isActivating, setIsActivating] = useState(false);
   const [view, setView] = useState<View>("home");
+  const [useV2Workspace, setUseV2Workspace] = useState(true);
   const [mode, setMode] = useState<Mode>("shipment");
   const [customer, setCustomer] = useState("");
   const [barcode, setBarcode] = useState("");
@@ -1014,6 +1016,10 @@ function App() {
     return renderActivationScreen();
   }
 
+  if (useV2Workspace) {
+    return <InventoryWorkspace onBackToLegacy={() => setUseV2Workspace(false)} />;
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -1025,6 +1031,7 @@ function App() {
           </div>
         </div>
         <div className="topbar-actions">
+          <button type="button" className="btn secondary" onClick={() => setUseV2Workspace(true)}><Boxes size={16} /> V2 库存工作台</button>
           <button type="button" className="btn secondary" onClick={handleNewTable}><FilePlus2 size={16} /> 新建</button>
           <button type="button" className="btn secondary" onClick={handleImport}><FolderOpen size={16} /> 导入</button>
           <button type="button" className="btn secondary" onClick={handleExport}><FileOutput size={16} /> 导出</button>

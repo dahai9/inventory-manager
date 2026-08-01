@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod v2;
 
 use calamine::{open_workbook_auto, Data, Reader};
 use rodio::{source::SineWave, DeviceSinkBuilder, MixerDeviceSink, Source};
@@ -1479,6 +1480,108 @@ async fn export_customer_statements_to_dir(
     Ok(exported_paths)
 }
 
+#[tauri::command]
+async fn v2_post_receipt(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::PostReceiptRequest,
+) -> Result<v2::application::PostReceiptResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .post_receipt(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_complete_inspection(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::CompleteInspectionRequest,
+) -> Result<v2::application::CompleteInspectionResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .complete_inspection(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_list_inventory(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    query: v2::application::InventoryListQuery,
+) -> Result<v2::application::InventoryListResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .list_inventory(query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_get_dashboard(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    query: v2::application::InventorySummaryQuery,
+) -> Result<v2::application::InventorySummaryResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .inventory_summary(query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct V2UpgradeExportInput {
+    destination: String,
+    export_id: String,
+    exported_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct V2UpgradeExportOutput {
+    path: String,
+    export_id: String,
+    checksum: String,
+}
+
+#[tauri::command]
+async fn v2_export_upgrade_package(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: V2UpgradeExportInput,
+) -> Result<V2UpgradeExportOutput, String> {
+    activation::require_activated(&app)?;
+    let package = v2::upgrade::OfflineUpgradeExporter::new(database.pool())
+        .export(
+            std::path::Path::new(&input.destination),
+            v2::upgrade::ExportRequest {
+                export_id: input.export_id.clone(),
+                workspace_id: database.workspace_id().to_owned(),
+                exported_at: input.exported_at,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(V2UpgradeExportOutput {
+        path: package.path.to_string_lossy().into_owned(),
+        export_id: package.manifest.export_id,
+        checksum: package.package_checksum,
+    })
+}
+
+#[tauri::command]
+async fn v2_archive_offline_workspace(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    export_id: String,
+    checksum: String,
+) -> Result<(), String> {
+    activation::require_activated(&app)?;
+    database.mark_read_only(&export_id, &checksum).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mixer_handle = DeviceSinkBuilder::open_default_sink().ok();
@@ -1487,6 +1590,14 @@ pub fn run() {
         .manage(AppState {
             data: Mutex::new(AppData::default()),
             mixer_handle,
+        })
+        .setup(|app| {
+            let database_path = app.path().app_data_dir()?.join("inventory-v2.sqlite3");
+            let database =
+                tauri::async_runtime::block_on(v2::OfflineDatabase::open(&database_path))
+                    .map_err(std::io::Error::other)?;
+            app.manage(database);
+            Ok(())
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1534,6 +1645,12 @@ pub fn run() {
             export_recipient_list,
             export_customer_statement,
             export_customer_statements_to_dir,
+            v2_post_receipt,
+            v2_complete_inspection,
+            v2_list_inventory,
+            v2_get_dashboard,
+            v2_export_upgrade_package,
+            v2_archive_offline_workspace,
             play_beep
         ])
         .run(tauri::generate_context!())
