@@ -32,7 +32,7 @@ base64 = "0.22.1"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 sha2 = "0.10.9"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros", "uuid"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
