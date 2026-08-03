@@ -16,11 +16,12 @@ import {
   RefreshCw,
   Search,
   ShieldAlert,
+  Truck,
   type LucideIcon,
 } from "lucide-react";
 import "./InventoryWorkspace.css";
 
-type WorkspacePage = "overview" | "receipt" | "quality" | "inventory";
+type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound";
 type InventoryStatus =
   | "received"
   | "available"
@@ -172,6 +173,76 @@ interface DashboardDto {
   quality: QualityStatusSummary;
 }
 
+interface CreateOutboundOrderRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_no: string;
+  upstream_receiver_name: string;
+  sku_code: string;
+  sku_name: string;
+  required_quantity: number;
+  required_at: string | null;
+  actor_id: string;
+}
+
+interface CreateOutboundOrderResponse {
+  order_id: string;
+  order_line_id: string;
+  order_no: string;
+  upstream_receiver_id: string;
+  sku_id: string;
+  required_quantity: number;
+  idempotent_replay: boolean;
+}
+
+interface AllocationItemDto {
+  allocation_id: string;
+  barcode: string;
+  owner_party_id: string;
+  sku_id: string;
+}
+
+interface AllocateOutboundResponse {
+  order_id: string;
+  order_line_id: string;
+  allocated_count: number;
+  order_status: string;
+  allocations: AllocationItemDto[];
+  idempotent_replay: boolean;
+}
+
+interface ShipmentItemDto {
+  shipment_line_id: string;
+  allocation_id: string;
+  barcode: string;
+  owner_party_id: string;
+  sku_id: string;
+}
+
+interface ShipOutboundResponse {
+  shipment_id: string;
+  shipment_no: string;
+  shipped_count: number;
+  order_status: string;
+  items: ShipmentItemDto[];
+  idempotent_replay: boolean;
+}
+
+interface ConfirmOutboundDeliveryResponse {
+  confirmation_id: string;
+  confirmation_code: string;
+  delivered_count: number;
+  shipment_status: string;
+  idempotent_replay: boolean;
+}
+
+interface ReturnOutboundShipmentResponse {
+  return_batch_id: string;
+  return_no: string;
+  quarantined_count: number;
+  idempotent_replay: boolean;
+}
+
 interface NavigationItem {
   id: WorkspacePage;
   label: string;
@@ -184,6 +255,7 @@ const navigationItems: NavigationItem[] = [
   { id: "receipt", label: "入库", description: "批量扫码收货", icon: PackagePlus },
   { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck },
   { id: "inventory", label: "库存", description: "单件库存查询", icon: Boxes },
+  { id: "outbound", label: "出库", description: "凑单交货与退回", icon: Truck },
 ];
 
 const inventoryStatusLabels: Record<InventoryStatus, string> = {
@@ -224,7 +296,7 @@ function toUtcIso(value: string): string {
   return parsed.toISOString();
 }
 
-function makeDocumentNumber(prefix: "RK" | "ZJ"): string {
+function makeDocumentNumber(prefix: "RK" | "ZJ" | "CK" | "TH"): string {
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
   return `${prefix}-${stamp}-${createId().slice(0, 6).toUpperCase()}`;
 }
@@ -306,6 +378,21 @@ export default function InventoryWorkspace({
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryStatus, setInventoryStatus] = useState<InventoryStatus | "">("");
   const [qualityStatus, setQualityStatus] = useState<QualityStatus | "">("");
+
+  const [outboundReceiver, setOutboundReceiver] = useState("");
+  const [outboundOrderNo, setOutboundOrderNo] = useState("");
+  const [outboundSkuCode, setOutboundSkuCode] = useState("");
+  const [outboundSkuName, setOutboundSkuName] = useState("");
+  const [outboundQuantity, setOutboundQuantity] = useState("1");
+  const [outboundBarcodes, setOutboundBarcodes] = useState("");
+  const [outboundShipmentNo, setOutboundShipmentNo] = useState("");
+  const [outboundConfirmationCode, setOutboundConfirmationCode] = useState("");
+  const [outboundReturnReason, setOutboundReturnReason] = useState("");
+  const [outboundNotice, setOutboundNotice] = useState<Notice | null>(null);
+  const [outboundLoading, setOutboundLoading] = useState(false);
+  const [outboundOrder, setOutboundOrder] = useState<CreateOutboundOrderResponse | null>(null);
+  const [outboundAllocation, setOutboundAllocation] = useState<AllocateOutboundResponse | null>(null);
+  const [outboundShipment, setOutboundShipment] = useState<ShipOutboundResponse | null>(null);
 
   const barcodes = useMemo(
     () => barcodeLines.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
@@ -497,6 +584,166 @@ export default function InventoryWorkspace({
     }
   }
 
+  async function createOutboundOrder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setOutboundNotice(null);
+    const quantity = Number.parseInt(outboundQuantity, 10);
+    if (!outboundReceiver.trim() || !outboundSkuCode.trim() || !outboundSkuName.trim() || !outboundOrderNo.trim()) {
+      setOutboundNotice({ type: "error", text: "请完整填写上游收货方、订单号和产品型号。" });
+      return;
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      setOutboundNotice({ type: "error", text: "需求数量必须是大于 0 的整数。" });
+      return;
+    }
+    setOutboundLoading(true);
+    try {
+      const operationId = createId();
+      const response = await invoke<CreateOutboundOrderResponse>("v2_create_outbound_order", {
+        input: {
+          request_id: operationId,
+          idempotency_key: `outbound-order:${operationId}`,
+          order_no: outboundOrderNo.trim(),
+          upstream_receiver_name: outboundReceiver.trim(),
+          sku_code: outboundSkuCode.trim(),
+          sku_name: outboundSkuName.trim(),
+          required_quantity: quantity,
+          required_at: null,
+          actor_id: resolvedActorId,
+        } satisfies CreateOutboundOrderRequest,
+      });
+      setOutboundOrder(response);
+      setOutboundAllocation(null);
+      setOutboundShipment(null);
+      setOutboundBarcodes("");
+      setOutboundShipmentNo("");
+      setOutboundConfirmationCode("");
+      setOutboundNotice({ type: "success", text: `${response.order_no} 已建单，请继续分配可用库存。` });
+    } catch (error) {
+      setOutboundNotice({ type: "error", text: `建单失败：${displayError(error)}` });
+    } finally {
+      setOutboundLoading(false);
+    }
+  }
+
+  async function allocateOutboundOrder() {
+    if (!outboundOrder) return;
+    setOutboundLoading(true);
+    setOutboundNotice(null);
+    try {
+      const operationId = createId();
+      const response = await invoke<AllocateOutboundResponse>("v2_allocate_outbound_order", {
+        input: {
+          request_id: operationId,
+          idempotency_key: `outbound-allocation:${operationId}`,
+          order_id: outboundOrder.order_id,
+          order_line_id: outboundOrder.order_line_id,
+          barcodes: outboundBarcodes.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+          actor_id: resolvedActorId,
+        },
+      });
+      setOutboundAllocation(response);
+      setOutboundBarcodes("");
+      setOutboundNotice({ type: "success", text: `已分配 ${response.allocated_count} 件，状态：${response.order_status}。` });
+    } catch (error) {
+      setOutboundNotice({ type: "error", text: `库存分配失败：${displayError(error)}` });
+    } finally {
+      setOutboundLoading(false);
+    }
+  }
+
+  async function shipOutboundOrder() {
+    if (!outboundOrder || !outboundAllocation || outboundAllocation.allocations.length === 0) return;
+    setOutboundLoading(true);
+    setOutboundNotice(null);
+    try {
+      const operationId = createId();
+      const response = await invoke<ShipOutboundResponse>("v2_ship_outbound_order", {
+        input: {
+          request_id: operationId,
+          idempotency_key: `outbound-shipment:${operationId}`,
+          order_id: outboundOrder.order_id,
+          shipment_no: outboundShipmentNo.trim() || makeDocumentNumber("CK"),
+          allocation_ids: outboundAllocation.allocations.map((item) => item.allocation_id),
+          barcodes: [],
+          shipped_at: new Date().toISOString(),
+          actor_id: resolvedActorId,
+        },
+      });
+      setOutboundShipment(response);
+      setOutboundShipmentNo(response.shipment_no);
+      setOutboundNotice({ type: "success", text: `${response.shipment_no} 已出库 ${response.shipped_count} 件。` });
+      await refreshDashboard();
+    } catch (error) {
+      setOutboundNotice({ type: "error", text: `出库失败：${displayError(error)}` });
+    } finally {
+      setOutboundLoading(false);
+    }
+  }
+
+  async function confirmOutboundDelivery() {
+    if (!outboundShipment) return;
+    if (!outboundConfirmationCode.trim()) {
+      setOutboundNotice({ type: "error", text: "请输入上游确认码。" });
+      return;
+    }
+    setOutboundLoading(true);
+    setOutboundNotice(null);
+    try {
+      const operationId = createId();
+      const response = await invoke<ConfirmOutboundDeliveryResponse>("v2_confirm_outbound_delivery", {
+        input: {
+          request_id: operationId,
+          idempotency_key: `outbound-delivery:${operationId}`,
+          shipment_id: outboundShipment.shipment_id,
+          confirmation_code: outboundConfirmationCode.trim(),
+          shipment_line_ids: [],
+          confirmed_at: new Date().toISOString(),
+          confirmed_by: resolvedActorId,
+          notes: null,
+        },
+      });
+      setOutboundNotice({ type: "success", text: `已确认交货 ${response.delivered_count} 件，批次状态：${response.shipment_status}。` });
+      await refreshDashboard();
+    } catch (error) {
+      setOutboundNotice({ type: "error", text: `交货确认失败：${displayError(error)}` });
+    } finally {
+      setOutboundLoading(false);
+    }
+  }
+
+  async function returnOutboundShipment() {
+    if (!outboundShipment) return;
+    if (!outboundReturnReason.trim()) {
+      setOutboundNotice({ type: "error", text: "请输入退回原因。" });
+      return;
+    }
+    setOutboundLoading(true);
+    setOutboundNotice(null);
+    try {
+      const operationId = createId();
+      const response = await invoke<ReturnOutboundShipmentResponse>("v2_return_outbound_shipment", {
+        input: {
+          request_id: operationId,
+          idempotency_key: `outbound-return:${operationId}`,
+          shipment_id: outboundShipment.shipment_id,
+          shipment_line_ids: [],
+          return_no: makeDocumentNumber("TH"),
+          returned_at: new Date().toISOString(),
+          reason: outboundReturnReason.trim(),
+          actor_id: resolvedActorId,
+        },
+      });
+      setOutboundNotice({ type: "success", text: `${response.return_no} 已登记退回 ${response.quarantined_count} 件，并进入隔离区待复检。` });
+      setOutboundReturnReason("");
+      await refreshDashboard();
+    } catch (error) {
+      setOutboundNotice({ type: "error", text: `退回登记失败：${displayError(error)}` });
+    } finally {
+      setOutboundLoading(false);
+    }
+  }
+
   function renderOverview() {
     const inventory = dashboard?.inventory;
     const quality = dashboard?.quality;
@@ -650,6 +897,50 @@ export default function InventoryWorkspace({
     );
   }
 
+  function renderOutbound() {
+    return (
+      <section className="v2-page" aria-labelledby="v2-outbound-title">
+        <div className="v2-page-heading">
+          <div><span className="v2-eyebrow">出库管理</span><h2 id="v2-outbound-title">凑单交货</h2><p>多个货主的合格库存可以组成同一张上游订单，所有单件仍保留来源追踪。</p></div>
+        </div>
+        <div className="v2-outbound-layout">
+          <form className="v2-panel v2-form" onSubmit={createOutboundOrder}>
+            <h3>1. 建立上游需求</h3>
+            <div className="v2-form-grid">
+              <label><span>上游收货方 *</span><input value={outboundReceiver} onChange={(event) => setOutboundReceiver(event.target.value)} placeholder="例如：上游客户 A" /></label>
+              <label><span>订单号 *</span><input value={outboundOrderNo} onChange={(event) => setOutboundOrderNo(event.target.value)} placeholder="例如：SO-20260803-01" /></label>
+              <label><span>型号编码 *</span><input value={outboundSkuCode} onChange={(event) => setOutboundSkuCode(event.target.value)} placeholder="例如：DDR4-32G-3200" /></label>
+              <label><span>型号名称 *</span><input value={outboundSkuName} onChange={(event) => setOutboundSkuName(event.target.value)} placeholder="例如：32G 3200 内存" /></label>
+              <label><span>需求数量 *</span><input type="number" min="1" step="1" value={outboundQuantity} onChange={(event) => setOutboundQuantity(event.target.value)} /></label>
+            </div>
+            <div className="v2-form-actions"><button className="v2-button primary" type="submit" disabled={outboundLoading}>{outboundLoading ? "处理中…" : outboundOrder ? "重新建单" : "创建出库订单"}</button></div>
+          </form>
+          <div className="v2-panel v2-outbound-workflow">
+            <h3>2. 分配合格库存</h3>
+            <p className="v2-outbound-meta">{outboundOrder ? `${outboundOrder.order_no} · 需求 ${outboundOrder.required_quantity} 件` : "请先创建订单"}</p>
+            <label><span>指定条码（可选）</span><textarea value={outboundBarcodes} onChange={(event) => setOutboundBarcodes(event.target.value)} placeholder="留空则按入库时间 FIFO；指定时每行一个条码" disabled={!outboundOrder || outboundLoading} /></label>
+            <button className="v2-button primary wide" type="button" onClick={() => void allocateOutboundOrder()} disabled={!outboundOrder || outboundLoading}>{outboundLoading ? "处理中…" : "分配库存"}</button>
+            {outboundAllocation && <div className="v2-code-list"><strong>已分配 {outboundAllocation.allocated_count} 件</strong>{outboundAllocation.allocations.map((item) => <span key={item.allocation_id}><b>{item.barcode}</b><small>货主 {item.owner_party_id}</small></span>)}</div>}
+          </div>
+          <div className="v2-panel v2-outbound-workflow">
+            <h3>3. 扫码出库</h3>
+            <label><span>出库批次号</span><input value={outboundShipmentNo} onChange={(event) => setOutboundShipmentNo(event.target.value)} placeholder="留空自动生成" disabled={!outboundAllocation || outboundLoading} /></label>
+            <button className="v2-button primary wide" type="button" onClick={() => void shipOutboundOrder()} disabled={!outboundAllocation || outboundLoading}>{outboundLoading ? "处理中…" : "确认出库"}</button>
+            {outboundShipment && <div className="v2-code-list"><strong>{outboundShipment.shipment_no} · 已出库 {outboundShipment.shipped_count} 件</strong>{outboundShipment.items.map((item) => <span key={item.shipment_line_id}><b>{item.barcode}</b><small>出库行已建立</small></span>)}</div>}
+          </div>
+          <div className="v2-panel v2-outbound-workflow">
+            <h3>4. 交货确认或退回</h3>
+            <label><span>上游确认码</span><input value={outboundConfirmationCode} onChange={(event) => setOutboundConfirmationCode(event.target.value)} placeholder="例如：签收单号 / 确认码" disabled={!outboundShipment || outboundLoading} /></label>
+            <button className="v2-button primary wide" type="button" onClick={() => void confirmOutboundDelivery()} disabled={!outboundShipment || outboundLoading}>确认已交货</button>
+            <label><span>退回原因</span><textarea value={outboundReturnReason} onChange={(event) => setOutboundReturnReason(event.target.value)} placeholder="退回后全部进入隔离区，复检通过前不可再次出库" disabled={!outboundShipment || outboundLoading} /></label>
+            <button className="v2-button wide" type="button" onClick={() => void returnOutboundShipment()} disabled={!outboundShipment || outboundLoading}>登记退回并隔离</button>
+          </div>
+        </div>
+        {outboundNotice && <div className={`v2-notice ${outboundNotice.type}`}>{outboundNotice.text}</div>}
+      </section>
+    );
+  }
+
   return (
     <div className="v2-workspace">
       <aside className="v2-sidebar">
@@ -670,6 +961,7 @@ export default function InventoryWorkspace({
         {page === "receipt" && renderReceipt()}
         {page === "quality" && renderQuality()}
         {page === "inventory" && renderInventory()}
+        {page === "outbound" && renderOutbound()}
       </main>
     </div>
   );

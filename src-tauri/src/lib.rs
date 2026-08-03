@@ -1532,6 +1532,84 @@ async fn v2_get_dashboard(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn v2_create_outbound_order(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::CreateOutboundOrderRequest,
+) -> Result<v2::outbound::CreateOutboundOrderResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .create_outbound_order(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_allocate_outbound_order(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::AllocateOutboundRequest,
+) -> Result<v2::outbound::AllocateOutboundResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .allocate_outbound_order(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_ship_outbound_order(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::ShipOutboundRequest,
+) -> Result<v2::outbound::ShipOutboundResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .ship_outbound_order(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_confirm_outbound_delivery(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::ConfirmOutboundDeliveryRequest,
+) -> Result<v2::outbound::ConfirmOutboundDeliveryResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .confirm_outbound_delivery(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_return_outbound_shipment(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::ReturnOutboundShipmentRequest,
+) -> Result<v2::outbound::ReturnOutboundShipmentResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .return_outbound_shipment(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_get_outbound_order(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    order_id: String,
+) -> Result<v2::outbound::OutboundOrderDetails, String> {
+    activation::require_activated(&app)?;
+    database
+        .outbound_order_details(&order_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[derive(serde::Deserialize)]
 struct V2UpgradeExportInput {
     destination: String,
@@ -1649,6 +1727,12 @@ pub fn run() {
             v2_complete_inspection,
             v2_list_inventory,
             v2_get_dashboard,
+            v2_create_outbound_order,
+            v2_allocate_outbound_order,
+            v2_ship_outbound_order,
+            v2_confirm_outbound_delivery,
+            v2_return_outbound_shipment,
+            v2_get_outbound_order,
             v2_export_upgrade_package,
             v2_archive_offline_workspace,
             play_beep
