@@ -92,3 +92,15 @@ cargo run --example license_keygen -- issue \
 - **前端**: React + TypeScript + Vite
 - **Excel 处理**: `calamine` (读取), `rust_xlsxwriter` (写入)
 - **UI 组件**: 原生 CSS 样式
+
+## 网络版服务端 POC
+
+网络版使用 PostgreSQL 作为唯一事实源，运行账号必须是非超级用户、不能绕过 RLS 且不拥有业务表。迁移使用单独的高权限连接：
+
+```bash
+INVENTORY_DATABASE_URL=postgres://inventory_runtime:***@db/inventory \
+INVENTORY_MIGRATION_DATABASE_URL=postgres://inventory_migrator:***@db/inventory \
+cargo run --bin inventory-server
+```
+
+当前服务提供 `/health`、`/v1/auth/login`、`/v1/auth/refresh`、`/v1/auth/logout` 和幂等入库接口 `/v1/inbound/receipts`。服务默认只监听 `127.0.0.1:3100`；多用户部署应放在 TLS 反向代理后，不要把明文 HTTP 直接暴露到公网。

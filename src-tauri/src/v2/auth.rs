@@ -6,11 +6,8 @@
 //! it is configured for the network edition.  The PostgreSQL migration next to
 //! this file is the database-side part of the same boundary.
 //!
-//! The crate currently does not list `argon2` in `Cargo.toml`.  Before wiring
-//! this module into `v2/mod.rs`, add `argon2 = "0.5"` (the default
-//! `password-hash` support is required).  Keeping that dependency explicit is
-//! intentional: the authentication code must never silently fall back to a
-//! weaker password scheme.
+//! The `argon2` dependency is kept explicit in `Cargo.toml`; the authentication
+//! code must never silently fall back to a weaker password scheme.
 
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
@@ -341,6 +338,13 @@ pub struct AuthenticatedIdentity {
     pub membership_status: MembershipStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedSession {
+    pub identity: AuthenticatedIdentity,
+    pub session_id: Uuid,
+    pub device_id: Uuid,
+}
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("invalid authentication input: {0}")]
@@ -357,6 +361,8 @@ pub enum AuthError {
     LoginLocked,
     #[error("invalid or expired refresh token")]
     InvalidRefreshToken,
+    #[error("invalid, expired, or revoked session")]
+    InvalidSession,
     #[error("authorization denied: {0}")]
     AccessDenied(AuthorizationDenial),
     #[error("database operation failed: {0}")]
@@ -492,7 +498,33 @@ pub async fn authorize_in_transaction(
     identity: &AuthenticatedIdentity,
     required_permission: &str,
 ) -> Result<AuthorizationDecision, AuthError> {
-    set_tenant_context(transaction, identity.tenant_id).await?;
+    set_principal_context(transaction, identity.tenant_id, Some(identity.user_id)).await?;
+    // Lock every authorization input before evaluating it.  The locks keep a
+    // concurrent account, role, seat, or entitlement revocation from
+    // committing halfway through a business transaction.
+    sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR SHARE")
+        .bind(identity.tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    sqlx::query("SELECT id FROM users WHERE tenant_id = $1 AND id = $2 FOR SHARE")
+        .bind(identity.tenant_id)
+        .bind(identity.user_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    sqlx::query(
+        "SELECT id FROM memberships WHERE tenant_id = $1 AND id = $2 AND user_id = $3 FOR SHARE",
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.membership_id)
+    .bind(identity.user_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "SELECT id FROM memberships WHERE tenant_id = $1 AND status = 'active' AND consumes_license_seat FOR SHARE",
+    )
+    .bind(identity.tenant_id)
+    .fetch_all(&mut **transaction)
+    .await?;
     let core = sqlx::query(
         r#"
         SELECT t.active AS tenant_active,
@@ -543,6 +575,21 @@ pub async fn authorize_in_transaction(
         })?;
     let database_now_epoch_seconds: i64 = core.try_get("database_now_epoch_seconds")?;
 
+    sqlx::query(
+        r#"
+        SELECT mr.membership_id
+          FROM membership_roles mr
+          JOIN roles r
+            ON r.tenant_id = mr.tenant_id AND r.id = mr.role_id
+         WHERE mr.tenant_id = $1
+           AND mr.membership_id = $2
+        FOR SHARE OF mr, r
+        "#,
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.membership_id)
+    .fetch_all(&mut **transaction)
+    .await?;
     let role_rows = sqlx::query(
         r#"
         SELECT r.code
@@ -563,6 +610,24 @@ pub async fn authorize_in_transaction(
         .map(|row| row.try_get::<String, _>("code"))
         .collect::<Result<BTreeSet<_>, _>>()?;
 
+    sqlx::query(
+        r#"
+        SELECT p.id
+          FROM membership_roles mr
+          JOIN roles r
+            ON r.tenant_id = mr.tenant_id AND r.id = mr.role_id AND r.active
+          JOIN role_permissions rp
+            ON rp.tenant_id = r.tenant_id AND rp.role_id = r.id
+          JOIN permissions p
+            ON p.tenant_id = rp.tenant_id AND p.id = rp.permission_id
+         WHERE mr.tenant_id = $1 AND mr.membership_id = $2
+        FOR SHARE OF mr, r, rp, p
+        "#,
+    )
+    .bind(identity.tenant_id)
+    .bind(identity.membership_id)
+    .fetch_all(&mut **transaction)
+    .await?;
     let permission_rows = sqlx::query(
         r#"
         SELECT DISTINCT p.code
@@ -586,6 +651,10 @@ pub async fn authorize_in_transaction(
         .map(|row| row.try_get::<String, _>("code"))
         .collect::<Result<BTreeSet<_>, _>>()?;
 
+    sqlx::query("SELECT id FROM license_entitlements WHERE tenant_id = $1 FOR SHARE")
+        .bind(identity.tenant_id)
+        .fetch_all(&mut **transaction)
+        .await?;
     let entitlement_rows = sqlx::query(
         r#"
         SELECT status,
@@ -595,6 +664,7 @@ pub async fn authorize_in_transaction(
                revoked_at IS NOT NULL AS revoked
           FROM license_entitlements
          WHERE tenant_id = $1
+           AND verified_at IS NOT NULL
         "#,
     )
     .bind(identity.tenant_id)
@@ -729,6 +799,104 @@ pub fn hash_token(kind: TokenKind, token: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// Resolve an opaque bearer token inside the caller's business transaction.
+///
+/// The tenant is set before querying the RLS-protected session table, and the
+/// actor setting is populated only from the verified session. Business DTOs
+/// must never supply either value.
+pub async fn authenticate_session_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    session_token: &str,
+) -> Result<AuthenticatedSession, AuthError> {
+    let session_token = session_token.trim();
+    if session_token.is_empty() {
+        return Err(AuthError::InvalidSession);
+    }
+    set_principal_context(transaction, tenant_id, None).await?;
+    let token_hash = hash_token(TokenKind::Session, session_token);
+    let row = sqlx::query(
+        r#"
+        SELECT s.id AS session_id,
+               s.device_id,
+               s.user_id,
+               s.membership_id,
+               u.status AS account_status,
+               m.status AS membership_status,
+               d.status AS device_status
+          FROM sessions s
+          JOIN users u
+            ON u.tenant_id = s.tenant_id AND u.id = s.user_id
+          JOIN memberships m
+            ON m.tenant_id = s.tenant_id
+           AND m.id = s.membership_id
+           AND m.user_id = s.user_id
+          JOIN devices d
+            ON d.tenant_id = s.tenant_id
+           AND d.id = s.device_id
+           AND d.membership_id = s.membership_id
+           AND d.user_id = s.user_id
+         WHERE s.tenant_id = $1
+           AND s.token_hash = $2
+           AND s.revoked_at IS NULL
+           AND s.expires_at > CURRENT_TIMESTAMP
+         FOR SHARE OF s, u, m, d
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(token_hash.as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        return Err(AuthError::InvalidSession);
+    };
+    if row.try_get::<String, _>("device_status")? != "active" {
+        return Err(AuthError::InvalidSession);
+    }
+    let user_id: Uuid = row.try_get("user_id")?;
+    let identity = AuthenticatedIdentity {
+        tenant_id,
+        user_id,
+        membership_id: row.try_get("membership_id")?,
+        account_status: AccountStatus::from_database(
+            row.try_get::<String, _>("account_status")?.as_str(),
+        ),
+        membership_status: MembershipStatus::from_database(
+            row.try_get::<String, _>("membership_status")?.as_str(),
+        ),
+    };
+    sqlx::query(
+        "UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(row.try_get::<Uuid, _>("session_id")?)
+    .execute(&mut **transaction)
+    .await?;
+    set_principal_context(transaction, tenant_id, Some(user_id)).await?;
+    Ok(AuthenticatedSession {
+        identity,
+        session_id: row.try_get("session_id")?,
+        device_id: row.try_get("device_id")?,
+    })
+}
+
+/// Authenticate and authorize one bearer token without leaving the caller's
+/// transaction. Permission names are supplied by server route code, never by
+/// the request body.
+pub async fn authorize_session_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    session_token: &str,
+    required_permission: &str,
+) -> Result<AuthenticatedSession, AuthError> {
+    let session =
+        authenticate_session_in_transaction(transaction, tenant_id, session_token).await?;
+    match authorize_in_transaction(transaction, &session.identity, required_permission).await? {
+        AuthorizationDecision::Allowed => Ok(session),
+        AuthorizationDecision::Denied { reason } => Err(AuthError::AccessDenied(reason)),
+    }
+}
+
 fn new_token(kind: TokenKind) -> (String, [u8; 32]) {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -833,14 +1001,215 @@ pub async fn issue_session(
     })
 }
 
+/// Rotate a refresh token exactly once and issue a new short-lived session
+/// token.  The old refresh row is marked used in the same transaction as the
+/// replacement row, so two concurrent refresh requests cannot both succeed.
+pub async fn rotate_refresh_token(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    refresh_token: &str,
+    required_permission: &str,
+    policy: SessionPolicy,
+) -> Result<(AuthenticatedIdentity, IssuedSession), AuthError> {
+    policy.validate()?;
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err(AuthError::InvalidRefreshToken);
+    }
+
+    let mut transaction = pool.begin().await?;
+    set_tenant_context(&mut transaction, tenant_id).await?;
+    let token_hash = hash_token(TokenKind::Refresh, refresh_token);
+    let row = sqlx::query(
+        r#"
+        SELECT rt.id AS refresh_token_id,
+               rt.session_id,
+               rt.user_id,
+               rt.membership_id,
+               rt.used_at IS NULL
+                   AND rt.revoked_at IS NULL
+                   AND rt.expires_at > CURRENT_TIMESTAMP AS token_valid,
+               s.device_id,
+               s.revoked_at IS NULL
+                   AND s.expires_at > CURRENT_TIMESTAMP AS session_valid,
+               u.status AS account_status,
+               m.status AS membership_status
+          FROM refresh_tokens rt
+          JOIN sessions s
+            ON s.tenant_id = rt.tenant_id AND s.id = rt.session_id
+          JOIN users u
+            ON u.tenant_id = rt.tenant_id AND u.id = rt.user_id
+          JOIN memberships m
+            ON m.tenant_id = rt.tenant_id
+           AND m.id = rt.membership_id
+           AND m.user_id = rt.user_id
+          JOIN devices d
+            ON d.tenant_id = s.tenant_id
+           AND d.id = s.device_id
+           AND d.membership_id = s.membership_id
+           AND d.user_id = s.user_id
+           AND d.status = 'active'
+         WHERE rt.tenant_id = $1
+           AND rt.token_hash = $2
+         FOR UPDATE OF rt, s
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(token_hash.as_slice())
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(row) = row else {
+        transaction.rollback().await?;
+        return Err(AuthError::InvalidRefreshToken);
+    };
+    if !row.try_get::<bool, _>("token_valid")? || !row.try_get::<bool, _>("session_valid")? {
+        transaction.rollback().await?;
+        return Err(AuthError::InvalidRefreshToken);
+    }
+
+    let identity = AuthenticatedIdentity {
+        tenant_id,
+        user_id: row.try_get("user_id")?,
+        membership_id: row.try_get("membership_id")?,
+        account_status: AccountStatus::from_database(
+            row.try_get::<String, _>("account_status")?.as_str(),
+        ),
+        membership_status: MembershipStatus::from_database(
+            row.try_get::<String, _>("membership_status")?.as_str(),
+        ),
+    };
+    if let AuthorizationDecision::Denied { reason } =
+        authorize_in_transaction(&mut transaction, &identity, required_permission).await?
+    {
+        transaction.rollback().await?;
+        return Err(AuthError::AccessDenied(reason));
+    }
+
+    let session_id: Uuid = row.try_get("session_id")?;
+    let old_refresh_token_id: Uuid = row.try_get("refresh_token_id")?;
+    let new_refresh_token_id = Uuid::now_v7();
+    let (session_token, session_hash) = new_token(TokenKind::Session);
+    let (refresh_token, refresh_hash) = new_token(TokenKind::Refresh);
+
+    sqlx::query(
+        r#"
+        INSERT INTO refresh_tokens
+            (tenant_id, id, session_id, membership_id, user_id, token_hash,
+             issued_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP + make_interval(secs => $7::double precision))
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(new_refresh_token_id)
+    .bind(session_id)
+    .bind(identity.membership_id)
+    .bind(identity.user_id)
+    .bind(refresh_hash.as_slice())
+    .bind(policy.refresh_ttl_seconds)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE refresh_tokens
+           SET used_at = CURRENT_TIMESTAMP,
+               replaced_by_token_id = $3
+         WHERE tenant_id = $1
+           AND id = $2
+           AND used_at IS NULL
+           AND revoked_at IS NULL
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(old_refresh_token_id)
+    .bind(new_refresh_token_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE sessions
+           SET token_hash = $3,
+               expires_at = CURRENT_TIMESTAMP
+                   + make_interval(secs => $4::double precision),
+               last_seen_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = $1
+           AND id = $2
+           AND revoked_at IS NULL
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(session_hash.as_slice())
+    .bind(policy.session_ttl_seconds)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok((
+        identity,
+        IssuedSession {
+            session_id,
+            refresh_token_id: new_refresh_token_id,
+            session_token,
+            refresh_token,
+            session_ttl_seconds: policy.session_ttl_seconds,
+            refresh_ttl_seconds: policy.refresh_ttl_seconds,
+        },
+    ))
+}
+
+/// Revoke one session after authenticating its current bearer token.  The
+/// operation is deliberately idempotent at the service boundary: a second
+/// logout receives the same invalid-session response without changing data.
+pub async fn revoke_session(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    session_token: &str,
+    reason: &str,
+) -> Result<(), AuthError> {
+    let mut transaction = pool.begin().await?;
+    let session =
+        authenticate_session_in_transaction(&mut transaction, tenant_id, session_token).await?;
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP, revoke_reason = $3 WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(session.session_id)
+    .bind(if reason.trim().is_empty() {
+        "user_logout"
+    } else {
+        reason.trim()
+    })
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE tenant_id = $1 AND session_id = $2 AND used_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(session.session_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn set_tenant_context(
     transaction: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
 ) -> Result<(), AuthError> {
+    set_principal_context(transaction, tenant_id, None).await
+}
+
+async fn set_principal_context(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    actor_user_id: Option<Uuid>,
+) -> Result<(), AuthError> {
     sqlx::query(
-        "SELECT set_config('app.tenant_id', $1, true), set_config('app.actor_user_id', '', true)",
+        "SELECT set_config('app.tenant_id', $1, true), set_config('app.actor_user_id', $2, true)",
     )
     .bind(tenant_id.to_string())
+    .bind(actor_user_id.map(|id| id.to_string()).unwrap_or_default())
     .execute(&mut **transaction)
     .await?;
     Ok(())

@@ -1,25 +1,47 @@
 //! PostgreSQL storage boundary for the network edition.
 //!
 //! The network edition keeps the same logical model as the offline SQLite
-//! edition, but every business transaction is explicitly bound to a tenant.
-//! `begin_tenant` sets the tenant and actor settings locally on the checked-out
-//! connection before any application query can run.  The SQL migration adds
-//! `FORCE ROW LEVEL SECURITY`, so a missing or stale context cannot broaden a
-//! query's visibility.
+//! edition, but every business transaction is explicitly bound to a tenant and
+//! a verified bearer session. The SQL migrations add `FORCE ROW LEVEL
+//! SECURITY`, so a missing or stale context cannot broaden a query's
+//! visibility.
 
+use super::auth::{authorize_session_in_transaction, AuthError, AuthenticatedSession};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Connection settings for the network PostgreSQL service.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NetworkDatabaseConfig {
     pub url: String,
+    /// Optional privileged connection used only for immutable migrations.
+    /// The runtime URL must use a restricted non-owner role.
+    pub migration_url: Option<String>,
     pub max_connections: u32,
     pub min_connections: u32,
     pub acquire_timeout: Duration,
+    pub require_restricted_role: bool,
+}
+
+impl fmt::Debug for NetworkDatabaseConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkDatabaseConfig")
+            .field("url", &"<redacted>")
+            .field(
+                "migration_url",
+                &self.migration_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("require_restricted_role", &self.require_restricted_role)
+            .finish()
+    }
 }
 
 impl NetworkDatabaseConfig {
@@ -34,6 +56,15 @@ impl NetworkDatabaseConfig {
         if self.url.trim().is_empty() {
             return Err(NetworkDatabaseError::InvalidConfig(
                 "PostgreSQL URL must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .migration_url
+            .as_ref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            return Err(NetworkDatabaseError::InvalidConfig(
+                "migration_url must not be empty when configured".to_owned(),
             ));
         }
         if self.min_connections > self.max_connections {
@@ -59,9 +90,11 @@ impl Default for NetworkDatabaseConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
+            migration_url: None,
             max_connections: 16,
             min_connections: 1,
             acquire_timeout: Duration::from_secs(5),
+            require_restricted_role: true,
         }
     }
 }
@@ -76,6 +109,10 @@ pub enum NetworkDatabaseError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("tenant {0} does not exist or is inactive")]
     TenantUnavailable(Uuid),
+    #[error("runtime PostgreSQL role is unsafe: {0}")]
+    InsecureRuntimeRole(String),
+    #[error("network authorization failed: {0}")]
+    Authorization(#[from] AuthError),
 }
 
 /// A pool that is safe to share between network requests.
@@ -85,9 +122,21 @@ pub struct NetworkDatabase {
 }
 
 impl NetworkDatabase {
-    /// Connect to PostgreSQL and apply immutable SQLx migrations.
+    /// Apply migrations through the optional privileged connection, then open
+    /// the runtime pool using a restricted role.
     pub async fn connect(config: &NetworkDatabaseConfig) -> Result<Self, NetworkDatabaseError> {
         config.validate()?;
+        if let Some(migration_url) = &config.migration_url {
+            let migration_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(config.acquire_timeout)
+                .connect(migration_url)
+                .await?;
+            sqlx::migrate!("./migrations/postgres")
+                .run(&migration_pool)
+                .await?;
+            migration_pool.close().await;
+        }
         let pool = PgPoolOptions::new()
             .min_connections(config.min_connections)
             .max_connections(config.max_connections)
@@ -95,78 +144,83 @@ impl NetworkDatabase {
             .connect(&config.url)
             .await?;
 
-        sqlx::migrate!("./migrations/postgres").run(&pool).await?;
+        if config.require_restricted_role {
+            validate_runtime_role(&pool).await?;
+        }
 
         Ok(Self { pool })
     }
 
-    pub fn pool(&self) -> &PgPool {
+    pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// Begin a transaction with an RLS tenant context.
-    ///
-    /// The settings use `is_local = true`, so they disappear when this
-    /// transaction commits or rolls back.  Callers must use the returned
-    /// transaction for all reads and writes in one application operation.
-    pub async fn begin_tenant(
+    /// Begin one authenticated and authorized business request. Tenant,
+    /// session, actor, permission and entitlement are all resolved before the
+    /// transaction is exposed to a repository.
+    pub async fn begin_authorized_request(
         &self,
         tenant_id: Uuid,
-        actor_user_id: Option<Uuid>,
-    ) -> Result<TenantTransaction<'_>, NetworkDatabaseError> {
+        session_token: &str,
+        required_permission: &str,
+    ) -> Result<AuthorizedTransaction<'_>, NetworkDatabaseError> {
         let mut transaction = self.pool.begin().await?;
-        let actor_value = actor_user_id.map(|id| id.to_string()).unwrap_or_default();
-
-        sqlx::query(
-            "SELECT set_config('app.tenant_id', $1, true), set_config('app.actor_user_id', $2, true)",
-        )
-        .bind(tenant_id.to_string())
-        .bind(actor_value)
-        .execute(&mut *transaction)
-        .await?;
-
-        let active =
-            sqlx::query_scalar::<_, bool>("SELECT active FROM tenants WHERE id = $1 FOR SHARE")
-                .bind(tenant_id)
-                .fetch_optional(&mut *transaction)
-                .await?;
-        if active != Some(true) {
-            transaction.rollback().await?;
-            return Err(NetworkDatabaseError::TenantUnavailable(tenant_id));
-        }
-
-        Ok(TenantTransaction {
-            transaction,
+        let session = authorize_session_in_transaction(
+            &mut transaction,
             tenant_id,
-            actor_user_id,
+            session_token,
+            required_permission,
+        )
+        .await?;
+        Ok(AuthorizedTransaction {
+            transaction,
+            session,
         })
     }
 }
 
-/// A transaction carrying the tenant and actor identity used by RLS and
-/// audit repositories.  It intentionally exposes the SQLx transaction only
-/// through a mutable reference, making it difficult to accidentally use the
-/// pool (and lose the tenant context) in the middle of an operation.
-pub struct TenantTransaction<'pool> {
-    transaction: Transaction<'pool, Postgres>,
-    tenant_id: Uuid,
-    actor_user_id: Option<Uuid>,
+async fn validate_runtime_role(pool: &PgPool) -> Result<(), NetworkDatabaseError> {
+    let row = sqlx::query(
+        r#"
+        SELECT current_user AS role_name,
+               r.rolsuper,
+               r.rolbypassrls,
+               EXISTS (
+                   SELECT 1
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p')
+                      AND c.relowner = r.oid
+               ) AS owns_public_tables
+          FROM pg_roles r
+         WHERE r.rolname = current_user
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let role_name: String = row.try_get("role_name")?;
+    let superuser: bool = row.try_get("rolsuper")?;
+    let bypass_rls: bool = row.try_get("rolbypassrls")?;
+    let owns_public_tables: bool = row.try_get("owns_public_tables")?;
+    if superuser || bypass_rls || owns_public_tables {
+        return Err(NetworkDatabaseError::InsecureRuntimeRole(format!(
+            "role {role_name} must be NOSUPERUSER, NOBYPASSRLS, and not own public tables"
+        )));
+    }
+    Ok(())
 }
 
-impl<'pool> TenantTransaction<'pool> {
-    pub fn tenant_id(&self) -> Uuid {
-        self.tenant_id
+pub struct AuthorizedTransaction<'pool> {
+    transaction: Transaction<'pool, Postgres>,
+    session: AuthenticatedSession,
+}
+
+impl<'pool> AuthorizedTransaction<'pool> {
+    pub fn session(&self) -> &AuthenticatedSession {
+        &self.session
     }
 
-    pub fn actor_user_id(&self) -> Option<Uuid> {
-        self.actor_user_id
-    }
-
-    /// Borrow the underlying transaction for repository queries.
-    ///
-    /// Repository methods should accept this borrow instead of acquiring a
-    /// second pool connection.  All SQL issued through it remains covered by
-    /// the transaction-local RLS settings.
     pub fn sqlx_transaction(&mut self) -> &mut Transaction<'pool, Postgres> {
         &mut self.transaction
     }
