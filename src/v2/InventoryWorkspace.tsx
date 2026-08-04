@@ -12,6 +12,7 @@ import {
   Boxes,
   CheckCircle2,
   ClipboardCheck,
+  FileSpreadsheet,
   Gauge,
   LogOut,
   PackagePlus,
@@ -20,13 +21,16 @@ import {
   Settings,
   ShieldAlert,
   Truck,
+  Users,
   Warehouse,
   X,
   type LucideIcon,
 } from "lucide-react";
+import IdentityAdminPanel from "./IdentityAdminPanel";
+import LegacyImportPanel from "./LegacyImportPanel";
 import "./InventoryWorkspace.css";
 
-type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound" | "settings";
+type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound" | "legacy-import" | "users" | "settings";
 type WorkspaceMode = "offline" | "network";
 type InventoryStatus =
   | "received"
@@ -423,6 +427,7 @@ interface NavigationItem {
   label: string;
   description: string;
   icon: LucideIcon;
+  mode?: WorkspaceMode;
 }
 
 const navigationItems: NavigationItem[] = [
@@ -431,6 +436,8 @@ const navigationItems: NavigationItem[] = [
   { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck },
   { id: "inventory", label: "库存", description: "单件库存查询", icon: Boxes },
   { id: "outbound", label: "出库", description: "凑单交货与退回", icon: Truck },
+  { id: "legacy-import", label: "Excel 导入", description: "历史数据迁移", icon: FileSpreadsheet, mode: "offline" },
+  { id: "users", label: "用户与角色", description: "账号和权限", icon: Users, mode: "network" },
   { id: "settings", label: "数据与设置", description: "备份、恢复和升级", icon: Settings },
 ];
 
@@ -764,6 +771,9 @@ export default function InventoryWorkspace({
 
   function switchMode(nextMode: WorkspaceMode) {
     setMode(nextMode);
+    if ((page === "legacy-import" && nextMode !== "offline") || (page === "users" && nextMode !== "network")) {
+      setPage("overview");
+    }
     setNetworkAuthNotice(null);
   }
 
@@ -1541,7 +1551,7 @@ export default function InventoryWorkspace({
           <button type="button" className={mode === "network" ? "active" : ""} onClick={() => switchMode("network")}>网络 PostgreSQL</button>
         </div>
         <nav aria-label="库存模块">
-          {navigationItems.map((item) => {
+          {navigationItems.filter((item) => !item.mode || item.mode === mode).map((item) => {
             const Icon = item.icon;
             return <button key={item.id} type="button" className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}><Icon size={19} /><span><strong>{item.label}</strong><small>{item.description}</small></span></button>;
           })}
@@ -1562,6 +1572,8 @@ export default function InventoryWorkspace({
           {page === "quality" && renderQuality()}
           {page === "inventory" && renderInventory()}
           {page === "outbound" && renderOutbound()}
+          {page === "legacy-import" && <LegacyImportPanel actorId={resolvedActorId} activated={offlineActivated} onCommitted={() => void refreshDashboard()} />}
+          {page === "users" && <IdentityAdminPanel currentUserId={networkStatus?.user_id ?? null} />}
           {page === "settings" && renderSettings()}
         </>}
       </main>

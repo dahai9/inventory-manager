@@ -2477,13 +2477,12 @@ mod tests {
             PERMISSION_RETURN_WRITE,
         ];
         for permission in permissions {
-            let permission_id = Uuid::now_v7();
-            sqlx::query("INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4)")
+            let permission_id: Uuid = sqlx::query_scalar("INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, code) DO UPDATE SET description = EXCLUDED.description RETURNING id")
                 .bind(tenant_id)
-                .bind(permission_id)
+                .bind(Uuid::now_v7())
                 .bind(permission)
                 .bind(permission)
-                .execute(&mut *setup)
+                .fetch_one(&mut *setup)
                 .await
                 .expect("insert permission");
             sqlx::query("INSERT INTO role_permissions (tenant_id, role_id, permission_id) VALUES ($1, $2, $3)")

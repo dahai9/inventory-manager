@@ -1401,10 +1401,6 @@ fn validate_relational_data(
         ("outbound_shipments", &["workspace_id", "shipment_no"]),
         ("outbound_shipments", &["workspace_id", "idempotency_key"]),
         (
-            "outbound_shipment_lines",
-            &["workspace_id", "inventory_unit_id"],
-        ),
-        (
             "delivery_confirmations",
             &["workspace_id", "confirmation_code"],
         ),
@@ -1430,6 +1426,7 @@ fn validate_relational_data(
         validate_unique_fields(records, table, fields)?;
     }
     validate_active_allocation_uniqueness(records)?;
+    validate_active_shipment_line_uniqueness(records)?;
 
     for (table, field, target) in [
         ("party_roles", "party_id", "business_parties"),
@@ -1618,6 +1615,29 @@ fn validate_active_allocation_uniqueness(
                     "inventory unit {unit} has more than one active allocation"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_active_shipment_line_uniqueness(
+    records: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<(), UpgradeError> {
+    let returned_line_ids: HashSet<&str> = table_records(records, "outbound_return_lines")
+        .iter()
+        .map(|record| required_string(record, "outbound_return_lines", "outbound_shipment_line_id"))
+        .collect::<Result<_, UpgradeError>>()?;
+    let mut active_units = HashSet::new();
+    for record in table_records(records, "outbound_shipment_lines") {
+        let line_id = required_string(record, "outbound_shipment_lines", "id")?;
+        if returned_line_ids.contains(line_id) {
+            continue;
+        }
+        let unit = required_string(record, "outbound_shipment_lines", "inventory_unit_id")?;
+        if !active_units.insert(unit) {
+            return Err(UpgradeError::Data(format!(
+                "inventory unit {unit} has more than one active shipment line"
+            )));
         }
     }
     Ok(())
@@ -2595,9 +2615,9 @@ impl<'a> PgUpgradeTransaction<'a> {
                 INSERT INTO inbound_receipts
                     (tenant_id, id, receipt_no, owner_party_id, warehouse_id,
                      source_reference, received_at, status, actor_id,
-                     idempotency_key, request_id, created_at)
+                     source_actor_id, idempotency_key, request_id, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9,
-                        $10, $11, $12::timestamptz)
+                        $10, $11, $12, $13::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2613,6 +2633,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "inbound_receipts", "received_at")?)
             .bind(string_field(record, "inbound_receipts", "status")?)
             .bind(actor_id)
+            .bind(string_field(record, "inbound_receipts", "actor_id")?)
             .bind(string_field(record, "inbound_receipts", "idempotency_key")?)
             .bind(string_field(record, "inbound_receipts", "request_id")?)
             .bind(string_field(record, "inbound_receipts", "created_at")?)
@@ -2695,10 +2716,10 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO quality_inspections
                     (tenant_id, id, inspection_no, inspection_type, status,
-                     inspector_id, inspected_at, idempotency_key, request_id,
-                     created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9,
-                        $10::timestamptz)
+                     inspector_id, source_actor_id, inspected_at,
+                     idempotency_key, request_id, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9,
+                        $10, $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2715,6 +2736,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             )?)
             .bind(string_field(record, "quality_inspections", "status")?)
             .bind(actor_id)
+            .bind(string_field(record, "quality_inspections", "inspector_id")?)
             .bind(string_field(record, "quality_inspections", "inspected_at")?)
             .bind(string_field(
                 record,
@@ -2780,8 +2802,9 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO quality_waivers
                     (tenant_id, id, inventory_unit_id, reason, authorized_by,
-                     authorized_at, revoked_at)
-                VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz)
+                     source_actor_id, authorized_at, revoked_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz,
+                        $8::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2789,6 +2812,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(uuid_field(record, "quality_waivers", "inventory_unit_id")?)
             .bind(string_field(record, "quality_waivers", "reason")?)
             .bind(actor_id)
+            .bind(string_field(record, "quality_waivers", "authorized_by")?)
             .bind(string_field(record, "quality_waivers", "authorized_at")?)
             .bind(optional_string_field(
                 record,
@@ -2812,9 +2836,10 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO outbound_orders
                     (tenant_id, id, order_no, upstream_receiver_id, required_at,
-                     status, actor_id, idempotency_key, request_id, created_at)
+                     status, actor_id, source_actor_id, idempotency_key,
+                     request_id, created_at)
                 VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8, $9,
-                        $10::timestamptz)
+                        $10, $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2832,6 +2857,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             )?)
             .bind(string_field(record, "outbound_orders", "status")?)
             .bind(actor_id)
+            .bind(string_field(record, "outbound_orders", "actor_id")?)
             .bind(string_field(record, "outbound_orders", "idempotency_key")?)
             .bind(string_field(record, "outbound_orders", "request_id")?)
             .bind(string_field(record, "outbound_orders", "created_at")?)
@@ -2919,9 +2945,10 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO outbound_allocations
                     (tenant_id, id, outbound_order_line_id, inventory_unit_id,
-                     sku_id, status, allocated_by, allocated_at, released_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz,
-                        $9::timestamptz)
+                     sku_id, status, allocated_by, source_actor_id,
+                     allocated_at, released_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz,
+                        $10::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2942,6 +2969,11 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(
                 record,
                 "outbound_allocations",
+                "allocated_by",
+            )?)
+            .bind(string_field(
+                record,
+                "outbound_allocations",
                 "allocated_at",
             )?)
             .bind(optional_string_field(
@@ -2958,9 +2990,10 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO outbound_shipments
                     (tenant_id, id, shipment_no, outbound_order_id, status,
-                     shipped_at, actor_id, idempotency_key, request_id, created_at)
+                     shipped_at, actor_id, source_actor_id, idempotency_key,
+                     request_id, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9,
-                        $10::timestamptz)
+                        $10, $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2974,6 +3007,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "outbound_shipments", "status")?)
             .bind(string_field(record, "outbound_shipments", "shipped_at")?)
             .bind(actor_id)
+            .bind(string_field(record, "outbound_shipments", "actor_id")?)
             .bind(string_field(
                 record,
                 "outbound_shipments",
@@ -2985,13 +3019,154 @@ impl<'a> PgUpgradeTransaction<'a> {
             .await?;
         }
 
-        for record in records_for(records, "outbound_shipment_lines") {
+        for record in records_for(records, "delivery_confirmations") {
+            sqlx::query(
+                r#"
+                INSERT INTO delivery_confirmations
+                    (tenant_id, id, outbound_shipment_id, confirmation_code,
+                     confirmed_by, source_actor_id, confirmed_at, notes,
+                     idempotency_key, request_id, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9,
+                        $10, $11::timestamptz)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(uuid_field(record, "delivery_confirmations", "id")?)
+            .bind(uuid_field(
+                record,
+                "delivery_confirmations",
+                "outbound_shipment_id",
+            )?)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "confirmation_code",
+            )?)
+            .bind(actor_id)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "confirmed_by",
+            )?)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "confirmed_at",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "delivery_confirmations",
+                "notes",
+            )?)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "idempotency_key",
+            )?)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "request_id",
+            )?)
+            .bind(string_field(
+                record,
+                "delivery_confirmations",
+                "created_at",
+            )?)
+            .execute(&mut *self.transaction)
+            .await?;
+        }
+        for record in records_for(records, "outbound_return_batches") {
+            sqlx::query(
+                r#"
+                INSERT INTO outbound_return_batches
+                    (tenant_id, id, return_no, returned_at, actor_id,
+                     source_actor_id, idempotency_key, request_id, created_at)
+                VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8,
+                        $9::timestamptz)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(uuid_field(record, "outbound_return_batches", "id")?)
+            .bind(string_field(
+                record,
+                "outbound_return_batches",
+                "return_no",
+            )?)
+            .bind(string_field(
+                record,
+                "outbound_return_batches",
+                "returned_at",
+            )?)
+            .bind(actor_id)
+            .bind(string_field(record, "outbound_return_batches", "actor_id")?)
+            .bind(string_field(
+                record,
+                "outbound_return_batches",
+                "idempotency_key",
+            )?)
+            .bind(string_field(
+                record,
+                "outbound_return_batches",
+                "request_id",
+            )?)
+            .bind(string_field(
+                record,
+                "outbound_return_batches",
+                "created_at",
+            )?)
+            .execute(&mut *self.transaction)
+            .await?;
+        }
+
+        let delivery_lines_by_shipment: HashMap<&str, &Map<String, Value>> =
+            records_for(records, "delivery_confirmation_lines")
+                .iter()
+                .map(|record| {
+                    Ok((
+                        string_field(
+                            record,
+                            "delivery_confirmation_lines",
+                            "outbound_shipment_line_id",
+                        )?,
+                        record,
+                    ))
+                })
+                .collect::<Result<_, PgUpgradeError>>()?;
+        let return_lines_by_shipment: HashMap<&str, &Map<String, Value>> =
+            records_for(records, "outbound_return_lines")
+                .iter()
+                .map(|record| {
+                    Ok((
+                        string_field(record, "outbound_return_lines", "outbound_shipment_line_id")?,
+                        record,
+                    ))
+                })
+                .collect::<Result<_, PgUpgradeError>>()?;
+        let mut shipment_lines = records_for(records, "outbound_shipment_lines")
+            .iter()
+            .map(|record| {
+                Ok((
+                    string_field(record, "outbound_shipment_lines", "created_at")?.to_owned(),
+                    string_field(record, "outbound_shipment_lines", "id")?.to_owned(),
+                    record,
+                ))
+            })
+            .collect::<Result<Vec<_>, PgUpgradeError>>()?;
+        shipment_lines
+            .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        // Replaying each unit's history in time order is required for a unit
+        // that was returned, retested and shipped again. PostgreSQL permits
+        // only one currently shipped/delivered line per unit, so the earlier
+        // line must reach `returned` before the later line is inserted.
+        for (_, shipment_line_id, record) in shipment_lines {
             sqlx::query(
                 r#"
                 INSERT INTO outbound_shipment_lines
                     (tenant_id, id, outbound_shipment_id, outbound_allocation_id,
                      inventory_unit_id, scanned_barcode_snapshot, created_at, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, 'shipped')
                 "#,
             )
             .bind(tenant_id)
@@ -3021,178 +3196,91 @@ impl<'a> PgUpgradeTransaction<'a> {
                 "outbound_shipment_lines",
                 "created_at",
             )?)
-            // Replay delivery and return rows below so their database
-            // triggers perform the same state transitions as live operations.
-            .bind("shipped")
             .execute(&mut *self.transaction)
             .await?;
-        }
-        for record in records_for(records, "delivery_confirmations") {
-            sqlx::query(
-                r#"
-                INSERT INTO delivery_confirmations
-                    (tenant_id, id, outbound_shipment_id, confirmation_code,
-                     confirmed_by, confirmed_at, notes, idempotency_key,
-                     request_id, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9,
-                        $10::timestamptz)
-                "#,
-            )
-            .bind(tenant_id)
-            .bind(uuid_field(record, "delivery_confirmations", "id")?)
-            .bind(uuid_field(
-                record,
-                "delivery_confirmations",
-                "outbound_shipment_id",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmations",
-                "confirmation_code",
-            )?)
-            .bind(actor_id)
-            .bind(string_field(
-                record,
-                "delivery_confirmations",
-                "confirmed_at",
-            )?)
-            .bind(optional_string_field(
-                record,
-                "delivery_confirmations",
-                "notes",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmations",
-                "idempotency_key",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmations",
-                "request_id",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmations",
-                "created_at",
-            )?)
-            .execute(&mut *self.transaction)
-            .await?;
-        }
-        for record in records_for(records, "delivery_confirmation_lines") {
-            sqlx::query(
-                r#"
-                INSERT INTO delivery_confirmation_lines
-                    (tenant_id, id, delivery_confirmation_id,
-                     outbound_shipment_line_id, result, exception_notes, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
-                "#,
-            )
-            .bind(tenant_id)
-            .bind(uuid_field(record, "delivery_confirmation_lines", "id")?)
-            .bind(uuid_field(
-                record,
-                "delivery_confirmation_lines",
-                "delivery_confirmation_id",
-            )?)
-            .bind(uuid_field(
-                record,
-                "delivery_confirmation_lines",
-                "outbound_shipment_line_id",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmation_lines",
-                "result",
-            )?)
-            .bind(optional_string_field(
-                record,
-                "delivery_confirmation_lines",
-                "exception_notes",
-            )?)
-            .bind(string_field(
-                record,
-                "delivery_confirmation_lines",
-                "created_at",
-            )?)
-            .execute(&mut *self.transaction)
-            .await?;
-        }
-        for record in records_for(records, "outbound_return_batches") {
-            sqlx::query(
-                r#"
-                INSERT INTO outbound_return_batches
-                    (tenant_id, id, return_no, returned_at, actor_id,
-                     idempotency_key, request_id, created_at)
-                VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8::timestamptz)
-                "#,
-            )
-            .bind(tenant_id)
-            .bind(uuid_field(record, "outbound_return_batches", "id")?)
-            .bind(string_field(
-                record,
-                "outbound_return_batches",
-                "return_no",
-            )?)
-            .bind(string_field(
-                record,
-                "outbound_return_batches",
-                "returned_at",
-            )?)
-            .bind(actor_id)
-            .bind(string_field(
-                record,
-                "outbound_return_batches",
-                "idempotency_key",
-            )?)
-            .bind(string_field(
-                record,
-                "outbound_return_batches",
-                "request_id",
-            )?)
-            .bind(string_field(
-                record,
-                "outbound_return_batches",
-                "created_at",
-            )?)
-            .execute(&mut *self.transaction)
-            .await?;
-        }
-        for record in records_for(records, "outbound_return_lines") {
-            sqlx::query(
-                r#"
-                INSERT INTO outbound_return_lines
-                    (tenant_id, id, return_batch_id, outbound_shipment_line_id,
-                     inventory_unit_id, reason, disposition, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz)
-                "#,
-            )
-            .bind(tenant_id)
-            .bind(uuid_field(record, "outbound_return_lines", "id")?)
-            .bind(uuid_field(
-                record,
-                "outbound_return_lines",
-                "return_batch_id",
-            )?)
-            .bind(uuid_field(
-                record,
-                "outbound_return_lines",
-                "outbound_shipment_line_id",
-            )?)
-            .bind(uuid_field(
-                record,
-                "outbound_return_lines",
-                "inventory_unit_id",
-            )?)
-            .bind(string_field(record, "outbound_return_lines", "reason")?)
-            .bind(string_field(
-                record,
-                "outbound_return_lines",
-                "disposition",
-            )?)
-            .bind(string_field(record, "outbound_return_lines", "created_at")?)
-            .execute(&mut *self.transaction)
-            .await?;
+
+            if let Some(delivery) = delivery_lines_by_shipment.get(shipment_line_id.as_str()) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO delivery_confirmation_lines
+                        (tenant_id, id, delivery_confirmation_id,
+                         outbound_shipment_line_id, result, exception_notes,
+                         created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(uuid_field(delivery, "delivery_confirmation_lines", "id")?)
+                .bind(uuid_field(
+                    delivery,
+                    "delivery_confirmation_lines",
+                    "delivery_confirmation_id",
+                )?)
+                .bind(uuid_field(
+                    delivery,
+                    "delivery_confirmation_lines",
+                    "outbound_shipment_line_id",
+                )?)
+                .bind(string_field(
+                    delivery,
+                    "delivery_confirmation_lines",
+                    "result",
+                )?)
+                .bind(optional_string_field(
+                    delivery,
+                    "delivery_confirmation_lines",
+                    "exception_notes",
+                )?)
+                .bind(string_field(
+                    delivery,
+                    "delivery_confirmation_lines",
+                    "created_at",
+                )?)
+                .execute(&mut *self.transaction)
+                .await?;
+            }
+
+            if let Some(returned) = return_lines_by_shipment.get(shipment_line_id.as_str()) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO outbound_return_lines
+                        (tenant_id, id, return_batch_id,
+                         outbound_shipment_line_id, inventory_unit_id, reason,
+                         disposition, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz)
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(uuid_field(returned, "outbound_return_lines", "id")?)
+                .bind(uuid_field(
+                    returned,
+                    "outbound_return_lines",
+                    "return_batch_id",
+                )?)
+                .bind(uuid_field(
+                    returned,
+                    "outbound_return_lines",
+                    "outbound_shipment_line_id",
+                )?)
+                .bind(uuid_field(
+                    returned,
+                    "outbound_return_lines",
+                    "inventory_unit_id",
+                )?)
+                .bind(string_field(returned, "outbound_return_lines", "reason")?)
+                .bind(string_field(
+                    returned,
+                    "outbound_return_lines",
+                    "disposition",
+                )?)
+                .bind(string_field(
+                    returned,
+                    "outbound_return_lines",
+                    "created_at",
+                )?)
+                .execute(&mut *self.transaction)
+                .await?;
+            }
         }
         for record in records_for(records, "stock_movements") {
             sqlx::query(
@@ -3200,9 +3288,9 @@ impl<'a> PgUpgradeTransaction<'a> {
                 INSERT INTO stock_movements
                     (tenant_id, id, inventory_unit_id, movement_type,
                      from_location_id, to_location_id, source_type, source_id,
-                     actor_id, occurred_at, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz,
-                        $11::timestamptz)
+                     actor_id, source_actor_id, occurred_at, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11::timestamptz, $12::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -3222,6 +3310,7 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "stock_movements", "source_type")?)
             .bind(uuid_field(record, "stock_movements", "source_id")?)
             .bind(actor_id)
+            .bind(string_field(record, "stock_movements", "actor_id")?)
             .bind(string_field(record, "stock_movements", "occurred_at")?)
             .bind(string_field(record, "stock_movements", "created_at")?)
             .execute(&mut *self.transaction)
@@ -3240,14 +3329,17 @@ impl<'a> PgUpgradeTransaction<'a> {
             sqlx::query(
                 r#"
                 INSERT INTO audit_logs
-                    (tenant_id, id, actor_id, action, entity_type, entity_id,
-                     request_id, result, details_json, occurred_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz)
+                    (tenant_id, id, actor_id, source_actor_id, action,
+                     entity_type, entity_id, request_id, result, details_json,
+                     occurred_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
             .bind(uuid_field(record, "audit_logs", "id")?)
             .bind(actor_id)
+            .bind(string_field(record, "audit_logs", "actor_id")?)
             .bind(string_field(record, "audit_logs", "action")?)
             .bind(string_field(record, "audit_logs", "entity_type")?)
             .bind(uuid_field(record, "audit_logs", "entity_id")?)
@@ -3507,9 +3599,18 @@ fn json_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::application::{
+        CompleteInspectionRequest, InspectionResultInput, PostReceiptRequest,
+    };
     use crate::v2::auth::{hash_token, TokenKind};
+    use crate::v2::domain::{InspectionKind, QualityOutcome};
     use crate::v2::network::{NetworkService, PERMISSION_NETWORK_ACCESS};
+    use crate::v2::outbound::{
+        AllocateOutboundRequest, ConfirmOutboundDeliveryRequest, CreateOutboundOrderRequest,
+        ReturnOutboundShipmentRequest, ShipOutboundRequest,
+    };
     use crate::v2::postgres::NetworkDatabaseConfig;
+    use crate::v2::OfflineDatabase;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::Executor;
@@ -3740,6 +3841,52 @@ mod tests {
             first,
             deterministic_migration_id(&Uuid::now_v7().to_string(), &workspace, &export)
         );
+    }
+
+    #[test]
+    fn package_validation_allows_a_returned_unit_to_ship_again() {
+        let inventory_unit_id = Uuid::now_v7().to_string();
+        let first_line_id = Uuid::now_v7().to_string();
+        let second_line_id = Uuid::now_v7().to_string();
+        let shipment_line = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "inventory_unit_id": inventory_unit_id,
+            })
+            .as_object()
+            .expect("shipment line object")
+            .clone()
+        };
+        let mut records = BTreeMap::from([
+            (
+                "outbound_shipment_lines".to_owned(),
+                vec![
+                    shipment_line(&first_line_id),
+                    shipment_line(&second_line_id),
+                ],
+            ),
+            (
+                "outbound_return_lines".to_owned(),
+                vec![serde_json::json!({
+                    "outbound_shipment_line_id": first_line_id,
+                })
+                .as_object()
+                .expect("return line object")
+                .clone()],
+            ),
+        ]);
+
+        validate_active_shipment_line_uniqueness(&records)
+            .expect("returned shipment history is not active");
+        records
+            .get_mut("outbound_return_lines")
+            .expect("return lines")
+            .clear();
+        let error = validate_active_shipment_line_uniqueness(&records)
+            .expect_err("two unreturned lines for one unit must fail");
+        assert!(error
+            .to_string()
+            .contains("more than one active shipment line"));
     }
 
     #[derive(Debug)]
@@ -4006,16 +4153,16 @@ mod tests {
         .execute(&mut *setup)
         .await
         .expect("insert role");
-        for (permission_id, code) in [
+        for (proposed_id, code) in [
             (access_permission_id, PERMISSION_NETWORK_ACCESS),
             (upgrade_permission_id, "inventory.upgrade.import"),
         ] {
-            sqlx::query("INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4)")
+            let permission_id: Uuid = sqlx::query_scalar("INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, code) DO UPDATE SET description = EXCLUDED.description RETURNING id")
                 .bind(tenant_id)
-                .bind(permission_id)
+                .bind(proposed_id)
                 .bind(code)
                 .bind(code)
-                .execute(&mut *setup)
+                .fetch_one(&mut *setup)
                 .await
                 .expect("insert permission");
             sqlx::query("INSERT INTO role_permissions (tenant_id, role_id, permission_id) VALUES ($1, $2, $3)")
@@ -4064,58 +4211,235 @@ mod tests {
             .expect("insert session");
         setup.commit().await.expect("commit setup");
 
-        let source = test_pool().await;
+        let directory = TestDirectory::new();
+        let source_path = directory.path().join("source.sqlite");
+        let source = OfflineDatabase::open(&source_path)
+            .await
+            .expect("open source offline database");
         sqlx::query("UPDATE workspaces SET source_instance_id = ?1 WHERE id = ?2")
             .bind(source_instance_id.to_string())
-            .bind(&source.1)
-            .execute(&source.0)
+            .bind(source.workspace_id())
+            .execute(source.pool())
             .await
             .expect("set source instance");
-        let source_party_id = Uuid::now_v7().to_string();
-        let source_sku_id = Uuid::now_v7().to_string();
-        let source_warehouse_id = Uuid::now_v7().to_string();
-        let source_location_id = Uuid::now_v7().to_string();
-        let source_receipt_id = Uuid::now_v7().to_string();
-        let source_line_id = Uuid::now_v7().to_string();
-        let source_unit_id = Uuid::now_v7().to_string();
-        let source_barcode = format!("UPGRADE-SN-{tenant_id}");
-        let source_now = "2026-08-03T00:00:00Z";
-        sqlx::query("INSERT INTO business_parties (id, workspace_id, normalized_name, display_name, created_at) VALUES (?1, ?2, 'upgrade-owner', 'Upgrade Owner', ?3)")
-            .bind(&source_party_id).bind(&source.1).bind(source_now)
-            .execute(&source.0).await.expect("insert source party");
-        sqlx::query("INSERT INTO party_roles (workspace_id, party_id, role, created_at) VALUES (?1, ?2, 'goods_owner', ?3)")
-            .bind(&source.1).bind(&source_party_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source party role");
-        sqlx::query("INSERT INTO skus (id, workspace_id, code, name, tracking_mode, active, created_at) VALUES (?1, ?2, 'UPGRADE-SKU', 'Upgrade SKU', 'serial', 1, ?3)")
-            .bind(&source_sku_id).bind(&source.1).bind(source_now)
-            .execute(&source.0).await.expect("insert source sku");
-        sqlx::query("INSERT INTO warehouses (id, workspace_id, code, name, created_at) VALUES (?1, ?2, 'UPGRADE-WH', 'Upgrade Warehouse', ?3)")
-            .bind(&source_warehouse_id).bind(&source.1).bind(source_now)
-            .execute(&source.0).await.expect("insert source warehouse");
-        sqlx::query("INSERT INTO locations (id, workspace_id, warehouse_id, code, name, kind, created_at) VALUES (?1, ?2, ?3, 'RECEIVING', 'Receiving', 'receiving', ?4)")
-            .bind(&source_location_id).bind(&source.1).bind(&source_warehouse_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source location");
-        sqlx::query("INSERT INTO inbound_receipts (id, workspace_id, receipt_no, owner_party_id, warehouse_id, source_reference, received_at, status, actor_id, idempotency_key, request_id, created_at) VALUES (?1, ?2, 'UPGRADE-RCPT', ?3, ?4, 'legacy', ?5, 'posted', 'operator', 'upgrade-receipt', 'upgrade-request', ?5)")
-            .bind(&source_receipt_id).bind(&source.1).bind(&source_party_id).bind(&source_warehouse_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source receipt");
-        sqlx::query("INSERT INTO inbound_receipt_lines (id, workspace_id, receipt_id, sku_id, declared_quantity, scanned_quantity, notes, created_at) VALUES (?1, ?2, ?3, ?4, 1, 1, 'legacy', ?5)")
-            .bind(&source_line_id).bind(&source.1).bind(&source_receipt_id).bind(&source_sku_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source receipt line");
-        sqlx::query("INSERT INTO inventory_units (id, workspace_id, barcode, inbound_receipt_line_id, owner_party_id, sku_id, location_id, inventory_status, quality_status, version, received_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'received', 'untested', 1, ?8, ?8)")
-            .bind(&source_unit_id).bind(&source.1).bind(&source_barcode).bind(&source_line_id).bind(&source_party_id).bind(&source_sku_id).bind(&source_location_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source inventory unit");
-        sqlx::query("INSERT INTO stock_movements (id, workspace_id, inventory_unit_id, movement_type, from_location_id, to_location_id, source_type, source_id, actor_id, occurred_at, created_at) VALUES (?1, ?2, ?3, 'received', NULL, ?4, 'inbound_receipt', ?5, 'operator', ?6, ?6)")
-            .bind(Uuid::now_v7().to_string()).bind(&source.1).bind(&source_unit_id).bind(&source_location_id).bind(&source_receipt_id).bind(source_now)
-            .execute(&source.0).await.expect("insert source stock movement");
-        let directory = TestDirectory::new();
+
+        let source_barcode_a = format!("UPGRADE-A-{tenant_id}");
+        let source_barcode_b = format!("UPGRADE-B-{tenant_id}");
+        let receipt_a = source
+            .post_receipt(PostReceiptRequest {
+                request_id: "source-receipt-a".to_owned(),
+                idempotency_key: "source-receipt-a-key".to_owned(),
+                receipt_no: format!("UPGRADE-RA-{}", tenant_id.simple()),
+                owner_name: "Upgrade Owner A".to_owned(),
+                sku_code: "UPGRADE-SKU".to_owned(),
+                sku_name: "Upgrade Model".to_owned(),
+                source_reference: Some("offline-batch-a".to_owned()),
+                received_at: "2026-08-03T00:00:00Z".to_owned(),
+                actor_id: "offline-receiver-a".to_owned(),
+                barcodes: vec![source_barcode_a.clone()],
+                notes: None,
+            })
+            .await
+            .expect("post source receipt A");
+        let receipt_b = source
+            .post_receipt(PostReceiptRequest {
+                request_id: "source-receipt-b".to_owned(),
+                idempotency_key: "source-receipt-b-key".to_owned(),
+                receipt_no: format!("UPGRADE-RB-{}", tenant_id.simple()),
+                owner_name: "Upgrade Owner B".to_owned(),
+                sku_code: "UPGRADE-SKU".to_owned(),
+                sku_name: "Upgrade Model".to_owned(),
+                source_reference: Some("offline-batch-b".to_owned()),
+                received_at: "2026-08-03T00:01:00Z".to_owned(),
+                actor_id: "offline-receiver-b".to_owned(),
+                barcodes: vec![source_barcode_b.clone()],
+                notes: None,
+            })
+            .await
+            .expect("post source receipt B");
+
+        let inspection_a = source
+            .complete_inspection(CompleteInspectionRequest {
+                request_id: "source-inspection-a".to_owned(),
+                idempotency_key: "source-inspection-a-key".to_owned(),
+                inspection_no: format!("UPGRADE-QA-{}", tenant_id.simple()),
+                inspection_kind: InspectionKind::Initial,
+                inspector_id: "offline-inspector-a".to_owned(),
+                inspected_at: "2026-08-03T00:10:00Z".to_owned(),
+                results: vec![InspectionResultInput {
+                    barcode: source_barcode_a.clone(),
+                    outcome: QualityOutcome::Passed,
+                    defect_code: None,
+                    measurements: serde_json::json!({"voltage": 3.3}),
+                    notes: None,
+                }],
+            })
+            .await
+            .expect("pass source unit A");
+        let inspection_b = source
+            .complete_inspection(CompleteInspectionRequest {
+                request_id: "source-inspection-b".to_owned(),
+                idempotency_key: "source-inspection-b-key".to_owned(),
+                inspection_no: format!("UPGRADE-QB-{}", tenant_id.simple()),
+                inspection_kind: InspectionKind::Initial,
+                inspector_id: "offline-inspector-b".to_owned(),
+                inspected_at: "2026-08-03T00:11:00Z".to_owned(),
+                results: vec![InspectionResultInput {
+                    barcode: source_barcode_b.clone(),
+                    outcome: QualityOutcome::Passed,
+                    defect_code: None,
+                    measurements: serde_json::json!({"voltage": 3.4}),
+                    notes: None,
+                }],
+            })
+            .await
+            .expect("pass source unit B");
+
+        let first_order = source
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "source-order-one".to_owned(),
+                idempotency_key: "source-order-one-key".to_owned(),
+                order_no: format!("UPGRADE-O1-{}", tenant_id.simple()),
+                upstream_receiver_name: "Upgrade Upstream One".to_owned(),
+                sku_code: "UPGRADE-SKU".to_owned(),
+                sku_name: "Upgrade Model".to_owned(),
+                required_quantity: 2,
+                required_at: Some("2026-08-03T01:00:00Z".to_owned()),
+                actor_id: "offline-order-creator-one".to_owned(),
+            })
+            .await
+            .expect("create first source order");
+        let first_allocation = source
+            .allocate_outbound_order(AllocateOutboundRequest {
+                request_id: "source-allocation-one".to_owned(),
+                idempotency_key: "source-allocation-one-key".to_owned(),
+                order_id: first_order.order_id.clone(),
+                order_line_id: first_order.order_line_id.clone(),
+                barcodes: Vec::new(),
+                actor_id: "offline-allocator-one".to_owned(),
+            })
+            .await
+            .expect("allocate two owners to first source order");
+        assert_eq!(first_allocation.allocated_count, 2);
+        assert_eq!(
+            first_allocation
+                .allocations
+                .iter()
+                .map(|allocation| allocation.owner_party_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        let first_shipment = source
+            .ship_outbound_order(ShipOutboundRequest {
+                request_id: "source-shipment-one".to_owned(),
+                idempotency_key: "source-shipment-one-key".to_owned(),
+                order_id: first_order.order_id.clone(),
+                shipment_no: format!("UPGRADE-S1-{}", tenant_id.simple()),
+                allocation_ids: first_allocation
+                    .allocations
+                    .iter()
+                    .map(|allocation| allocation.allocation_id.clone())
+                    .collect(),
+                barcodes: Vec::new(),
+                shipped_at: "2026-08-03T01:10:00Z".to_owned(),
+                actor_id: "offline-shipper-one".to_owned(),
+            })
+            .await
+            .expect("ship first source order");
+        let first_delivery = source
+            .confirm_outbound_delivery(ConfirmOutboundDeliveryRequest {
+                request_id: "source-delivery-one".to_owned(),
+                idempotency_key: "source-delivery-one-key".to_owned(),
+                shipment_id: first_shipment.shipment_id.clone(),
+                confirmation_code: format!("UPGRADE-D1-{}", tenant_id.simple()),
+                shipment_line_ids: Vec::new(),
+                confirmed_at: "2026-08-03T01:20:00Z".to_owned(),
+                confirmed_by: "offline-delivery-confirmer".to_owned(),
+                notes: Some("both units accepted before one was returned".to_owned()),
+            })
+            .await
+            .expect("confirm first source delivery");
+        let returned_item = first_shipment.items[0].clone();
+        let delivered_item = first_shipment.items[1].clone();
+        let first_return = source
+            .return_outbound_shipment(ReturnOutboundShipmentRequest {
+                request_id: "source-return-one".to_owned(),
+                idempotency_key: "source-return-one-key".to_owned(),
+                shipment_id: first_shipment.shipment_id.clone(),
+                shipment_line_ids: vec![returned_item.shipment_line_id.clone()],
+                return_no: format!("UPGRADE-RT1-{}", tenant_id.simple()),
+                returned_at: "2026-08-03T01:30:00Z".to_owned(),
+                reason: "upstream rejected one unit".to_owned(),
+                actor_id: "offline-return-operator".to_owned(),
+            })
+            .await
+            .expect("return one source shipment line");
+        let retest = source
+            .complete_inspection(CompleteInspectionRequest {
+                request_id: "source-retest".to_owned(),
+                idempotency_key: "source-retest-key".to_owned(),
+                inspection_no: format!("UPGRADE-QR-{}", tenant_id.simple()),
+                inspection_kind: InspectionKind::Retest,
+                inspector_id: "offline-retest-inspector".to_owned(),
+                inspected_at: "2026-08-03T01:40:00Z".to_owned(),
+                results: vec![InspectionResultInput {
+                    barcode: returned_item.barcode.clone(),
+                    outcome: QualityOutcome::Passed,
+                    defect_code: None,
+                    measurements: serde_json::json!({"retest": true}),
+                    notes: Some("return retest passed".to_owned()),
+                }],
+            })
+            .await
+            .expect("retest returned source unit");
+        let second_order = source
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "source-order-two".to_owned(),
+                idempotency_key: "source-order-two-key".to_owned(),
+                order_no: format!("UPGRADE-O2-{}", tenant_id.simple()),
+                upstream_receiver_name: "Upgrade Upstream Two".to_owned(),
+                sku_code: "UPGRADE-SKU".to_owned(),
+                sku_name: "Upgrade Model".to_owned(),
+                required_quantity: 1,
+                required_at: Some("2026-08-03T02:00:00Z".to_owned()),
+                actor_id: "offline-order-creator-two".to_owned(),
+            })
+            .await
+            .expect("create second source order");
+        let second_allocation = source
+            .allocate_outbound_order(AllocateOutboundRequest {
+                request_id: "source-allocation-two".to_owned(),
+                idempotency_key: "source-allocation-two-key".to_owned(),
+                order_id: second_order.order_id.clone(),
+                order_line_id: second_order.order_line_id.clone(),
+                barcodes: vec![returned_item.barcode.clone()],
+                actor_id: "offline-allocator-two".to_owned(),
+            })
+            .await
+            .expect("allocate returned source unit again");
+        let second_shipment = source
+            .ship_outbound_order(ShipOutboundRequest {
+                request_id: "source-shipment-two".to_owned(),
+                idempotency_key: "source-shipment-two-key".to_owned(),
+                order_id: second_order.order_id.clone(),
+                shipment_no: format!("UPGRADE-S2-{}", tenant_id.simple()),
+                allocation_ids: vec![second_allocation.allocations[0].allocation_id.clone()],
+                barcodes: Vec::new(),
+                shipped_at: "2026-08-03T02:10:00Z".to_owned(),
+                actor_id: "offline-shipper-two".to_owned(),
+            })
+            .await
+            .expect("ship returned source unit again");
+
         let package_path = directory.path().join("upgrade.invpack");
-        let package = OfflineUpgradeExporter::new(&source.0)
+        let package = OfflineUpgradeExporter::new(source.pool())
             .export(
                 &package_path,
                 ExportRequest {
                     export_id: Uuid::now_v7().to_string(),
-                    workspace_id: source.1.clone(),
-                    exported_at: "2026-08-03T00:00:00Z".to_owned(),
+                    workspace_id: source.workspace_id().to_owned(),
+                    exported_at: "2026-08-03T03:00:00Z".to_owned(),
                 },
             )
             .await
@@ -4146,14 +4470,222 @@ mod tests {
             .execute(&mut *verification)
             .await
             .expect("set verification context");
-        let counts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT (SELECT count(*) FROM workspaces WHERE tenant_id = $1), (SELECT count(*) FROM business_parties WHERE tenant_id = $1), (SELECT count(*) FROM inbound_receipts WHERE tenant_id = $1), (SELECT count(*) FROM inbound_receipt_lines WHERE tenant_id = $1), (SELECT count(*) FROM inventory_units WHERE tenant_id = $1), (SELECT count(*) FROM migration_packages WHERE tenant_id = $1)",
+        let counts = sqlx::query(
+            r#"
+            SELECT
+                (SELECT count(*) FROM workspaces WHERE tenant_id = $1) AS workspaces,
+                (SELECT count(*) FROM business_parties WHERE tenant_id = $1) AS parties,
+                (SELECT count(*) FROM inbound_receipts WHERE tenant_id = $1) AS receipts,
+                (SELECT count(*) FROM inbound_receipt_lines WHERE tenant_id = $1) AS receipt_lines,
+                (SELECT count(*) FROM inventory_units WHERE tenant_id = $1) AS units,
+                (SELECT count(*) FROM quality_inspections WHERE tenant_id = $1) AS inspections,
+                (SELECT count(*) FROM quality_inspection_results WHERE tenant_id = $1) AS inspection_results,
+                (SELECT count(*) FROM outbound_orders WHERE tenant_id = $1) AS orders,
+                (SELECT count(*) FROM outbound_allocations WHERE tenant_id = $1) AS allocations,
+                (SELECT count(*) FROM outbound_shipments WHERE tenant_id = $1) AS shipments,
+                (SELECT count(*) FROM outbound_shipment_lines WHERE tenant_id = $1) AS shipment_lines,
+                (SELECT count(*) FROM delivery_confirmations WHERE tenant_id = $1) AS deliveries,
+                (SELECT count(*) FROM outbound_return_batches WHERE tenant_id = $1) AS returns,
+                (SELECT count(*) FROM migration_packages WHERE tenant_id = $1) AS packages
+            "#,
         )
         .bind(tenant_id)
         .fetch_one(&mut *verification)
         .await
         .expect("verify imported rows");
-        assert_eq!(counts, (1, 1, 1, 1, 1, 1));
+        for (column, expected) in [
+            ("workspaces", 1_i64),
+            ("parties", 4),
+            ("receipts", 2),
+            ("receipt_lines", 2),
+            ("units", 2),
+            ("inspections", 3),
+            ("inspection_results", 3),
+            ("orders", 2),
+            ("allocations", 3),
+            ("shipments", 2),
+            ("shipment_lines", 3),
+            ("deliveries", 1),
+            ("returns", 1),
+            ("packages", 1),
+        ] {
+            assert_eq!(
+                counts.try_get::<i64, _>(column).expect("read count"),
+                expected,
+                "unexpected imported row count for {column}"
+            );
+        }
+
+        let imported_identities: BTreeSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT 'receipt', id::text FROM inbound_receipts WHERE tenant_id = $1
+            UNION ALL SELECT 'unit', id::text FROM inventory_units WHERE tenant_id = $1
+            UNION ALL SELECT 'inspection', id::text FROM quality_inspections WHERE tenant_id = $1
+            UNION ALL SELECT 'order', id::text FROM outbound_orders WHERE tenant_id = $1
+            UNION ALL SELECT 'allocation', id::text FROM outbound_allocations WHERE tenant_id = $1
+            UNION ALL SELECT 'shipment', id::text FROM outbound_shipments WHERE tenant_id = $1
+            UNION ALL SELECT 'shipment_line', id::text FROM outbound_shipment_lines WHERE tenant_id = $1
+            UNION ALL SELECT 'delivery', id::text FROM delivery_confirmations WHERE tenant_id = $1
+            UNION ALL SELECT 'return', id::text FROM outbound_return_batches WHERE tenant_id = $1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *verification)
+        .await
+        .expect("load imported stable identities")
+        .into_iter()
+        .collect();
+        let expected_identities: BTreeSet<(String, String)> = [
+            ("receipt", receipt_a.receipt_id.as_str()),
+            ("receipt", receipt_b.receipt_id.as_str()),
+            ("unit", receipt_a.units[0].inventory_unit_id.as_str()),
+            ("unit", receipt_b.units[0].inventory_unit_id.as_str()),
+            ("inspection", inspection_a.inspection_id.as_str()),
+            ("inspection", inspection_b.inspection_id.as_str()),
+            ("inspection", retest.inspection_id.as_str()),
+            ("order", first_order.order_id.as_str()),
+            ("order", second_order.order_id.as_str()),
+            (
+                "allocation",
+                first_allocation.allocations[0].allocation_id.as_str(),
+            ),
+            (
+                "allocation",
+                first_allocation.allocations[1].allocation_id.as_str(),
+            ),
+            (
+                "allocation",
+                second_allocation.allocations[0].allocation_id.as_str(),
+            ),
+            ("shipment", first_shipment.shipment_id.as_str()),
+            ("shipment", second_shipment.shipment_id.as_str()),
+            (
+                "shipment_line",
+                first_shipment.items[0].shipment_line_id.as_str(),
+            ),
+            (
+                "shipment_line",
+                first_shipment.items[1].shipment_line_id.as_str(),
+            ),
+            (
+                "shipment_line",
+                second_shipment.items[0].shipment_line_id.as_str(),
+            ),
+            ("delivery", first_delivery.confirmation_id.as_str()),
+            ("return", first_return.return_batch_id.as_str()),
+        ]
+        .into_iter()
+        .map(|(entity, id)| (entity.to_owned(), id.to_owned()))
+        .collect();
+        assert_eq!(imported_identities, expected_identities);
+
+        let inventory_projection: BTreeMap<String, (String, String)> =
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT barcode, inventory_status, quality_status FROM inventory_units WHERE tenant_id = $1",
+            )
+            .bind(tenant_id)
+            .fetch_all(&mut *verification)
+            .await
+            .expect("load imported inventory projection")
+            .into_iter()
+            .map(|(barcode, inventory_status, quality_status)| {
+                (barcode, (inventory_status, quality_status))
+            })
+            .collect();
+        assert_eq!(inventory_projection.len(), 2);
+        assert_eq!(
+            inventory_projection.get(&returned_item.barcode),
+            Some(&("shipped".to_owned(), "passed".to_owned()))
+        );
+        assert_eq!(
+            inventory_projection.get(&delivered_item.barcode),
+            Some(&("delivered".to_owned(), "passed".to_owned()))
+        );
+
+        let shipment_line_statuses: BTreeMap<String, String> = sqlx::query_as(
+            "SELECT id::text, status FROM outbound_shipment_lines WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *verification)
+        .await
+        .expect("load imported shipment line statuses")
+        .into_iter()
+        .collect();
+        assert_eq!(
+            shipment_line_statuses.get(&returned_item.shipment_line_id),
+            Some(&"returned".to_owned())
+        );
+        assert_eq!(
+            shipment_line_statuses.get(&delivered_item.shipment_line_id),
+            Some(&"delivered".to_owned())
+        );
+        assert_eq!(
+            shipment_line_statuses.get(&second_shipment.items[0].shipment_line_id),
+            Some(&"shipped".to_owned())
+        );
+
+        let actor_rows: Vec<(String, Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT 'receipt', actor_id, source_actor_id FROM inbound_receipts WHERE tenant_id = $1
+            UNION ALL SELECT 'inspection', inspector_id, source_actor_id FROM quality_inspections WHERE tenant_id = $1
+            UNION ALL SELECT 'order', actor_id, source_actor_id FROM outbound_orders WHERE tenant_id = $1
+            UNION ALL SELECT 'allocation', allocated_by, source_actor_id FROM outbound_allocations WHERE tenant_id = $1
+            UNION ALL SELECT 'shipment', actor_id, source_actor_id FROM outbound_shipments WHERE tenant_id = $1
+            UNION ALL SELECT 'delivery', confirmed_by, source_actor_id FROM delivery_confirmations WHERE tenant_id = $1
+            UNION ALL SELECT 'return', actor_id, source_actor_id FROM outbound_return_batches WHERE tenant_id = $1
+            UNION ALL SELECT 'movement', actor_id, source_actor_id FROM stock_movements WHERE tenant_id = $1
+            UNION ALL SELECT 'audit', actor_id, source_actor_id FROM audit_logs WHERE tenant_id = $1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *verification)
+        .await
+        .expect("load imported actor provenance");
+        assert!(
+            actor_rows
+                .iter()
+                .all(|(_, actor_id, _)| *actor_id == user_id),
+            "every imported target actor must be the authenticated importer"
+        );
+        let source_actors: BTreeSet<String> = actor_rows
+            .into_iter()
+            .map(|(_, _, source_actor_id)| source_actor_id)
+            .collect();
+        assert_eq!(
+            source_actors,
+            [
+                "offline-receiver-a",
+                "offline-receiver-b",
+                "offline-inspector-a",
+                "offline-inspector-b",
+                "offline-order-creator-one",
+                "offline-allocator-one",
+                "offline-shipper-one",
+                "offline-delivery-confirmer",
+                "offline-return-operator",
+                "offline-retest-inspector",
+                "offline-order-creator-two",
+                "offline-allocator-two",
+                "offline-shipper-two",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+
+        let immutable_error = sqlx::query(
+            "UPDATE inbound_receipts SET source_actor_id = 'tampered' WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(Uuid::parse_str(&receipt_a.receipt_id).expect("receipt UUID"))
+        .execute(&mut *verification)
+        .await
+        .expect_err("source actor provenance must be immutable");
+        let sqlstate = immutable_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned());
+        assert_eq!(sqlstate.as_deref(), Some("55000"));
         verification
             .rollback()
             .await

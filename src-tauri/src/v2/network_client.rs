@@ -8,6 +8,12 @@ use super::application::{
     CompleteInspectionResponse, InventoryListResponse, InventorySummaryResponse,
     PostReceiptResponse,
 };
+use super::identity_admin::{
+    CreateTenantUserRequest, CreateTenantUserResponse, DisableTenantUserRequest,
+    DisableTenantUserResponse, ListTenantUsersRequest, ListTenantUsersResponse,
+    MembershipPermissionsRequest, MembershipPermissionsResponse, ReplaceMembershipRolesRequest,
+    TenantRoleSummary,
+};
 use super::network::{
     LoginRequest, LoginResponse, NetworkPostReceiptRequest, NetworkWarehouse, RefreshRequest,
     RefreshResponse,
@@ -344,6 +350,55 @@ impl NetworkClient {
             "/v1/upgrades/offline-imports",
             request,
             Duration::from_secs(5 * 60),
+        )
+        .await
+    }
+
+    pub async fn list_tenant_users(
+        &self,
+        request: &ListTenantUsersRequest,
+    ) -> Result<ListTenantUsersResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/admin/users/query", request)
+            .await
+    }
+
+    pub async fn create_tenant_user(
+        &self,
+        request: &CreateTenantUserRequest,
+    ) -> Result<CreateTenantUserResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/admin/users", request)
+            .await
+    }
+
+    pub async fn disable_tenant_user(
+        &self,
+        request: &DisableTenantUserRequest,
+    ) -> Result<DisableTenantUserResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/admin/users/disable", request)
+            .await
+    }
+
+    pub async fn list_tenant_roles(&self) -> Result<Vec<TenantRoleSummary>, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/admin/roles/query", &Value::Null)
+            .await
+    }
+
+    pub async fn replace_membership_roles(
+        &self,
+        request: &ReplaceMembershipRolesRequest,
+    ) -> Result<MembershipPermissionsResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/admin/memberships/roles", request)
+            .await
+    }
+
+    pub async fn membership_effective_permissions(
+        &self,
+        request: &MembershipPermissionsRequest,
+    ) -> Result<MembershipPermissionsResponse, NetworkClientError> {
+        self.authorized_json(
+            Method::POST,
+            "/v1/admin/memberships/permissions/query",
+            request,
         )
         .await
     }

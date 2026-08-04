@@ -1494,6 +1494,46 @@ async fn v2_post_receipt(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn v2_inspect_legacy_workbook(
+    path: String,
+) -> Result<v2::legacy_import::LegacyWorkbookInfo, String> {
+    let path = path.trim().to_owned();
+    if path.is_empty() {
+        return Err("请选择历史 Excel 文件".to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        v2::legacy_import::inspect_legacy_workbook(Path::new(&path))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("读取历史 Excel 任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn v2_preview_legacy_excel(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::legacy_import::LegacyImportPreviewRequest,
+) -> Result<v2::legacy_import::LegacyImportPreview, String> {
+    database
+        .preview_legacy_excel(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_commit_legacy_excel(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::legacy_import::LegacyImportCommitRequest,
+) -> Result<v2::legacy_import::LegacyImportCommitReport, String> {
+    activation::require_activated(&app)?;
+    database
+        .commit_legacy_excel(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 const V2_PENDING_RESTORE_FILE: &str = ".inventory-v2-restore-pending.json";
 const V2_RESTORE_REPORT_FILE: &str = ".inventory-v2-restore-report.json";
 
@@ -1792,6 +1832,71 @@ async fn v2_network_logout(
 ) -> Result<V2NetworkStatus, String> {
     client.logout().await.map_err(|error| error.to_string())?;
     network_status_from_client(&client)
+}
+
+#[tauri::command]
+async fn v2_network_list_tenant_users(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::identity_admin::ListTenantUsersRequest,
+) -> Result<v2::identity_admin::ListTenantUsersResponse, String> {
+    client
+        .list_tenant_users(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_create_tenant_user(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::identity_admin::CreateTenantUserRequest,
+) -> Result<v2::identity_admin::CreateTenantUserResponse, String> {
+    client
+        .create_tenant_user(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_disable_tenant_user(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::identity_admin::DisableTenantUserRequest,
+) -> Result<v2::identity_admin::DisableTenantUserResponse, String> {
+    client
+        .disable_tenant_user(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_list_tenant_roles(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<Vec<v2::identity_admin::TenantRoleSummary>, String> {
+    client
+        .list_tenant_roles()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_replace_membership_roles(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::identity_admin::ReplaceMembershipRolesRequest,
+) -> Result<v2::identity_admin::MembershipPermissionsResponse, String> {
+    client
+        .replace_membership_roles(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_membership_permissions(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::identity_admin::MembershipPermissionsRequest,
+) -> Result<v2::identity_admin::MembershipPermissionsResponse, String> {
+    client
+        .membership_effective_permissions(&input)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2190,6 +2295,9 @@ pub fn run() {
             export_customer_statement,
             export_customer_statements_to_dir,
             v2_post_receipt,
+            v2_inspect_legacy_workbook,
+            v2_preview_legacy_excel,
+            v2_commit_legacy_excel,
             v2_complete_inspection,
             v2_list_inventory,
             v2_inventory_trace,
@@ -2211,6 +2319,12 @@ pub fn run() {
             v2_network_login,
             v2_network_refresh,
             v2_network_logout,
+            v2_network_list_tenant_users,
+            v2_network_create_tenant_user,
+            v2_network_disable_tenant_user,
+            v2_network_list_tenant_roles,
+            v2_network_replace_membership_roles,
+            v2_network_membership_permissions,
             v2_network_post_receipt,
             v2_network_list_warehouses,
             v2_network_complete_inspection,

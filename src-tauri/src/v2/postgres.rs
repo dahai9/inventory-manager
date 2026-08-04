@@ -177,6 +177,35 @@ impl NetworkDatabase {
             session,
         })
     }
+
+    /// Serialize a security-sensitive mutation before authentication acquires
+    /// principal row locks. This lock order prevents two administrators from
+    /// deadlocking while they mutate each other's memberships.
+    pub async fn begin_serialized_authorized_request(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        required_permission: &str,
+        lock_namespace: i64,
+    ) -> Result<AuthorizedTransaction<'_>, NetworkDatabaseError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))")
+            .bind(tenant_id)
+            .bind(lock_namespace)
+            .execute(&mut *transaction)
+            .await?;
+        let session = authorize_session_in_transaction(
+            &mut transaction,
+            tenant_id,
+            session_token,
+            required_permission,
+        )
+        .await?;
+        Ok(AuthorizedTransaction {
+            transaction,
+            session,
+        })
+    }
 }
 
 async fn validate_runtime_role(pool: &PgPool) -> Result<(), NetworkDatabaseError> {

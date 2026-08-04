@@ -1,10 +1,10 @@
 use super::application::{InventoryListQuery, InventorySummaryQuery};
-use super::auth::{AuthError, PasswordService};
+use super::auth::{hash_token, AuthError, AuthorizationDenial, PasswordService, TokenKind};
 use super::network::{
-    LoginRequest, NetworkPostReceiptRequest, NetworkService, RefreshRequest,
+    LoginRequest, NetworkPostReceiptRequest, NetworkService, NetworkServiceError, RefreshRequest,
     PERMISSION_NETWORK_ACCESS, PERMISSION_RECEIPT_WRITE,
 };
-use super::postgres::{NetworkDatabase, NetworkDatabaseConfig};
+use super::postgres::{NetworkDatabase, NetworkDatabaseConfig, NetworkDatabaseError};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
@@ -84,7 +84,7 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     .execute(&mut *setup)
     .await
     .expect("insert role");
-    for (id, code, description) in [
+    for (proposed_id, code, description) in [
         (
             access_permission_id,
             PERMISSION_NETWORK_ACCESS,
@@ -96,14 +96,14 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
             "Receipt write",
         ),
     ] {
-        sqlx::query(
-            "INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4)",
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, code) DO UPDATE SET description = EXCLUDED.description RETURNING id",
         )
         .bind(tenant_id)
-        .bind(id)
+        .bind(proposed_id)
         .bind(code)
         .bind(description)
-        .execute(&mut *setup)
+        .fetch_one(&mut *setup)
         .await
         .expect("insert permission");
         sqlx::query(
@@ -272,6 +272,177 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     .expect("verify facts");
     assert_eq!(facts, (1, 1, 1));
     verification.commit().await.expect("commit verification");
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires INVENTORY_NETWORK_TEST_ADMIN_URL and INVENTORY_NETWORK_TEST_RUNTIME_URL"]
+async fn disabled_principal_invalidates_an_existing_access_session_immediately() {
+    let admin_url =
+        std::env::var("INVENTORY_NETWORK_TEST_ADMIN_URL").expect("network test admin URL");
+    let runtime_url =
+        std::env::var("INVENTORY_NETWORK_TEST_RUNTIME_URL").expect("network test runtime URL");
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url)
+        .await
+        .expect("connect admin database");
+
+    let tenant_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    let membership_id = Uuid::now_v7();
+    let role_id = Uuid::now_v7();
+    let access_permission_id = Uuid::now_v7();
+    let device_id = Uuid::now_v7();
+    let session_id = Uuid::now_v7();
+    let session_token = format!("disable-session-{session_id}");
+
+    let mut setup = admin.begin().await.expect("begin disabled-principal setup");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant_id.to_string())
+        .execute(&mut *setup)
+        .await
+        .expect("set setup tenant context");
+    sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'Disable Session Tenant')")
+        .bind(tenant_id)
+        .bind(format!("disable-session-{}", tenant_id.simple()))
+        .execute(&mut *setup)
+        .await
+        .expect("insert tenant");
+    sqlx::query("INSERT INTO users (tenant_id, id, login, normalized_login, display_name) VALUES ($1, $2, 'disable-operator', 'disable-operator', 'Disable Operator')")
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *setup)
+        .await
+        .expect("insert user");
+    sqlx::query("INSERT INTO memberships (tenant_id, id, user_id) VALUES ($1, $2, $3)")
+        .bind(tenant_id)
+        .bind(membership_id)
+        .bind(user_id)
+        .execute(&mut *setup)
+        .await
+        .expect("insert membership");
+    sqlx::query("INSERT INTO roles (tenant_id, id, code, name) VALUES ($1, $2, 'disable-operator', 'Disable Operator')")
+        .bind(tenant_id)
+        .bind(role_id)
+        .execute(&mut *setup)
+        .await
+        .expect("insert role");
+    for (proposed_id, code) in [(access_permission_id, PERMISSION_NETWORK_ACCESS)] {
+        let permission_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO permissions (tenant_id, id, code, description) VALUES ($1, $2, $3, $3) ON CONFLICT (tenant_id, code) DO UPDATE SET description = EXCLUDED.description RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(proposed_id)
+        .bind(code)
+        .fetch_one(&mut *setup)
+        .await
+        .expect("insert permission");
+        sqlx::query(
+            "INSERT INTO role_permissions (tenant_id, role_id, permission_id) VALUES ($1, $2, $3)",
+        )
+        .bind(tenant_id)
+        .bind(role_id)
+        .bind(permission_id)
+        .execute(&mut *setup)
+        .await
+        .expect("assign permission");
+    }
+    sqlx::query(
+        "INSERT INTO membership_roles (tenant_id, membership_id, role_id) VALUES ($1, $2, $3)",
+    )
+    .bind(tenant_id)
+    .bind(membership_id)
+    .bind(role_id)
+    .execute(&mut *setup)
+    .await
+    .expect("assign role");
+    sqlx::query("INSERT INTO devices (tenant_id, id, membership_id, user_id, device_fingerprint, display_name) VALUES ($1, $2, $3, $4, $5, 'Disable Session Device')")
+        .bind(tenant_id)
+        .bind(device_id)
+        .bind(membership_id)
+        .bind(user_id)
+        .bind(format!("disable-device-{device_id}"))
+        .execute(&mut *setup)
+        .await
+        .expect("insert device");
+    sqlx::query("INSERT INTO license_entitlements (tenant_id, id, license_id, edition, status, seat_limit, starts_at, expires_at, issuer, signature, key_id, claims_hash, verified_at) VALUES ($1, $2, $3, 'network', 'active', 5, CURRENT_TIMESTAMP - INTERVAL '1 hour', CURRENT_TIMESTAMP + INTERVAL '1 day', 'integration-test', 'test-signature', 'test-key', $4, CURRENT_TIMESTAMP)")
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(format!("DISABLE-{tenant_id}"))
+        .bind("d".repeat(64))
+        .execute(&mut *setup)
+        .await
+        .expect("insert entitlement");
+    sqlx::query("INSERT INTO sessions (tenant_id, id, membership_id, user_id, device_id, token_hash, issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '1 hour')")
+        .bind(tenant_id)
+        .bind(session_id)
+        .bind(membership_id)
+        .bind(user_id)
+        .bind(device_id)
+        .bind(hash_token(TokenKind::Session, &session_token).as_slice())
+        .execute(&mut *setup)
+        .await
+        .expect("insert session");
+    setup
+        .commit()
+        .await
+        .expect("commit disabled-principal setup");
+
+    let database = NetworkDatabase::connect(&NetworkDatabaseConfig::new(runtime_url))
+        .await
+        .expect("connect restricted runtime database");
+    let service = NetworkService::new(database).expect("network service");
+    service
+        .inventory_summary(tenant_id, &session_token, InventorySummaryQuery::default())
+        .await
+        .expect("session works before principal is disabled");
+
+    sqlx::query("UPDATE memberships SET status = 'suspended' WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(membership_id)
+        .execute(&admin)
+        .await
+        .expect("suspend membership");
+    let membership_error = service
+        .inventory_summary(tenant_id, &session_token, InventorySummaryQuery::default())
+        .await
+        .expect_err("old access token must fail after membership suspension");
+    assert!(matches!(
+        membership_error,
+        NetworkServiceError::Database(NetworkDatabaseError::Authorization(
+            AuthError::AccessDenied(AuthorizationDenial::MembershipInactive)
+        ))
+    ));
+
+    sqlx::query("UPDATE memberships SET status = 'active' WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(membership_id)
+        .execute(&admin)
+        .await
+        .expect("reactivate membership");
+    service
+        .inventory_summary(tenant_id, &session_token, InventorySummaryQuery::default())
+        .await
+        .expect("same session works after explicit membership reactivation");
+
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&admin)
+        .await
+        .expect("disable user");
+    let account_error = service
+        .inventory_summary(tenant_id, &session_token, InventorySummaryQuery::default())
+        .await
+        .expect_err("old access token must fail after account disable");
+    assert!(matches!(
+        account_error,
+        NetworkServiceError::Database(NetworkDatabaseError::Authorization(
+            AuthError::AccessDenied(AuthorizationDenial::AccountDisabled)
+        ))
+    ));
+
     admin.close().await;
 }
 

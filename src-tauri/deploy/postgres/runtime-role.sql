@@ -17,14 +17,82 @@ SELECT format(
 ) \gexec
 GRANT USAGE ON SCHEMA public, app TO :"runtime_role";
 
-GRANT SELECT, INSERT, UPDATE, DELETE
+GRANT SELECT
     ON ALL TABLES IN SCHEMA public
     TO :"runtime_role";
 
--- Business facts and security audit are append-only. Trigger protection is
--- still present as a second line of defense for privileged maintenance paths.
-REVOKE UPDATE, DELETE ON TABLE public.stock_movements FROM :"runtime_role";
-REVOKE UPDATE, DELETE ON TABLE public.audit_logs FROM :"runtime_role";
+REVOKE INSERT, UPDATE, DELETE
+    ON ALL TABLES IN SCHEMA public
+    FROM :"runtime_role";
+
+GRANT INSERT, UPDATE
+    ON TABLE public.workspaces,
+             public.business_parties,
+             public.party_roles,
+             public.skus,
+             public.warehouses,
+             public.locations,
+             public.inbound_receipts,
+             public.inbound_receipt_lines,
+             public.inventory_units,
+             public.quality_inspections,
+             public.quality_inspection_results,
+             public.quality_waivers,
+             public.outbound_orders,
+             public.outbound_order_lines,
+             public.outbound_allocations,
+             public.outbound_shipments,
+             public.outbound_shipment_lines,
+             public.delivery_confirmations,
+             public.delivery_confirmation_lines,
+             public.outbound_return_batches,
+             public.outbound_return_lines,
+             public.idempotency_records
+    TO :"runtime_role";
+
+GRANT INSERT
+    ON TABLE public.stock_movements,
+             public.audit_logs,
+             public.migration_packages
+    TO :"runtime_role";
+
+GRANT UPDATE (created_at)
+    ON TABLE public.migration_packages
+    TO :"runtime_role";
+
+GRANT INSERT, UPDATE
+    ON TABLE public.users,
+             public.credentials,
+             public.memberships,
+             public.sessions,
+             public.refresh_tokens
+    TO :"runtime_role";
+
+GRANT INSERT, DELETE
+    ON TABLE public.membership_roles
+    TO :"runtime_role";
+
+-- Authorization takes row-level FOR SHARE locks on these catalogs. PostgreSQL
+-- requires UPDATE privilege on at least one column for that lock mode, so keep
+-- it limited to non-authoritative creation metadata.
+GRANT UPDATE (created_at)
+    ON TABLE public.tenants,
+             public.roles,
+             public.permissions,
+             public.role_permissions
+    TO :"runtime_role";
+
+GRANT UPDATE (assigned_at)
+    ON TABLE public.membership_roles
+    TO :"runtime_role";
+
+GRANT INSERT, UPDATE (last_seen_at)
+    ON TABLE public.devices
+    TO :"runtime_role";
+
+GRANT UPDATE (issued_at)
+    ON TABLE public.license_entitlements
+    TO :"runtime_role";
 
 -- UUID primary keys mean the current schema does not use sequences, but this
 -- default keeps future migration-created identity columns deployable without
@@ -32,7 +100,9 @@ REVOKE UPDATE, DELETE ON TABLE public.audit_logs FROM :"runtime_role";
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO :"runtime_role";
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"runtime_role";
+    REVOKE INSERT, UPDATE, DELETE ON TABLES FROM :"runtime_role";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO :"runtime_role";
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO :"runtime_role";
 

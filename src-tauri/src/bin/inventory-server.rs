@@ -5,6 +5,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use inventory_manager_lib::v2::auth::{AuthError, AuthorizationDenial};
+use inventory_manager_lib::v2::identity_admin::{
+    CreateTenantUserRequest, DisableTenantUserRequest, ListTenantUsersRequest,
+    MembershipPermissionsRequest, ReplaceMembershipRolesRequest,
+};
 use inventory_manager_lib::v2::network::{
     LoginRequest, NetworkPostReceiptRequest, NetworkService, NetworkServiceError, RefreshRequest,
 };
@@ -116,6 +120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/admin/users/query", post(list_tenant_users))
+        .route("/v1/admin/users", post(create_tenant_user))
+        .route("/v1/admin/users/disable", post(disable_tenant_user))
+        .route("/v1/admin/roles/query", post(list_tenant_roles))
+        .route(
+            "/v1/admin/memberships/roles",
+            post(replace_membership_roles),
+        )
+        .route(
+            "/v1/admin/memberships/permissions/query",
+            post(membership_effective_permissions),
+        )
         .route("/v1/inventory/query", post(list_inventory))
         .route("/v1/inventory/summary", post(inventory_summary))
         .route("/v1/inventory/trace", post(inventory_trace))
@@ -199,6 +215,95 @@ async fn logout(
         .logout(tenant_id, bearer)
         .await
         .map(|_| StatusCode::NO_CONTENT)
+        .map_err(Into::into)
+}
+
+async fn list_tenant_users(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ListTenantUsersRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_tenant_users(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_tenant_user(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTenantUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .create_tenant_user(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn disable_tenant_user(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<DisableTenantUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .disable_tenant_user(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_tenant_roles(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_tenant_roles(tenant_id, bearer)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn replace_membership_roles(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ReplaceMembershipRolesRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .replace_membership_roles(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn membership_effective_permissions(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<MembershipPermissionsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .membership_effective_permissions(tenant_id, bearer, request)
+        .await
+        .map(Json)
         .map_err(Into::into)
 }
 

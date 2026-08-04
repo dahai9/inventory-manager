@@ -58,6 +58,10 @@ impl NetworkService {
         &self.database
     }
 
+    pub(crate) fn password_service(&self) -> &PasswordService {
+        self.passwords.as_ref()
+    }
+
     pub async fn readiness(&self) -> NetworkResult<()> {
         sqlx::query("SELECT 1")
             .execute(self.database.pool())

@@ -196,6 +196,70 @@
 .v2-upgrade-result.success { color: #05603a; background: #ecfdf3; border-color: #abefc6; }
 .v2-upgrade-result span { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
 
+.v2-import-layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(260px, .55fr); gap: 12px; margin-bottom: 12px; align-items: start; }
+.v2-import-mapping { display: grid; gap: 13px; }
+.v2-import-mapping > label, .v2-import-map-grid label { display: grid; gap: 6px; }
+.v2-import-mapping label > span, .v2-import-map-grid label > span { color: #475467; font-size: 12px; font-weight: 700; }
+.v2-import-mapping select { width: 100%; min-height: 38px; padding: 0 10px; color: #182230; background: #fff; border: 1px solid #cfd7e3; border-radius: 6px; outline: none; }
+.v2-import-mapping select:focus { border-color: var(--v2-blue); box-shadow: 0 0 0 3px rgba(31,94,255,.12); }
+.v2-import-map-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
+.v2-import-facts { display: flex; align-items: flex-start; gap: 10px; color: #7a2e0e; background: #fff8f2; border-color: #ffcfad; }
+.v2-import-facts > svg { flex: 0 0 auto; }
+.v2-import-facts strong, .v2-import-facts span { display: block; }
+.v2-import-facts span { margin-top: 4px; color: #9a3412; font-size: 12px; line-height: 1.55; }
+.v2-import-preview { padding: 0; overflow: hidden; }
+.v2-import-summary { min-height: 54px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: #e4e7ec; border-bottom: 1px solid #e4e7ec; }
+.v2-import-summary span { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 13px; color: #667085; background: #f8fafc; font-size: 12px; }
+.v2-import-summary strong { color: #182230; font-size: 17px; }
+.v2-import-preview > .v2-selection-heading { padding: 0 14px; }
+.v2-check-label { display: inline-flex; align-items: center; gap: 7px; color: #475467; font-size: 12px; font-weight: 700; }
+.v2-check-label input { width: 16px; height: 16px; accent-color: var(--v2-blue); }
+.v2-import-table { min-width: 1060px !important; }
+.v2-import-table tbody tr.blocked { background: #fff7f7; }
+.v2-import-table td:first-child { width: 42px; }
+.v2-import-table td input { width: 16px; height: 16px; accent-color: var(--v2-blue); }
+.v2-import-table td small { max-width: 320px; overflow-wrap: anywhere; }
+.v2-row-error { color: #b42318 !important; }
+.v2-badge.import-ready { color: #05603a; background: #dcfae6; }
+.v2-badge.import-blocked { color: #b42318; background: #fee4e2; }
+.v2-badge.import-ignored { color: #475467; background: #eaecf0; }
+.v2-import-preview > .v2-form-actions { min-height: 62px; align-items: center; padding: 11px 14px; background: #f8fafc; border-top: 1px solid #e4e7ec; }
+.v2-import-selection { margin-right: auto; color: var(--v2-muted); font-size: 12px; }
+
+.v2-identity-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; align-items: start; }
+.v2-identity-directory { min-width: 0; padding: 0; overflow: hidden; }
+.v2-identity-filter { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 9px; align-items: center; padding: 12px 14px; background: #f8fafc; border-bottom: 1px solid #e4e7ec; }
+.v2-user-table { min-width: 680px !important; }
+.v2-user-table tr.selected { background: #eef4ff; }
+.v2-user-table td:first-child { min-width: 210px; }
+.v2-user-table td:nth-child(2) { max-width: 300px; overflow-wrap: anywhere; }
+.v2-row-actions { display: flex; justify-content: flex-end; gap: 5px; }
+.v2-pagination { min-height: 48px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 14px; color: #667085; background: #f8fafc; border-top: 1px solid #e4e7ec; font-size: 12px; }
+.v2-icon-button.danger { color: #b42318; }
+.v2-icon-button.danger:hover { color: #b42318; background: #fff1f0; border-color: #fda29b !important; }
+.v2-icon-button:disabled { color: #98a2b3; background: #f2f4f7; cursor: not-allowed; }
+.v2-badge.identity-active { color: #05603a; background: #dcfae6; }
+.v2-badge.identity-disabled { color: #b42318; background: #fee4e2; }
+.v2-identity-side { display: grid; gap: 12px; }
+.v2-identity-create, .v2-identity-editor { display: grid; gap: 12px; }
+.v2-identity-create > label { display: grid; gap: 6px; }
+.v2-identity-create > label > span { color: #475467; font-size: 12px; font-weight: 700; }
+.v2-identity-create input { width: 100%; min-height: 38px; padding: 0 10px; color: #182230; background: #fff; border: 1px solid #cfd7e3; border-radius: 6px; outline: none; }
+.v2-identity-create input:focus { border-color: var(--v2-blue); box-shadow: 0 0 0 3px rgba(31,94,255,.12); }
+.v2-role-checklist { display: grid; gap: 6px; margin: 0; padding: 10px; border: 1px solid #e4e7ec; border-radius: 6px; }
+.v2-role-checklist legend { padding: 0 5px; color: #475467; font-size: 12px; font-weight: 700; }
+.v2-role-checklist label { display: flex; align-items: flex-start; gap: 8px; padding: 7px 8px; border-radius: 5px; cursor: pointer; }
+.v2-role-checklist label:hover { background: #f8fafc; }
+.v2-role-checklist input { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--v2-blue); }
+.v2-role-checklist span, .v2-role-checklist strong, .v2-role-checklist small { display: block; min-width: 0; }
+.v2-role-checklist strong { color: #344054; font-size: 12px; }
+.v2-role-checklist small { margin-top: 2px; color: #98a2b3; overflow-wrap: anywhere; font-size: 11px; }
+.v2-effective-permissions { display: grid; gap: 8px; padding-top: 11px; border-top: 1px solid #eaecf0; }
+.v2-effective-permissions > strong { display: flex; align-items: center; gap: 6px; color: #344054; font-size: 12px; }
+.v2-effective-permissions > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.v2-effective-permissions span { padding: 4px 6px; color: #344054; background: #eef2f6; border: 1px solid #d8dee8; border-radius: 4px; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
+.v2-effective-permissions small { color: var(--v2-muted); }
+
 .v2-trace-backdrop { position: fixed; z-index: 50; inset: 0; display: flex; justify-content: flex-end; background: rgba(16,24,40,.38); }
 .v2-trace-drawer { width: min(560px, 100%); height: 100%; display: flex; flex-direction: column; padding: 18px; background: #fff; box-shadow: -8px 0 28px rgba(16,24,40,.18); overflow: auto; }
 .v2-trace-drawer > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-bottom: 13px; border-bottom: 1px solid #e4e7ec; }
@@ -221,6 +285,8 @@
   .v2-filters { grid-template-columns: minmax(230px, 1fr) 160px 160px; }
   .v2-filters > .v2-button { grid-column: 1 / -1; justify-self: end; }
   .v2-settings-grid { grid-template-columns: 1fr; }
+  .v2-import-layout { grid-template-columns: 1fr; }
+  .v2-identity-layout { grid-template-columns: minmax(0, 1fr) 320px; }
 }
 
 @media (max-width: 760px) {
@@ -229,7 +295,8 @@
   .v2-brand { padding: 0 2px 9px; }
   .v2-brand > span { width: 34px; height: 34px; }
   .v2-mode-switch { margin-bottom: 9px; }
-  .v2-sidebar nav { display: flex; gap: 5px; overflow-x: auto; padding-bottom: 3px; }
+  .v2-sidebar nav { display: flex; gap: 5px; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .v2-sidebar nav::-webkit-scrollbar { display: none; }
   .v2-sidebar nav button { min-width: 112px; min-height: 48px; padding: 6px 8px; }
   .v2-sidebar nav button small { display: none; }
   .v2-sidebar-footer { display: none; }
@@ -248,6 +315,10 @@
   .v2-outbound-layout > .v2-form { grid-column: auto; }
   .v2-settings-grid { grid-template-columns: 1fr; }
   .v2-upgrade-steps { grid-template-columns: 1fr; }
+  .v2-import-map-grid, .v2-import-summary { grid-template-columns: 1fr; }
+  .v2-import-summary span { min-height: 42px; }
+  .v2-identity-layout, .v2-identity-filter { grid-template-columns: 1fr; }
+  .v2-identity-filter .v2-button { width: 100%; }
   .v2-form-actions { flex-direction: column-reverse; }
   .v2-form-actions .v2-button { width: 100%; }
   .v2-trace-drawer { padding: 14px; }
