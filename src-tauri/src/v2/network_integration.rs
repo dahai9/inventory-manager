@@ -1,3 +1,4 @@
+use super::application::{InventoryListQuery, InventorySummaryQuery};
 use super::auth::{AuthError, PasswordService};
 use super::network::{
     LoginRequest, NetworkPostReceiptRequest, NetworkService, RefreshRequest,
@@ -124,8 +125,6 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     .execute(&mut *setup)
     .await
     .expect("assign role");
-    sqlx::query("INSERT INTO devices (tenant_id, id, membership_id, user_id, device_fingerprint, display_name) VALUES ($1, $2, $3, $4, $5, 'Test Device')")
-        .bind(tenant_id).bind(device_id).bind(membership_id).bind(user_id).bind(format!("test-device-{device_id}")).execute(&mut *setup).await.expect("insert device");
     sqlx::query("INSERT INTO license_entitlements (tenant_id, id, license_id, edition, status, seat_limit, starts_at, expires_at, issuer, signature, key_id, claims_hash, verified_at) VALUES ($1, $2, $3, 'network', 'active', 5, CURRENT_TIMESTAMP - INTERVAL '1 hour', CURRENT_TIMESTAMP + INTERVAL '1 day', 'integration-test', 'test-signature', 'test-key', $4, CURRENT_TIMESTAMP)")
         .bind(tenant_id).bind(Uuid::now_v7()).bind(format!("TEST-{tenant_id}")).bind("a".repeat(64)).execute(&mut *setup).await.expect("insert entitlement");
     setup.commit().await.expect("commit setup");
@@ -168,6 +167,44 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     assert_eq!(first.received_count, 1);
     assert!(replay.idempotent_replay);
     assert_eq!(first.receipt_id, replay.receipt_id);
+
+    let inventory = service
+        .list_inventory(
+            tenant_id,
+            &login.session_token,
+            InventoryListQuery {
+                search: Some("sku-x".to_owned()),
+                ..InventoryListQuery::default()
+            },
+        )
+        .await
+        .expect("query network inventory");
+    assert_eq!(inventory.total, 1);
+    assert_eq!(inventory.items[0].receipt_id, first.receipt_id);
+    assert_eq!(inventory.items[0].quality_status.to_string(), "untested");
+    let summary = service
+        .inventory_summary(
+            tenant_id,
+            &login.session_token,
+            InventorySummaryQuery::default(),
+        )
+        .await
+        .expect("query network inventory summary");
+    assert_eq!(summary.total_units, 1);
+    assert_eq!(summary.inventory.received, 1);
+    assert_eq!(summary.quality.untested, 1);
+    let cross_tenant = service
+        .inventory_summary(
+            Uuid::now_v7(),
+            &login.session_token,
+            InventorySummaryQuery::default(),
+        )
+        .await
+        .expect_err("session token must not authorize another tenant selector");
+    assert!(matches!(
+        cross_tenant,
+        super::network::NetworkServiceError::Database(_)
+    ));
 
     let old_refresh_token = login.refresh_token.clone();
     let refreshed = service
@@ -235,5 +272,113 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     .expect("verify facts");
     assert_eq!(facts, (1, 1, 1));
     verification.commit().await.expect("commit verification");
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires INVENTORY_NETWORK_TEST_ADMIN_URL and INVENTORY_NETWORK_TEST_RUNTIME_URL"]
+async fn restricted_postgres_role_cannot_cross_tenant_rls_for_direct_sql() {
+    let admin_url =
+        std::env::var("INVENTORY_NETWORK_TEST_ADMIN_URL").expect("network test admin URL");
+    let runtime_url =
+        std::env::var("INVENTORY_NETWORK_TEST_RUNTIME_URL").expect("network test runtime URL");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("connect admin database");
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&runtime_url)
+        .await
+        .expect("connect restricted runtime database");
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let workspace_a = Uuid::now_v7();
+    let workspace_b = Uuid::now_v7();
+
+    for (tenant_id, workspace_id, suffix) in
+        [(tenant_a, workspace_a, "a"), (tenant_b, workspace_b, "b")]
+    {
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $3)")
+            .bind(tenant_id)
+            .bind(format!("rls-{suffix}-{}", tenant_id.simple()))
+            .bind(format!("RLS tenant {suffix}"))
+            .execute(&admin)
+            .await
+            .expect("insert RLS tenant");
+        sqlx::query(
+            "INSERT INTO workspaces (tenant_id, id, name, source_instance_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant_id)
+        .bind(workspace_id)
+        .bind(format!("RLS workspace {suffix}"))
+        .bind(Uuid::now_v7())
+        .execute(&admin)
+        .await
+        .expect("insert RLS workspace");
+    }
+
+    let mut read = runtime.begin().await.expect("begin cross-tenant read");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant_a.to_string())
+        .execute(&mut *read)
+        .await
+        .expect("set tenant A context");
+    let visible_b: i64 = sqlx::query_scalar("SELECT count(*) FROM workspaces WHERE tenant_id = $1")
+        .bind(tenant_b)
+        .fetch_one(&mut *read)
+        .await
+        .expect("query tenant B from tenant A context");
+    assert_eq!(visible_b, 0, "tenant B rows must be invisible to tenant A");
+    read.rollback().await.expect("rollback read check");
+
+    let mut insert = runtime.begin().await.expect("begin cross-tenant insert");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant_a.to_string())
+        .execute(&mut *insert)
+        .await
+        .expect("set tenant A context");
+    let insert_error = sqlx::query(
+        "INSERT INTO warehouses (tenant_id, id, code, name) VALUES ($1, $2, 'CROSS', 'Cross tenant')",
+    )
+    .bind(tenant_b)
+    .bind(Uuid::now_v7())
+    .execute(&mut *insert)
+    .await
+    .expect_err("tenant A context must not insert tenant B rows");
+    assert!(
+        insert_error
+            .as_database_error()
+            .is_some_and(|error| error.message().contains("row-level security")),
+        "expected an RLS policy error, got {insert_error}"
+    );
+    insert
+        .rollback()
+        .await
+        .expect("rollback rejected insert transaction");
+
+    let mut update = runtime.begin().await.expect("begin cross-tenant update");
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant_a.to_string())
+        .execute(&mut *update)
+        .await
+        .expect("set tenant A context");
+    let updated = sqlx::query(
+        "UPDATE workspaces SET name = 'cross-tenant mutation' WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_b)
+    .bind(workspace_b)
+    .execute(&mut *update)
+    .await
+    .expect("cross-tenant update is filtered by RLS");
+    assert_eq!(
+        updated.rows_affected(),
+        0,
+        "tenant A context must not update tenant B rows"
+    );
+    update.rollback().await.expect("rollback update check");
+
+    runtime.close().await;
     admin.close().await;
 }

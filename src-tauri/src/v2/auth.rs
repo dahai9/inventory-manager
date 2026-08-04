@@ -923,6 +923,27 @@ pub async fn issue_session(
         return Err(AuthError::AccessDenied(reason));
     }
 
+    // First login for a desktop installation may register its random,
+    // installation-scoped device id. This stays in the authorization/session
+    // transaction: a denied login cannot leave a device row behind, and an
+    // existing id or fingerprint is never reassigned to another membership.
+    sqlx::query(
+        r#"
+        INSERT INTO devices
+            (tenant_id, id, membership_id, user_id, device_fingerprint,
+             display_name, status)
+        VALUES ($1, $2, $3, $4, $5, 'Tauri desktop', 'active')
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(identity.tenant_id)
+    .bind(device_id)
+    .bind(identity.membership_id)
+    .bind(identity.user_id)
+    .bind(format!("tauri:{device_id}"))
+    .execute(&mut *transaction)
+    .await?;
+
     let device_exists = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS (

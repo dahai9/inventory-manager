@@ -1,4 +1,5 @@
-use axum::extract::State;
+use axum::body::to_bytes;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -7,11 +8,20 @@ use inventory_manager_lib::v2::auth::{AuthError, AuthorizationDenial};
 use inventory_manager_lib::v2::network::{
     LoginRequest, NetworkPostReceiptRequest, NetworkService, NetworkServiceError, RefreshRequest,
 };
+use inventory_manager_lib::v2::network_ops::{
+    NetworkAllocateOutboundRequest, NetworkCompleteInspectionRequest,
+    NetworkConfirmOutboundDeliveryRequest, NetworkCreateOutboundOrderRequest,
+    NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
+};
 use inventory_manager_lib::v2::postgres::{NetworkDatabase, NetworkDatabaseConfig};
-use serde::Serialize;
+use inventory_manager_lib::v2::upgrade::{NetworkUpgradeImportRequest, MAX_NETWORK_REQUEST_BYTES};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+const MAX_STANDARD_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BEARER_TOKEN_BYTES: usize = 1024;
 
 #[derive(Clone)]
 struct ServerState {
@@ -29,6 +39,7 @@ struct ErrorResponse {
     message: &'static str,
 }
 
+#[derive(Debug)]
 struct ApiError(NetworkServiceError);
 
 impl From<NetworkServiceError> for ApiError {
@@ -101,10 +112,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/inventory/query", post(list_inventory))
+        .route("/v1/inventory/summary", post(inventory_summary))
+        .route("/v1/inventory/trace", post(inventory_trace))
+        .route("/v1/reference/warehouses/query", post(list_warehouses))
         .route("/v1/inbound/receipts", post(post_receipt))
+        .route(
+            "/v1/upgrades/offline-imports",
+            post(import_upgrade_package).layer(DefaultBodyLimit::max(MAX_NETWORK_REQUEST_BYTES)),
+        )
+        .route("/v1/quality/inspections", post(complete_quality_inspection))
+        .route("/v1/outbound/orders", post(create_outbound_order))
+        .route("/v1/outbound/allocations", post(allocate_outbound_order))
+        .route("/v1/outbound/shipments", post(ship_outbound_order))
+        .route("/v1/outbound/deliveries", post(confirm_outbound_delivery))
+        .route("/v1/outbound/returns", post(return_outbound_shipment))
+        .layer(DefaultBodyLimit::max(MAX_STANDARD_REQUEST_BYTES))
         .with_state(state);
     let bind_address = std::env::var("INVENTORY_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:3100".to_owned())
@@ -119,6 +146,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn readiness(State(state): State<ServerState>) -> Response {
+    match state.service.readiness().await {
+        Ok(()) => (StatusCode::OK, Json(HealthResponse { status: "ready" })).into_response(),
+        Err(error) => {
+            eprintln!("network readiness check failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse {
+                    status: "unavailable",
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn login(
@@ -174,6 +217,191 @@ async fn post_receipt(
         .map_err(Into::into)
 }
 
+async fn import_upgrade_package(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .authorize_upgrade_import(tenant_id, bearer)
+        .await?;
+    let payload = to_bytes(request.into_body(), MAX_NETWORK_REQUEST_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError(NetworkServiceError::Invalid(
+                "upgrade request body is invalid or too large".to_owned(),
+            ))
+        })?;
+    let request: NetworkUpgradeImportRequest = serde_json::from_slice(&payload).map_err(|_| {
+        ApiError(NetworkServiceError::Invalid(
+            "upgrade request JSON is invalid".to_owned(),
+        ))
+    })?;
+    state
+        .service
+        .import_upgrade_package(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_inventory(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(query): Json<inventory_manager_lib::v2::application::InventoryListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_inventory(tenant_id, bearer, query)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn inventory_summary(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(query): Json<inventory_manager_lib::v2::application::InventorySummaryQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .inventory_summary(tenant_id, bearer, query)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+struct InventoryTraceRequest {
+    barcode: String,
+}
+
+async fn inventory_trace(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<InventoryTraceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .inventory_trace(tenant_id, bearer, &request.barcode)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_warehouses(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_warehouses(tenant_id, bearer)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn complete_quality_inspection(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkCompleteInspectionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .complete_quality_inspection(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_outbound_order(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkCreateOutboundOrderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .create_outbound_order(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn allocate_outbound_order(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkAllocateOutboundRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .allocate_outbound_order(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn ship_outbound_order(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkShipOutboundRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .ship_outbound_order(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn confirm_outbound_delivery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkConfirmOutboundDeliveryRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .confirm_outbound_delivery(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn return_outbound_shipment(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkReturnOutboundShipmentRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .return_outbound_shipment(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 fn tenant_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     headers
         .get("x-tenant-id")
@@ -187,12 +415,23 @@ fn tenant_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
-    headers
+    let value = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError(NetworkServiceError::Auth(AuthError::InvalidSession)))
+        .ok_or_else(|| ApiError(NetworkServiceError::Auth(AuthError::InvalidSession)))?;
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| ApiError(NetworkServiceError::Auth(AuthError::InvalidSession)))?;
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || token.is_empty()
+        || token.len() > MAX_BEARER_TOKEN_BYTES
+        || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ApiError(NetworkServiceError::Auth(
+            AuthError::InvalidSession,
+        )));
+    }
+    Ok(token)
 }
 
 fn required_env(name: &str) -> Result<String, std::io::Error> {
@@ -206,4 +445,40 @@ fn required_env(name: &str) -> Result<String, std::io::Error> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_token_is_returned() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("bearer abc_123"));
+        assert_eq!(bearer_token(&headers).expect("valid bearer"), "abc_123");
+    }
+
+    #[test]
+    fn bearer_rejects_whitespace_and_oversized_tokens() {
+        for value in ["Bearer", "Bearer  abc", "Bearer abc def", "Basic abc"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(value).expect("test header"),
+            );
+            assert!(bearer_token(&headers).is_err(), "accepted {value:?}");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "Bearer {}",
+                "a".repeat(MAX_BEARER_TOKEN_BYTES + 1)
+            ))
+            .expect("large test header"),
+        );
+        assert!(bearer_token(&headers).is_err());
+    }
 }

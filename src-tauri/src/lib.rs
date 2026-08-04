@@ -7,7 +7,8 @@ use rust_xlsxwriter::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
@@ -1493,6 +1494,426 @@ async fn v2_post_receipt(
         .map_err(|error| error.to_string())
 }
 
+const V2_PENDING_RESTORE_FILE: &str = ".inventory-v2-restore-pending.json";
+const V2_RESTORE_REPORT_FILE: &str = ".inventory-v2-restore-report.json";
+
+#[derive(Clone, Deserialize, Serialize)]
+struct V2PendingRestore {
+    package_path: String,
+    requested_at: String,
+    expected_source_instance_id: String,
+    expected_source_workspace_id: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct V2RestoreReport {
+    status: String,
+    requested_at: String,
+    completed_at: String,
+    source_workspace_id: Option<String>,
+    backup_exported_at: Option<String>,
+    pre_restore_backup: Option<String>,
+    error: Option<String>,
+}
+
+fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("路径没有父目录: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建目录 {}: {error}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("inventory-v2-state"),
+        uuid::Uuid::now_v7()
+    ));
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("无法创建 {}: {error}", temporary.display()))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("无法写入 {}: {error}", temporary.display()))?;
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("无法替换 {}: {error}", path.display()))?;
+        }
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("无法发布 {}: {error}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("无法读取 {}: {error}", path.display()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(format!("状态文件过大: {}", path.display()));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("无法解析 {}: {error}", path.display()))
+}
+
+async fn apply_pending_v2_restore(app_data_dir: &Path, database_path: &Path) {
+    let marker_path = app_data_dir.join(V2_PENDING_RESTORE_FILE);
+    if !marker_path.exists() {
+        return;
+    }
+
+    let pending = read_json_file::<V2PendingRestore>(&marker_path);
+    let report = match pending {
+        Ok(pending) => {
+            let options = v2::backup::RestoreOptions {
+                expected_source_instance_id: Some(pending.expected_source_instance_id.clone()),
+                expected_source_workspace_id: Some(pending.expected_source_workspace_id.clone()),
+                replace_existing: true,
+            };
+            match v2::backup::restore_backup_to_path(
+                Path::new(&pending.package_path),
+                database_path,
+                &options,
+            )
+            .await
+            {
+                Ok(restored) => V2RestoreReport {
+                    status: "restored".to_owned(),
+                    requested_at: pending.requested_at,
+                    completed_at: v2::sqlite::now_utc().unwrap_or_default(),
+                    source_workspace_id: Some(restored.metadata.source_workspace_id),
+                    backup_exported_at: Some(restored.metadata.exported_at),
+                    pre_restore_backup: restored
+                        .pre_restore_backup
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    error: None,
+                },
+                Err(error) => V2RestoreReport {
+                    status: "failed".to_owned(),
+                    requested_at: pending.requested_at,
+                    completed_at: v2::sqlite::now_utc().unwrap_or_default(),
+                    source_workspace_id: Some(pending.expected_source_workspace_id),
+                    backup_exported_at: None,
+                    pre_restore_backup: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        Err(error) => V2RestoreReport {
+            status: "failed".to_owned(),
+            requested_at: String::new(),
+            completed_at: v2::sqlite::now_utc().unwrap_or_default(),
+            source_workspace_id: None,
+            backup_exported_at: None,
+            pre_restore_backup: None,
+            error: Some(error),
+        },
+    };
+
+    if let Err(error) = write_json_atomically(&app_data_dir.join(V2_RESTORE_REPORT_FILE), &report) {
+        eprintln!("cannot persist offline restore report: {error}");
+    }
+    if let Err(error) = std::fs::remove_file(&marker_path) {
+        eprintln!("cannot clear offline restore marker: {error}");
+    }
+}
+
+#[tauri::command]
+async fn v2_create_offline_backup(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    destination: String,
+) -> Result<v2::backup::BackupMetadata, String> {
+    let destination = destination.trim();
+    if destination.is_empty() {
+        return Err("请选择备份保存位置".to_owned());
+    }
+    v2::backup::create_consistent_backup(database.pool(), Path::new(destination))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_verify_offline_backup(
+    package_path: String,
+) -> Result<v2::backup::BackupMetadata, String> {
+    let package_path = package_path.trim();
+    if package_path.is_empty() {
+        return Err("请选择备份包".to_owned());
+    }
+    v2::backup::verify_backup_package(Path::new(package_path))
+        .await
+        .map(|verified| verified.metadata)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_restore_offline_backup(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    package_path: String,
+) -> Result<(), String> {
+    let package_path = package_path.trim();
+    if package_path.is_empty() {
+        return Err("请选择备份包".to_owned());
+    }
+    let canonical_package =
+        std::fs::canonicalize(package_path).map_err(|error| format!("无法定位备份包: {error}"))?;
+    let verified = v2::backup::verify_backup_package(&canonical_package)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (workspace_id, source_instance_id) = database.source_identity().await?;
+    if verified.metadata.source_workspace_id != workspace_id
+        || verified.metadata.source_instance_id != source_instance_id
+    {
+        return Err("备份包不属于当前离线工作区，拒绝覆盖".to_owned());
+    }
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let marker_path = app_data_dir.join(V2_PENDING_RESTORE_FILE);
+    if marker_path.exists() {
+        return Err("已有待执行的恢复任务，请重新启动应用".to_owned());
+    }
+    write_json_atomically(
+        &marker_path,
+        &V2PendingRestore {
+            package_path: canonical_package.to_string_lossy().into_owned(),
+            requested_at: v2::sqlite::now_utc()?,
+            expected_source_instance_id: source_instance_id,
+            expected_source_workspace_id: workspace_id,
+        },
+    )?;
+    app.request_restart();
+    Ok(())
+}
+
+#[tauri::command]
+fn v2_offline_restore_report(app: tauri::AppHandle) -> Result<Option<V2RestoreReport>, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join(V2_RESTORE_REPORT_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json_file(&path).map(Some)
+}
+
+#[derive(serde::Serialize)]
+struct V2NetworkStatus {
+    configured: bool,
+    base_url: Option<String>,
+    authenticated: bool,
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+    session_expires_in_seconds: Option<i64>,
+}
+
+fn network_status_from_client(
+    client: &v2::network_client::NetworkClient,
+) -> Result<V2NetworkStatus, String> {
+    let base_url = client.base_url().map_err(|error| error.to_string())?;
+    let session = client.session().map_err(|error| error.to_string())?;
+    Ok(V2NetworkStatus {
+        configured: base_url.is_some(),
+        base_url,
+        authenticated: session.is_some(),
+        tenant_id: session.as_ref().map(|value| value.tenant_id.to_string()),
+        user_id: session.as_ref().map(|value| value.user_id.to_string()),
+        session_expires_in_seconds: session.map(|value| value.session_ttl_seconds),
+    })
+}
+
+#[tauri::command]
+fn v2_network_status(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<V2NetworkStatus, String> {
+    network_status_from_client(&client)
+}
+
+#[tauri::command]
+fn v2_network_configure(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    base_url: String,
+) -> Result<V2NetworkStatus, String> {
+    client
+        .configure(base_url)
+        .map_err(|error| error.to_string())?;
+    network_status_from_client(&client)
+}
+
+#[tauri::command]
+async fn v2_network_login(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    base_url: String,
+    tenant_id: String,
+    login: String,
+    password: String,
+    device_id: Option<String>,
+) -> Result<V2NetworkStatus, String> {
+    let tenant_id = uuid::Uuid::parse_str(tenant_id.trim())
+        .map_err(|error| format!("租户 ID 无效: {error}"))?;
+    let device_id = device_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|error| format!("设备 ID 无效: {error}"))?
+        .unwrap_or_else(uuid::Uuid::now_v7);
+    client
+        .configure(base_url)
+        .map_err(|error| error.to_string())?;
+    client
+        .login(tenant_id, login, password, device_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    network_status_from_client(&client)
+}
+
+#[tauri::command]
+async fn v2_network_refresh(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<V2NetworkStatus, String> {
+    client.refresh().await.map_err(|error| error.to_string())?;
+    network_status_from_client(&client)
+}
+
+#[tauri::command]
+async fn v2_network_logout(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<V2NetworkStatus, String> {
+    client.logout().await.map_err(|error| error.to_string())?;
+    network_status_from_client(&client)
+}
+
+#[tauri::command]
+async fn v2_network_post_receipt(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network::NetworkPostReceiptRequest,
+) -> Result<v2::application::PostReceiptResponse, String> {
+    client
+        .post_receipt(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_list_warehouses(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<Vec<v2::network::NetworkWarehouse>, String> {
+    client
+        .list_warehouses()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_complete_inspection(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkCompleteInspectionRequest,
+) -> Result<v2::application::CompleteInspectionResponse, String> {
+    client
+        .complete_quality_inspection(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_list_inventory(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    query: v2::application::InventoryListQuery,
+) -> Result<v2::application::InventoryListResponse, String> {
+    client
+        .list_inventory(&query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_inventory_trace(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    barcode: String,
+) -> Result<v2::traceability::InventoryTrace, String> {
+    client
+        .inventory_trace(&barcode)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_get_dashboard(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    query: v2::application::InventorySummaryQuery,
+) -> Result<v2::application::InventorySummaryResponse, String> {
+    client
+        .dashboard(&query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_create_outbound_order(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkCreateOutboundOrderRequest,
+) -> Result<v2::outbound::CreateOutboundOrderResponse, String> {
+    client
+        .create_outbound_order(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_allocate_outbound_order(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkAllocateOutboundRequest,
+) -> Result<v2::outbound::AllocateOutboundResponse, String> {
+    client
+        .allocate_outbound_order(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_ship_outbound_order(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkShipOutboundRequest,
+) -> Result<v2::outbound::ShipOutboundResponse, String> {
+    client
+        .ship_outbound_order(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_confirm_outbound_delivery(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkConfirmOutboundDeliveryRequest,
+) -> Result<v2::outbound::ConfirmOutboundDeliveryResponse, String> {
+    client
+        .confirm_outbound_delivery(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_return_outbound_shipment(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkReturnOutboundShipmentRequest,
+) -> Result<v2::outbound::ReturnOutboundShipmentResponse, String> {
+    client
+        .return_outbound_shipment(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn v2_complete_inspection(
     app: tauri::AppHandle,
@@ -1508,11 +1929,9 @@ async fn v2_complete_inspection(
 
 #[tauri::command]
 async fn v2_list_inventory(
-    app: tauri::AppHandle,
     database: tauri::State<'_, v2::OfflineDatabase>,
     query: v2::application::InventoryListQuery,
 ) -> Result<v2::application::InventoryListResponse, String> {
-    activation::require_activated(&app)?;
     database
         .list_inventory(query)
         .await
@@ -1521,15 +1940,21 @@ async fn v2_list_inventory(
 
 #[tauri::command]
 async fn v2_get_dashboard(
-    app: tauri::AppHandle,
     database: tauri::State<'_, v2::OfflineDatabase>,
     query: v2::application::InventorySummaryQuery,
 ) -> Result<v2::application::InventorySummaryResponse, String> {
-    activation::require_activated(&app)?;
     database
         .inventory_summary(query)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_inventory_trace(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    barcode: String,
+) -> Result<v2::traceability::InventoryTrace, String> {
+    database.inventory_trace(&barcode).await
 }
 
 #[tauri::command]
@@ -1599,11 +2024,9 @@ async fn v2_return_outbound_shipment(
 
 #[tauri::command]
 async fn v2_get_outbound_order(
-    app: tauri::AppHandle,
     database: tauri::State<'_, v2::OfflineDatabase>,
     order_id: String,
 ) -> Result<v2::outbound::OutboundOrderDetails, String> {
-    activation::require_activated(&app)?;
     database
         .outbound_order_details(&order_id)
         .await
@@ -1624,13 +2047,23 @@ struct V2UpgradeExportOutput {
     checksum: String,
 }
 
+#[derive(serde::Deserialize)]
+struct V2UpgradeOnlineInput {
+    package_path: String,
+    target_workspace_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct V2UpgradeOnlineOutput {
+    import: v2::upgrade::NetworkUpgradeImportResponse,
+    local_archived: bool,
+}
+
 #[tauri::command]
 async fn v2_export_upgrade_package(
-    app: tauri::AppHandle,
     database: tauri::State<'_, v2::OfflineDatabase>,
     input: V2UpgradeExportInput,
 ) -> Result<V2UpgradeExportOutput, String> {
-    activation::require_activated(&app)?;
     let package = v2::upgrade::OfflineUpgradeExporter::new(database.pool())
         .export(
             std::path::Path::new(&input.destination),
@@ -1650,14 +2083,44 @@ async fn v2_export_upgrade_package(
 }
 
 #[tauri::command]
-async fn v2_archive_offline_workspace(
-    app: tauri::AppHandle,
+async fn v2_upgrade_offline_to_network(
     database: tauri::State<'_, v2::OfflineDatabase>,
-    export_id: String,
-    checksum: String,
-) -> Result<(), String> {
-    activation::require_activated(&app)?;
-    database.mark_read_only(&export_id, &checksum).await
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: V2UpgradeOnlineInput,
+) -> Result<V2UpgradeOnlineOutput, String> {
+    let package_path = std::path::Path::new(input.package_path.trim());
+    let package = v2::upgrade::validate_package(package_path)
+        .map_err(|error| format!("升级包校验失败: {error}"))?;
+    database
+        .verify_upgrade_source(
+            &package.manifest.source.workspace_id,
+            &package.manifest.source.instance_id,
+        )
+        .await?;
+    let target_workspace_id = uuid::Uuid::parse_str(input.target_workspace_id.trim())
+        .map_err(|error| format!("目标工作区 ID 无效: {error}"))?;
+    let request = v2::upgrade::build_network_upgrade_request(&package, target_workspace_id)
+        .map_err(|error| format!("无法读取升级包: {error}"))?;
+    let expected_export_id = package.manifest.export_id.clone();
+    let expected_migration_id = package.manifest.migration_id.clone();
+    let expected_checksum = package.package_checksum.clone();
+    let response = client
+        .import_upgrade_package(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.export_id != expected_export_id
+        || response.migration_id != expected_migration_id
+        || response.checksum != expected_checksum
+    {
+        return Err("服务器升级确认与本地包身份不一致，离线库保持可写".to_owned());
+    }
+    database
+        .archive_after_network_import(&response, target_workspace_id)
+        .await?;
+    Ok(V2UpgradeOnlineOutput {
+        import: response,
+        local_archived: true,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1670,11 +2133,14 @@ pub fn run() {
             mixer_handle,
         })
         .setup(|app| {
-            let database_path = app.path().app_data_dir()?.join("inventory-v2.sqlite3");
+            let app_data_dir = app.path().app_data_dir()?;
+            let database_path = app_data_dir.join("inventory-v2.sqlite3");
+            tauri::async_runtime::block_on(apply_pending_v2_restore(&app_data_dir, &database_path));
             let database =
                 tauri::async_runtime::block_on(v2::OfflineDatabase::open(&database_path))
                     .map_err(std::io::Error::other)?;
             app.manage(database);
+            app.manage(v2::network_client::NetworkClient::default());
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -1726,6 +2192,7 @@ pub fn run() {
             v2_post_receipt,
             v2_complete_inspection,
             v2_list_inventory,
+            v2_inventory_trace,
             v2_get_dashboard,
             v2_create_outbound_order,
             v2_allocate_outbound_order,
@@ -1733,8 +2200,28 @@ pub fn run() {
             v2_confirm_outbound_delivery,
             v2_return_outbound_shipment,
             v2_get_outbound_order,
+            v2_create_offline_backup,
+            v2_verify_offline_backup,
+            v2_restore_offline_backup,
+            v2_offline_restore_report,
             v2_export_upgrade_package,
-            v2_archive_offline_workspace,
+            v2_upgrade_offline_to_network,
+            v2_network_status,
+            v2_network_configure,
+            v2_network_login,
+            v2_network_refresh,
+            v2_network_logout,
+            v2_network_post_receipt,
+            v2_network_list_warehouses,
+            v2_network_complete_inspection,
+            v2_network_list_inventory,
+            v2_network_inventory_trace,
+            v2_network_get_dashboard,
+            v2_network_create_outbound_order,
+            v2_network_allocate_outbound_order,
+            v2_network_ship_outbound_order,
+            v2_network_confirm_outbound_delivery,
+            v2_network_return_outbound_shipment,
             play_beep
         ])
         .run(tauri::generate_context!())

@@ -33,6 +33,7 @@ rodio = { version = "0.22.2", features = ["playback"] }
 base64 = "0.22.1"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sha2 = "0.10.9"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros", "uuid"] }
 thiserror = "2"

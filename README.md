@@ -95,7 +95,18 @@ cargo run --example license_keygen -- issue \
 
 ## 网络版服务端 POC
 
-网络版使用 PostgreSQL 作为唯一事实源，运行账号必须是非超级用户、不能绕过 RLS 且不拥有业务表。迁移使用单独的高权限连接：
+网络版使用 PostgreSQL 作为唯一事实源，运行账号必须是非超级用户、不能绕过 RLS 且不拥有业务表。迁移使用单独的 schema owner 连接。创建运行角色后，用仓库中的授权脚本授予最小业务权限：
+
+```bash
+psql "$INVENTORY_MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -c "CREATE ROLE inventory_runtime LOGIN PASSWORD '从密钥管理器读取' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS"
+
+psql "$INVENTORY_MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -v runtime_role=inventory_runtime \
+  -f src-tauri/deploy/postgres/runtime-role.sql
+```
+
+生产密码不得写入仓库或命令历史。迁移完成后再使用两个独立连接启动服务：
 
 ```bash
 INVENTORY_DATABASE_URL=postgres://inventory_runtime:***@db/inventory \
@@ -103,4 +114,18 @@ INVENTORY_MIGRATION_DATABASE_URL=postgres://inventory_migrator:***@db/inventory 
 cargo run --bin inventory-server
 ```
 
-当前服务提供 `/health`、`/v1/auth/login`、`/v1/auth/refresh`、`/v1/auth/logout` 和幂等入库接口 `/v1/inbound/receipts`。服务默认只监听 `127.0.0.1:3100`；多用户部署应放在 TLS 反向代理后，不要把明文 HTTP 直接暴露到公网。
+当前服务提供认证、库存查询、概览、幂等入库、质检、上游订单、库存分配、出库、交货和退回接口。服务默认只监听 `127.0.0.1:3100`；多用户部署必须放在 TLS 反向代理后，不要把明文 HTTP 或 PostgreSQL 直接暴露到公网。桌面客户端只接受 HTTPS 网络地址，本机 POC 的 `http://127.0.0.1` 例外。
+
+- `/health` 只表示进程存活；`/ready` 会实际探测 PostgreSQL，负载均衡器应使用后者接流量。
+- 普通 JSON 请求体限制为 2 MiB，Bearer token 限制为 1024 字节；升级上传使用下述独立上限。
+- 登录后客户端通过受保护接口读取可收货仓库，操作员不需要填写仓库 UUID。
+
+一次性升级使用 `POST /v1/upgrades/offline-imports`，调用账号必须拥有 `inventory.upgrade.import` 权限。桌面端先通过 `v2_export_upgrade_package` 生成并验证 `.invpack`，再调用 `v2_upgrade_offline_to_network` 上传到空网络工作区。只有服务端返回完全一致的 `export_id`、`migration_id` 和 checksum 后，桌面端才会把原 SQLite 工作区冻结为只读，并在 `migration_result_reports` 保存目标工作区、关键表计数和导入结果。网络导入成功但本地归档因断电失败时，可以用同一个包重试；服务端返回幂等重放后会继续完成本地归档，不会重复写入 PostgreSQL。
+
+当前上传协议是有明确上限的首版实现：一个请求最多包含 64 MiB 的包数据，服务器请求体上限为 80 MiB。更大的工作区必须先实现可恢复的分片上传，不应调高上限来绕过内存边界。
+
+## 离线备份与恢复
+
+V2 的“数据与设置”页面可创建带 SHA-256、schema 版本和来源身份的一致性 `.invbackup`。备份使用 SQLite `VACUUM INTO`，不会遗漏仍在 WAL 中的已提交数据。恢复会先校验包完整性和工作区身份，然后请求应用重启；数据库连接关闭后，启动流程先生成恢复前保护性备份，再原子替换当前 SQLite 文件。恢复失败会保留原数据库并在页面显示结果。
+
+离线授权失效时，入库、质检、凑单、出库和退回仍由 Rust 命令拒绝；库存只读查询、备份、恢复和一次性升级导出保持可用，避免用户因授权问题无法取回自己的数据。

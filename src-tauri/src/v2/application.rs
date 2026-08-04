@@ -786,7 +786,7 @@ impl OfflineDatabase {
 }
 
 impl InventoryStatusSummary {
-    fn add(&mut self, status: InventoryStatus, count: u64) {
+    pub(crate) fn add(&mut self, status: InventoryStatus, count: u64) {
         match status {
             InventoryStatus::Received => self.received += count,
             InventoryStatus::Available => self.available += count,
@@ -802,7 +802,7 @@ impl InventoryStatusSummary {
 }
 
 impl QualityStatusSummary {
-    fn add(&mut self, status: QualityStatus, count: u64) {
+    pub(crate) fn add(&mut self, status: QualityStatus, count: u64) {
         match status {
             QualityStatus::Untested => self.untested += count,
             QualityStatus::Testing => self.testing += count,
@@ -1701,7 +1701,7 @@ mod tests {
             .await
             .expect("post receipt before archive");
         database
-            .mark_read_only("export-1", "checksum-1")
+            .mark_read_only("export-1", &"a".repeat(64))
             .await
             .expect("archive workspace");
         assert!(database.is_read_only().await.expect("read archive marker"));

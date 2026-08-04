@@ -4,12 +4,20 @@
 //! service owns permission names and derives tenant actors from bearer
 //! sessions, so clients cannot forge authorization context in business DTOs.
 
-use super::application::{PostReceiptResponse, ReceiptUnit};
+use super::application::{
+    InventoryListItem, InventoryListQuery, InventoryListResponse, InventorySummaryQuery,
+    InventorySummaryResponse, PostReceiptResponse, ReceiptUnit,
+};
 use super::auth::{
     authenticate_password, issue_session, revoke_session, rotate_refresh_token, AuthError,
     LockoutPolicy, PasswordService, SessionPolicy,
 };
 use super::postgres::{NetworkDatabase, NetworkDatabaseError};
+use super::upgrade::{
+    import_to_postgres, stage_network_upgrade_request, ImportOutcome, NetworkUpgradeImportRequest,
+    NetworkUpgradeImportResponse, NetworkUpgradeImportStatus, NetworkUpgradeTarget,
+    PgUpgradeAdapter, PgUpgradeError, PostgresImportError, UpgradeError,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
@@ -20,6 +28,8 @@ use uuid::Uuid;
 
 pub const PERMISSION_NETWORK_ACCESS: &str = "inventory.access";
 pub const PERMISSION_RECEIPT_WRITE: &str = "inventory.receipt.write";
+pub const PERMISSION_INVENTORY_READ: &str = PERMISSION_NETWORK_ACCESS;
+pub const PERMISSION_UPGRADE_IMPORT: &str = "inventory.upgrade.import";
 const RECEIPT_SCOPE: &str = "post_inbound_receipt";
 
 #[derive(Clone)]
@@ -38,6 +48,21 @@ impl NetworkService {
             lockout_policy: LockoutPolicy::default(),
             session_policy: SessionPolicy::default(),
         })
+    }
+
+    /// Expose the storage boundary to sibling network operation modules.
+    /// Authentication and authorization still happen through
+    /// `begin_authorized_request`; callers cannot obtain an unscoped pool
+    /// from this accessor.
+    pub(crate) fn database(&self) -> &NetworkDatabase {
+        &self.database
+    }
+
+    pub async fn readiness(&self) -> NetworkResult<()> {
+        sqlx::query("SELECT 1")
+            .execute(self.database.pool())
+            .await?;
+        Ok(())
     }
 
     pub async fn login(&self, request: LoginRequest) -> NetworkResult<LoginResponse> {
@@ -259,6 +284,84 @@ impl NetworkService {
         Ok(response)
     }
 
+    /// Import a complete offline package and return the exact source identity
+    /// that the desktop must verify before archiving its SQLite workspace.
+    pub async fn import_upgrade_package(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        request: NetworkUpgradeImportRequest,
+    ) -> NetworkResult<NetworkUpgradeImportResponse> {
+        let target_workspace_id = request.target_workspace_id;
+        let staged = tokio::task::spawn_blocking(move || stage_network_upgrade_request(request))
+            .await
+            .map_err(|error| {
+                NetworkServiceError::Upgrade(format!(
+                    "upgrade package staging worker failed: {error}"
+                ))
+            })?
+            .map_err(map_upgrade_upload_error)?;
+
+        // Resolve the actor only from the bearer session. The concrete adapter
+        // authenticates the same token again inside the actual import
+        // transaction, closing any authorization race before live writes.
+        let actor_id = self
+            .authorize_upgrade_import(tenant_id, session_token)
+            .await?;
+        let adapter = PgUpgradeAdapter::new(
+            &self.database,
+            tenant_id,
+            session_token,
+            PERMISSION_UPGRADE_IMPORT,
+        );
+        let package = staged.package();
+        let outcome = import_to_postgres(
+            &adapter,
+            package,
+            NetworkUpgradeTarget {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: target_workspace_id.to_string(),
+                actor_id: actor_id.to_string(),
+            },
+        )
+        .await
+        .map_err(map_postgres_import_error)?;
+        let (status, imported_at) = match outcome {
+            ImportOutcome::Imported { imported_at, .. } => {
+                (NetworkUpgradeImportStatus::Imported, Some(imported_at))
+            }
+            ImportOutcome::AlreadyImported { imported_at, .. } => (
+                NetworkUpgradeImportStatus::AlreadyImported,
+                Some(imported_at),
+            ),
+        };
+        Ok(NetworkUpgradeImportResponse {
+            status,
+            export_id: package.manifest.export_id.clone(),
+            migration_id: package.manifest.migration_id.clone(),
+            checksum: package.package_checksum.clone(),
+            imported_at,
+            entity_counts: package.entity_counts.clone(),
+        })
+    }
+
+    /// Authenticate the import permission without consuming a request body.
+    /// The Axum route uses this before allocating memory for the bounded upload;
+    /// the adapter repeats authorization in the write transaction.
+    pub async fn authorize_upgrade_import(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+    ) -> NetworkResult<Uuid> {
+        let principal = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_UPGRADE_IMPORT)
+            .await?;
+        let actor_id = principal.session().identity.user_id;
+        principal.rollback().await?;
+        Ok(actor_id)
+    }
+
     pub async fn refresh(&self, request: RefreshRequest) -> NetworkResult<RefreshResponse> {
         let refresh_token = required("refresh_token", request.refresh_token)?;
         let (identity, session) = rotate_refresh_token(
@@ -290,6 +393,235 @@ impl NetworkService {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn list_warehouses(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+    ) -> NetworkResult<Vec<NetworkWarehouse>> {
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT w.id AS warehouse_id, w.code AS warehouse_code,
+                   w.name AS warehouse_name,
+                   receiving.id AS receiving_location_id,
+                   receiving.code AS receiving_location_code,
+                   receiving.name AS receiving_location_name
+              FROM warehouses w
+              JOIN LATERAL (
+                    SELECT l.id, l.code, l.name
+                      FROM locations l
+                     WHERE l.tenant_id = w.tenant_id
+                       AND l.warehouse_id = w.id
+                       AND l.kind = 'receiving'
+                     ORDER BY l.code, l.id
+                     LIMIT 1
+              ) receiving ON TRUE
+             WHERE w.tenant_id = $1
+             ORDER BY lower(w.name), w.code, w.id
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut **authorized.sqlx_transaction())
+        .await?;
+        let warehouses = rows
+            .into_iter()
+            .map(|row| {
+                Ok(NetworkWarehouse {
+                    warehouse_id: row.try_get("warehouse_id")?,
+                    warehouse_code: row.try_get("warehouse_code")?,
+                    warehouse_name: row.try_get("warehouse_name")?,
+                    receiving_location_id: row.try_get("receiving_location_id")?,
+                    receiving_location_code: row.try_get("receiving_location_code")?,
+                    receiving_location_name: row.try_get("receiving_location_name")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        authorized.commit().await?;
+        Ok(warehouses)
+    }
+
+    pub async fn list_inventory(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        query: InventoryListQuery,
+    ) -> NetworkResult<InventoryListResponse> {
+        let search = query
+            .search
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("%{value}%"));
+        let owner_party_id = parse_optional_uuid("owner_party_id", query.owner_party_id)?;
+        let sku_id = parse_optional_uuid("sku_id", query.sku_id)?;
+        let inventory_status = query.inventory_status.map(|value| value.to_string());
+        let quality_status = query.quality_status.map(|value| value.to_string());
+        let limit = query.limit.unwrap_or(100).clamp(1, 500);
+        let offset = query.offset.unwrap_or(0);
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+              FROM inventory_units iu
+              JOIN inbound_receipt_lines irl
+                ON irl.tenant_id = iu.tenant_id AND irl.id = iu.inbound_receipt_line_id
+              JOIN inbound_receipts ir
+                ON ir.tenant_id = irl.tenant_id AND ir.id = irl.receipt_id
+              JOIN business_parties bp
+                ON bp.tenant_id = iu.tenant_id AND bp.id = iu.owner_party_id
+              JOIN skus s ON s.tenant_id = iu.tenant_id AND s.id = iu.sku_id
+             WHERE iu.tenant_id = $1
+               AND ($2 IS NULL OR iu.barcode ILIKE $2 OR ir.receipt_no ILIKE $2
+                    OR bp.display_name ILIKE $2 OR s.code ILIKE $2 OR s.name ILIKE $2)
+               AND ($3 IS NULL OR iu.owner_party_id = $3)
+               AND ($4 IS NULL OR iu.sku_id = $4)
+               AND ($5 IS NULL OR iu.inventory_status = $5)
+               AND ($6 IS NULL OR iu.quality_status = $6)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&search)
+        .bind(owner_party_id)
+        .bind(sku_id)
+        .bind(&inventory_status)
+        .bind(&quality_status)
+        .fetch_one(&mut **transaction)
+        .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT iu.id AS inventory_unit_id, iu.barcode,
+                   ir.id AS receipt_id, ir.receipt_no,
+                   iu.owner_party_id, bp.display_name AS owner_name,
+                   iu.sku_id, s.code AS sku_code, s.name AS sku_name,
+                   iu.location_id, l.code AS location_code, l.name AS location_name,
+                   iu.inventory_status, iu.quality_status, iu.version,
+                   iu.received_at::text AS received_at,
+                   iu.updated_at::text AS updated_at
+              FROM inventory_units iu
+              JOIN inbound_receipt_lines irl
+                ON irl.tenant_id = iu.tenant_id AND irl.id = iu.inbound_receipt_line_id
+              JOIN inbound_receipts ir
+                ON ir.tenant_id = irl.tenant_id AND ir.id = irl.receipt_id
+              JOIN business_parties bp
+                ON bp.tenant_id = iu.tenant_id AND bp.id = iu.owner_party_id
+              JOIN skus s ON s.tenant_id = iu.tenant_id AND s.id = iu.sku_id
+              JOIN locations l ON l.tenant_id = iu.tenant_id AND l.id = iu.location_id
+             WHERE iu.tenant_id = $1
+               AND ($2 IS NULL OR iu.barcode ILIKE $2 OR ir.receipt_no ILIKE $2
+                    OR bp.display_name ILIKE $2 OR s.code ILIKE $2 OR s.name ILIKE $2)
+               AND ($3 IS NULL OR iu.owner_party_id = $3)
+               AND ($4 IS NULL OR iu.sku_id = $4)
+               AND ($5 IS NULL OR iu.inventory_status = $5)
+               AND ($6 IS NULL OR iu.quality_status = $6)
+             ORDER BY iu.received_at DESC, iu.id DESC
+             LIMIT $7 OFFSET $8
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&search)
+        .bind(owner_party_id)
+        .bind(sku_id)
+        .bind(&inventory_status)
+        .bind(&quality_status)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&mut **transaction)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let inventory_status: String = row.try_get("inventory_status")?;
+            let quality_status: String = row.try_get("quality_status")?;
+            let version: i64 = row.try_get("version")?;
+            items.push(InventoryListItem {
+                inventory_unit_id: row.try_get::<Uuid, _>("inventory_unit_id")?.to_string(),
+                barcode: row.try_get("barcode")?,
+                receipt_id: row.try_get::<Uuid, _>("receipt_id")?.to_string(),
+                receipt_no: row.try_get("receipt_no")?,
+                owner_party_id: row.try_get::<Uuid, _>("owner_party_id")?.to_string(),
+                owner_name: row.try_get("owner_name")?,
+                sku_id: row.try_get::<Uuid, _>("sku_id")?.to_string(),
+                sku_code: row.try_get("sku_code")?,
+                sku_name: row.try_get("sku_name")?,
+                location_id: row.try_get::<Uuid, _>("location_id")?.to_string(),
+                location_code: row.try_get("location_code")?,
+                location_name: row.try_get("location_name")?,
+                inventory_status: serde_json::from_value(serde_json::Value::String(
+                    inventory_status,
+                ))
+                .map_err(|error| NetworkServiceError::Invalid(error.to_string()))?,
+                quality_status: serde_json::from_value(serde_json::Value::String(quality_status))
+                    .map_err(|error| NetworkServiceError::Invalid(error.to_string()))?,
+                version: u64::try_from(version).map_err(|_| {
+                    NetworkServiceError::Invalid("invalid inventory version".to_owned())
+                })?,
+                received_at: row.try_get("received_at")?,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+        authorized.commit().await?;
+        Ok(InventoryListResponse {
+            items,
+            total: u64::try_from(total)
+                .map_err(|_| NetworkServiceError::Invalid("invalid inventory total".to_owned()))?,
+            limit,
+            offset,
+        })
+    }
+
+    pub async fn inventory_summary(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        query: InventorySummaryQuery,
+    ) -> NetworkResult<InventorySummaryResponse> {
+        let owner_party_id = parse_optional_uuid("owner_party_id", query.owner_party_id)?;
+        let sku_id = parse_optional_uuid("sku_id", query.sku_id)?;
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let rows = sqlx::query(
+            r#"
+            SELECT inventory_status, quality_status, COUNT(*) AS unit_count
+              FROM inventory_units
+             WHERE tenant_id = $1
+               AND ($2 IS NULL OR owner_party_id = $2)
+               AND ($3 IS NULL OR sku_id = $3)
+             GROUP BY inventory_status, quality_status
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(owner_party_id)
+        .bind(sku_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let mut summary = InventorySummaryResponse::default();
+        for row in rows {
+            let count: i64 = row.try_get("unit_count")?;
+            let inventory_status: String = row.try_get("inventory_status")?;
+            let quality_status: String = row.try_get("quality_status")?;
+            let inventory_status =
+                serde_json::from_value(serde_json::Value::String(inventory_status))
+                    .map_err(|error| NetworkServiceError::Invalid(error.to_string()))?;
+            let quality_status = serde_json::from_value(serde_json::Value::String(quality_status))
+                .map_err(|error| NetworkServiceError::Invalid(error.to_string()))?;
+            let count = u64::try_from(count)
+                .map_err(|_| NetworkServiceError::Invalid("invalid inventory count".to_owned()))?;
+            summary.total_units += count;
+            summary.inventory.add(inventory_status, count);
+            summary.quality.add(quality_status, count);
+        }
+        authorized.commit().await?;
+        Ok(summary)
     }
 }
 
@@ -346,6 +678,16 @@ pub struct NetworkPostReceiptRequest {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NetworkWarehouse {
+    pub warehouse_id: Uuid,
+    pub warehouse_code: String,
+    pub warehouse_name: String,
+    pub receiving_location_id: Uuid,
+    pub receiving_location_code: String,
+    pub receiving_location_name: String,
+}
+
 #[derive(Debug, Error)]
 pub enum NetworkServiceError {
     #[error("invalid network request: {0}")]
@@ -360,9 +702,58 @@ pub enum NetworkServiceError {
     Sqlx(#[from] sqlx::Error),
     #[error("network response JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("network upgrade failed: {0}")]
+    Upgrade(String),
 }
 
 pub type NetworkResult<T> = Result<T, NetworkServiceError>;
+
+fn map_upgrade_upload_error(error: UpgradeError) -> NetworkServiceError {
+    match error {
+        UpgradeError::InvalidRequest(reason)
+        | UpgradeError::UnsafePath(reason)
+        | UpgradeError::Incompatible(reason)
+        | UpgradeError::Integrity(reason)
+        | UpgradeError::Data(reason) => NetworkServiceError::Invalid(reason),
+        UpgradeError::Json { source, .. } => NetworkServiceError::Invalid(source.to_string()),
+        UpgradeError::Io { .. } | UpgradeError::Sqlite(_) | UpgradeError::DestinationExists(_) => {
+            NetworkServiceError::Upgrade(error.to_string())
+        }
+    }
+}
+
+fn map_postgres_import_error(error: PostgresImportError<PgUpgradeError>) -> NetworkServiceError {
+    match error {
+        PostgresImportError::StagingRejected(reason) => NetworkServiceError::Invalid(reason),
+        PostgresImportError::IdempotencyConflict { migration_id, .. } => {
+            NetworkServiceError::Conflict {
+                entity: "upgrade_package".to_owned(),
+                key: migration_id,
+            }
+        }
+        PostgresImportError::Adapter(PgUpgradeError::Auth(error)) => {
+            NetworkServiceError::Auth(error)
+        }
+        PostgresImportError::Adapter(PgUpgradeError::Sqlx(error)) => {
+            NetworkServiceError::Sqlx(error)
+        }
+        PostgresImportError::Adapter(PgUpgradeError::Data(reason)) => {
+            NetworkServiceError::Invalid(reason)
+        }
+        PostgresImportError::Adapter(PgUpgradeError::TargetOccupied(reason)) => {
+            NetworkServiceError::Conflict {
+                entity: "upgrade_target".to_owned(),
+                key: reason,
+            }
+        }
+        PostgresImportError::Adapter(PgUpgradeError::IdempotencyConflict {
+            migration_id, ..
+        }) => NetworkServiceError::Conflict {
+            entity: "upgrade_package".to_owned(),
+            key: migration_id,
+        },
+    }
+}
 
 fn normalize_receipt(
     mut request: NetworkPostReceiptRequest,
@@ -371,7 +762,7 @@ fn normalize_receipt(
     request.idempotency_key = required("idempotency_key", request.idempotency_key)?;
     request.receipt_no = required("receipt_no", request.receipt_no)?;
     request.owner_name = required("owner_name", request.owner_name)?;
-    request.sku_code = required("sku_code", request.sku_code)?;
+    request.sku_code = required("sku_code", request.sku_code)?.to_uppercase();
     request.sku_name = required("sku_name", request.sku_name)?;
     request.received_at = required("received_at", request.received_at)?;
     if request.barcodes.is_empty() {
@@ -383,7 +774,7 @@ fn normalize_receipt(
     request.barcodes = request
         .barcodes
         .into_iter()
-        .map(|barcode| required("barcode", barcode))
+        .map(|barcode| required("barcode", barcode).map(|barcode| barcode.to_uppercase()))
         .collect::<NetworkResult<_>>()?;
     for barcode in &request.barcodes {
         if !seen.insert(barcode.clone()) {
@@ -404,6 +795,16 @@ fn required(field: &str, value: String) -> NetworkResult<String> {
     } else {
         Ok(value)
     }
+}
+
+fn parse_optional_uuid(field: &str, value: Option<String>) -> NetworkResult<Option<Uuid>> {
+    value
+        .map(|value| {
+            Uuid::parse_str(value.trim()).map_err(|error| {
+                NetworkServiceError::Invalid(format!("{field} is not a UUID: {error}"))
+            })
+        })
+        .transpose()
 }
 
 async fn ensure_warehouse_and_receiving_location(

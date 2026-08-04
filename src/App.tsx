@@ -1012,12 +1012,18 @@ function App() {
     );
   }
 
-  if (!activationStatus?.activated) {
-    return renderActivationScreen();
+  if (useV2Workspace) {
+    return (
+      <InventoryWorkspace
+        offlineActivated={Boolean(activationStatus?.activated)}
+        onRequestActivation={() => setUseV2Workspace(false)}
+        onBackToLegacy={() => setUseV2Workspace(false)}
+      />
+    );
   }
 
-  if (useV2Workspace) {
-    return <InventoryWorkspace onBackToLegacy={() => setUseV2Workspace(false)} />;
+  if (!activationStatus?.activated) {
+    return renderActivationScreen();
   }
 
   return (

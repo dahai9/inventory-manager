@@ -861,6 +861,7 @@ impl OfflineDatabase {
         for row in &rows {
             let unit_id: String = row.try_get("unit_id").map_err(row_error)?;
             let line_id: String = row.try_get("shipment_line_id").map_err(row_error)?;
+            let allocation_id: String = row.try_get("allocation_id").map_err(row_error)?;
             let version: i64 = row.try_get("version").map_err(row_error)?;
             let status: String = row.try_get("inventory_status").map_err(row_error)?;
             if !matches!(status.as_str(), "shipped" | "delivered") {
@@ -870,6 +871,13 @@ impl OfflineDatabase {
             }
             sqlx::query("INSERT INTO outbound_return_lines (id, workspace_id, return_batch_id, outbound_shipment_line_id, inventory_unit_id, reason, disposition, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantine', ?7)")
                 .bind(new_id()).bind(&workspace_id).bind(&batch_id).bind(&line_id).bind(&unit_id).bind(&request.reason).bind(&now).execute(&mut *tx).await.map_err(|error| unique_or_storage("insert outbound return line", error))?;
+            let released = sqlx::query("UPDATE outbound_allocations SET status = 'released', released_at = ?1 WHERE workspace_id = ?2 AND id = ?3 AND status = 'shipped'")
+                .bind(&now).bind(&workspace_id).bind(&allocation_id).execute(&mut *tx).await.map_err(|error| storage("release returned allocation", error))?;
+            if released.rows_affected() != 1 {
+                return Err(OutboundError::Conflict(
+                    "returned allocation is not in shipped state".to_owned(),
+                ));
+            }
             let updated = sqlx::query("UPDATE inventory_units SET inventory_status = 'quarantined', location_id = ?1, version = version + 1, updated_at = ?2 WHERE workspace_id = ?3 AND id = ?4 AND version = ?5 AND inventory_status IN ('shipped', 'delivered')")
                 .bind(self.quarantine_location_id()).bind(&now).bind(&workspace_id).bind(&unit_id).bind(version).execute(&mut *tx).await.map_err(|error| storage("quarantine returned unit", error))?;
             if updated.rows_affected() != 1 {
@@ -1020,7 +1028,7 @@ async fn load_returnable_lines(
     shipment_id: &str,
     selected: &[String],
 ) -> OutboundResult<Vec<sqlx::sqlite::SqliteRow>> {
-    let rows = sqlx::query("SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, iu.inventory_status, iu.version FROM outbound_shipment_lines osl JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status IN ('shipped', 'delivered') AND NOT EXISTS (SELECT 1 FROM outbound_return_lines rl WHERE rl.outbound_shipment_line_id = osl.id AND rl.workspace_id = osl.workspace_id)")
+    let rows = sqlx::query("SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, osl.outbound_allocation_id AS allocation_id, iu.inventory_status, iu.version FROM outbound_shipment_lines osl JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status IN ('shipped', 'delivered') AND NOT EXISTS (SELECT 1 FROM outbound_return_lines rl WHERE rl.outbound_shipment_line_id = osl.id AND rl.workspace_id = osl.workspace_id)")
         .bind(workspace_id).bind(shipment_id).fetch_all(&mut **tx).await.map_err(|error| storage("load returnable shipment lines", error))?;
     if selected.is_empty() {
         return Ok(rows);
@@ -1536,6 +1544,88 @@ mod tests {
             .expect("details");
         assert_eq!(details.lines[0].shipped_quantity, 2);
         assert_eq!(details.status, "completed");
+        let trace = database
+            .inventory_trace(&shipment.items[0].barcode)
+            .await
+            .expect("inventory trace");
+        assert_eq!(trace.owner_name, "Owner A");
+        assert_eq!(trace.receipt_no, "R-ONE");
+        assert_eq!(trace.inspections.len(), 1);
+        assert_eq!(trace.outbound.len(), 1);
+        assert_eq!(trace.outbound[0].order_no, "O-1");
+        assert_eq!(trace.outbound[0].shipment_no.as_deref(), Some("S-1"));
+        assert_eq!(
+            trace.outbound[0].confirmation_code.as_deref(),
+            Some("UPSTREAM-1")
+        );
+        assert_eq!(trace.outbound[0].return_no.as_deref(), Some("RT-1"));
+        database
+            .complete_inspection(CompleteInspectionRequest {
+                request_id: "retest-after-return".to_owned(),
+                idempotency_key: "retest-after-return-key".to_owned(),
+                inspection_no: "Q-RETURN-1".to_owned(),
+                inspection_kind: InspectionKind::Retest,
+                inspector_id: "qc".to_owned(),
+                inspected_at: "2026-08-01T01:05:00Z".to_owned(),
+                results: vec![InspectionResultInput {
+                    barcode: shipment.items[0].barcode.clone(),
+                    outcome: QualityOutcome::Passed,
+                    defect_code: None,
+                    measurements: json!({}),
+                    notes: Some("return retest passed".to_owned()),
+                }],
+            })
+            .await
+            .expect("retest returned unit");
+        let second_order = database
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "order-two".to_owned(),
+                idempotency_key: "order-two-key".to_owned(),
+                order_no: "O-2".to_owned(),
+                upstream_receiver_name: "Upstream Two".to_owned(),
+                sku_code: "SKU-X".to_owned(),
+                sku_name: "Model X".to_owned(),
+                required_quantity: 1,
+                required_at: None,
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("second order");
+        let second_allocation = database
+            .allocate_outbound_order(AllocateOutboundRequest {
+                request_id: "alloc-two".to_owned(),
+                idempotency_key: "alloc-two-key".to_owned(),
+                order_id: second_order.order_id.clone(),
+                order_line_id: second_order.order_line_id.clone(),
+                barcodes: vec![shipment.items[0].barcode.clone()],
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("allocate returned unit again");
+        let second_shipment = database
+            .ship_outbound_order(ShipOutboundRequest {
+                request_id: "ship-two".to_owned(),
+                idempotency_key: "ship-two-key".to_owned(),
+                order_id: second_order.order_id,
+                shipment_no: "S-2".to_owned(),
+                allocation_ids: vec![second_allocation.allocations[0].allocation_id.clone()],
+                barcodes: Vec::new(),
+                shipped_at: "2026-08-01T01:06:00Z".to_owned(),
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("ship returned unit again");
+        assert_eq!(second_shipment.shipped_count, 1);
+        let repeated_trace = database
+            .inventory_trace(&shipment.items[0].barcode)
+            .await
+            .expect("repeated shipment trace");
+        assert_eq!(repeated_trace.inspections.len(), 2);
+        assert_eq!(repeated_trace.outbound.len(), 2);
+        assert_eq!(
+            repeated_trace.outbound[1].shipment_no.as_deref(),
+            Some("S-2")
+        );
         let _ = std::fs::remove_file(path);
     }
 }

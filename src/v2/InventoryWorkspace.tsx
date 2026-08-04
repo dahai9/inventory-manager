@@ -6,22 +6,28 @@ import {
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   Boxes,
   CheckCircle2,
   ClipboardCheck,
   Gauge,
+  LogOut,
   PackagePlus,
   RefreshCw,
   Search,
+  Settings,
   ShieldAlert,
   Truck,
+  Warehouse,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import "./InventoryWorkspace.css";
 
-type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound";
+type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound" | "settings";
+type WorkspaceMode = "offline" | "network";
 type InventoryStatus =
   | "received"
   | "available"
@@ -39,6 +45,8 @@ type Notice = { type: "success" | "error"; text: string };
 
 export interface InventoryWorkspaceProps {
   onBackToLegacy?: () => void;
+  onRequestActivation?: () => void;
+  offlineActivated?: boolean;
   actorId?: string;
 }
 
@@ -52,6 +60,20 @@ interface PostReceiptRequest {
   source_reference: string | null;
   received_at: string;
   actor_id: string;
+  barcodes: string[];
+  notes: string | null;
+}
+
+interface NetworkPostReceiptRequest {
+  request_id: string;
+  idempotency_key: string;
+  receipt_no: string;
+  owner_name: string;
+  sku_code: string;
+  sku_name: string;
+  warehouse_id: string;
+  source_reference: string | null;
+  received_at: string;
   barcodes: string[];
   notes: string | null;
 }
@@ -86,6 +108,15 @@ interface CompleteInspectionRequest {
   inspection_no: string;
   inspection_kind: InspectionKind;
   inspector_id: string;
+  inspected_at: string;
+  results: InspectionResultInput[];
+}
+
+interface NetworkCompleteInspectionRequest {
+  request_id: string;
+  idempotency_key: string;
+  inspection_no: string;
+  inspection_kind: InspectionKind;
   inspected_at: string;
   results: InspectionResultInput[];
 }
@@ -147,6 +178,47 @@ interface InventoryListResponse {
   offset: number;
 }
 
+interface InventoryTrace {
+  inventory_unit_id: string;
+  barcode: string;
+  owner_party_id: string;
+  owner_name: string;
+  sku_id: string;
+  sku_code: string;
+  sku_name: string;
+  receipt_id: string;
+  receipt_no: string;
+  received_at: string;
+  inventory_status: InventoryStatus;
+  quality_status: QualityStatus;
+  inspections: Array<{
+    inspection_no: string;
+    inspection_type: InspectionKind;
+    result: QualityOutcome;
+    inspected_at: string;
+    defect_code: string | null;
+    notes: string | null;
+  }>;
+  outbound: Array<{
+    allocation_id: string;
+    allocation_status: string;
+    allocated_at: string;
+    order_id: string;
+    order_no: string;
+    upstream_receiver_name: string;
+    shipment_id: string | null;
+    shipment_no: string | null;
+    shipped_at: string | null;
+    confirmation_code: string | null;
+    confirmed_at: string | null;
+    delivery_result: string | null;
+    return_no: string | null;
+    returned_at: string | null;
+    return_reason: string | null;
+    return_disposition: string | null;
+  }>;
+}
+
 interface InventoryStatusSummary {
   received: number;
   available: number;
@@ -183,6 +255,55 @@ interface CreateOutboundOrderRequest {
   required_quantity: number;
   required_at: string | null;
   actor_id: string;
+}
+
+interface NetworkCreateOutboundOrderRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_no: string;
+  upstream_receiver_name: string;
+  sku_code: string;
+  sku_name: string;
+  required_quantity: number;
+  required_at: string | null;
+}
+
+interface NetworkAllocateOutboundRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_id: string;
+  order_line_id: string;
+  barcodes: string[];
+}
+
+interface NetworkShipOutboundRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_id: string;
+  shipment_no: string;
+  allocation_ids: string[];
+  barcodes: string[];
+  shipped_at: string;
+}
+
+interface NetworkConfirmOutboundDeliveryRequest {
+  request_id: string;
+  idempotency_key: string;
+  shipment_id: string;
+  confirmation_code: string;
+  shipment_line_ids: string[];
+  confirmed_at: string;
+  notes: string | null;
+}
+
+interface NetworkReturnOutboundShipmentRequest {
+  request_id: string;
+  idempotency_key: string;
+  shipment_id: string;
+  shipment_line_ids: string[];
+  return_no: string;
+  returned_at: string;
+  reason: string;
 }
 
 interface CreateOutboundOrderResponse {
@@ -243,6 +364,60 @@ interface ReturnOutboundShipmentResponse {
   idempotent_replay: boolean;
 }
 
+interface NetworkStatus {
+  configured: boolean;
+  base_url: string | null;
+  authenticated: boolean;
+  tenant_id: string | null;
+  user_id: string | null;
+  session_expires_in_seconds: number | null;
+}
+
+interface NetworkWarehouse {
+  warehouse_id: string;
+  warehouse_code: string;
+  warehouse_name: string;
+  receiving_location_id: string;
+  receiving_location_code: string;
+  receiving_location_name: string;
+}
+
+interface BackupMetadata {
+  source_instance_id: string;
+  source_workspace_id: string;
+  exported_at: string;
+  database_bytes: number;
+  database_sha256: string;
+}
+
+interface RestoreReport {
+  status: "restored" | "failed";
+  requested_at: string;
+  completed_at: string;
+  source_workspace_id: string | null;
+  backup_exported_at: string | null;
+  pre_restore_backup: string | null;
+  error: string | null;
+}
+
+interface UpgradeExportOutput {
+  path: string;
+  export_id: string;
+  checksum: string;
+}
+
+interface UpgradeImportOutput {
+  import: {
+    status: "imported" | "already_imported";
+    export_id: string;
+    migration_id: string;
+    checksum: string;
+    imported_at: string | null;
+    entity_counts: Record<string, number>;
+  };
+  local_archived: boolean;
+}
+
 interface NavigationItem {
   id: WorkspacePage;
   label: string;
@@ -256,6 +431,7 @@ const navigationItems: NavigationItem[] = [
   { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck },
   { id: "inventory", label: "库存", description: "单件库存查询", icon: Boxes },
   { id: "outbound", label: "出库", description: "凑单交货与退回", icon: Truck },
+  { id: "settings", label: "数据与设置", description: "备份、恢复和升级", icon: Settings },
 ];
 
 const inventoryStatusLabels: Record<InventoryStatus, string> = {
@@ -330,6 +506,27 @@ function getDefaultActorId(): string {
   return created;
 }
 
+function getStoredNetworkValue(key: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function getNetworkDeviceId(): string {
+  const storageKey = "inventory-v2-network-device-id";
+  const existing = getStoredNetworkValue(storageKey);
+  if (existing) return existing;
+  const created = createId();
+  try {
+    window.localStorage.setItem(storageKey, created);
+  } catch {
+    // The server accepts a fresh device id when local storage is unavailable.
+  }
+  return created;
+}
+
 function emptyInventoryQuery(): InventoryListQuery {
   return {
     search: null,
@@ -344,10 +541,25 @@ function emptyInventoryQuery(): InventoryListQuery {
 
 export default function InventoryWorkspace({
   onBackToLegacy,
+  onRequestActivation,
+  offlineActivated = true,
   actorId,
 }: InventoryWorkspaceProps) {
   const [page, setPage] = useState<WorkspacePage>("overview");
+  const [mode, setMode] = useState<WorkspaceMode>(offlineActivated ? "offline" : "network");
   const [resolvedActorId] = useState(() => actorId?.trim() || getDefaultActorId());
+
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus | null>(null);
+  const [networkBaseUrl, setNetworkBaseUrl] = useState(() => getStoredNetworkValue("inventory-v2-network-url"));
+  const [networkTenantId, setNetworkTenantId] = useState(() => getStoredNetworkValue("inventory-v2-network-tenant"));
+  const [networkLogin, setNetworkLogin] = useState("");
+  const [networkPassword, setNetworkPassword] = useState("");
+  const [networkWarehouseId, setNetworkWarehouseId] = useState(() => getStoredNetworkValue("inventory-v2-network-warehouse"));
+  const [networkWarehouses, setNetworkWarehouses] = useState<NetworkWarehouse[]>([]);
+  const [networkWarehousesLoading, setNetworkWarehousesLoading] = useState(false);
+  const [networkWarehousesError, setNetworkWarehousesError] = useState<string | null>(null);
+  const [networkAuthLoading, setNetworkAuthLoading] = useState(false);
+  const [networkAuthNotice, setNetworkAuthNotice] = useState<Notice | null>(null);
 
   const [dashboard, setDashboard] = useState<DashboardDto | null>(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
@@ -375,6 +587,10 @@ export default function InventoryWorkspace({
   const [inventoryTotal, setInventoryTotal] = useState(0);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
+  const [inventoryTrace, setInventoryTrace] = useState<InventoryTrace | null>(null);
+  const [inventoryTraceBarcode, setInventoryTraceBarcode] = useState<string | null>(null);
+  const [inventoryTraceLoading, setInventoryTraceLoading] = useState(false);
+  const [inventoryTraceError, setInventoryTraceError] = useState<string | null>(null);
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryStatus, setInventoryStatus] = useState<InventoryStatus | "">("");
   const [qualityStatus, setQualityStatus] = useState<QualityStatus | "">("");
@@ -394,6 +610,14 @@ export default function InventoryWorkspace({
   const [outboundAllocation, setOutboundAllocation] = useState<AllocateOutboundResponse | null>(null);
   const [outboundShipment, setOutboundShipment] = useState<ShipOutboundResponse | null>(null);
 
+  const [dataOperationLoading, setDataOperationLoading] = useState(false);
+  const [dataNotice, setDataNotice] = useState<Notice | null>(null);
+  const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
+  const [upgradePackagePath, setUpgradePackagePath] = useState("");
+  const [upgradeTargetWorkspaceId, setUpgradeTargetWorkspaceId] = useState("");
+  const [upgradeExport, setUpgradeExport] = useState<UpgradeExportOutput | null>(null);
+  const [upgradeImport, setUpgradeImport] = useState<UpgradeImportOutput | null>(null);
+
   const barcodes = useMemo(
     () => barcodeLines.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
     [barcodeLines],
@@ -405,27 +629,27 @@ export default function InventoryWorkspace({
   }, [inspectionKind, qualityItems]);
 
   const refreshDashboard = useCallback(async () => {
+    if (mode === "network" && !networkStatus?.authenticated) return;
     setDashboardLoading(true);
     setDashboardError(null);
     try {
-      const response = await invoke<DashboardDto>("v2_get_dashboard", {
-        query: { owner_party_id: null, sku_id: null },
-      });
+      const command = mode === "network" ? "v2_network_get_dashboard" : "v2_get_dashboard";
+      const response = await invoke<DashboardDto>(command, { query: { owner_party_id: null, sku_id: null } });
       setDashboard(response);
     } catch (error) {
       setDashboardError(displayError(error));
     } finally {
       setDashboardLoading(false);
     }
-  }, []);
+  }, [mode, networkStatus?.authenticated]);
 
   const refreshQualityItems = useCallback(async () => {
+    if (mode === "network" && !networkStatus?.authenticated) return;
     setQualityLoading(true);
     setQualityNotice(null);
     try {
-      const response = await invoke<InventoryListResponse>("v2_list_inventory", {
-        query: emptyInventoryQuery(),
-      });
+      const command = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
+      const response = await invoke<InventoryListResponse>(command, { query: emptyInventoryQuery() });
       setQualityItems(
         response.items.filter((item) => item.quality_status === "untested" || item.quality_status === "failed"),
       );
@@ -435,9 +659,10 @@ export default function InventoryWorkspace({
     } finally {
       setQualityLoading(false);
     }
-  }, []);
+  }, [mode, networkStatus?.authenticated]);
 
   const refreshInventory = useCallback(async () => {
+    if (mode === "network" && !networkStatus?.authenticated) return;
     setInventoryLoading(true);
     setInventoryError(null);
     try {
@@ -447,7 +672,8 @@ export default function InventoryWorkspace({
         inventory_status: inventoryStatus || null,
         quality_status: qualityStatus || null,
       };
-      const response = await invoke<InventoryListResponse>("v2_list_inventory", { query });
+      const command = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
+      const response = await invoke<InventoryListResponse>(command, { query });
       setInventoryItems(response.items);
       setInventoryTotal(response.total);
     } catch (error) {
@@ -455,18 +681,138 @@ export default function InventoryWorkspace({
     } finally {
       setInventoryLoading(false);
     }
-  }, [inventorySearch, inventoryStatus, qualityStatus]);
+  }, [inventorySearch, inventoryStatus, qualityStatus, mode, networkStatus?.authenticated]);
+
+  async function openInventoryTrace(barcode: string) {
+    setInventoryTraceBarcode(barcode);
+    setInventoryTrace(null);
+    setInventoryTraceError(null);
+    setInventoryTraceLoading(true);
+    try {
+      const command = mode === "network" ? "v2_network_inventory_trace" : "v2_inventory_trace";
+      setInventoryTrace(await invoke<InventoryTrace>(command, { barcode }));
+    } catch (error) {
+      setInventoryTraceError(displayError(error));
+    } finally {
+      setInventoryTraceLoading(false);
+    }
+  }
+
+  const refreshNetworkWarehouses = useCallback(async () => {
+    if (!networkStatus?.authenticated) {
+      setNetworkWarehouses([]);
+      return;
+    }
+    setNetworkWarehousesLoading(true);
+    setNetworkWarehousesError(null);
+    try {
+      const warehouses = await invoke<NetworkWarehouse[]>("v2_network_list_warehouses");
+      setNetworkWarehouses(warehouses);
+      setNetworkWarehouseId((current) => {
+        const selected = warehouses.some((warehouse) => warehouse.warehouse_id === current)
+          ? current
+          : (warehouses[0]?.warehouse_id ?? "");
+        try {
+          if (selected) window.localStorage.setItem("inventory-v2-network-warehouse", selected);
+        } catch {
+          // The selected warehouse is still kept in component state.
+        }
+        return selected;
+      });
+    } catch (error) {
+      setNetworkWarehouses([]);
+      setNetworkWarehousesError(displayError(error));
+    } finally {
+      setNetworkWarehousesLoading(false);
+    }
+  }, [networkStatus?.authenticated]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<NetworkStatus>("v2_network_status")
+      .then((status) => {
+        if (!cancelled) setNetworkStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setNetworkStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    void invoke<RestoreReport | null>("v2_offline_restore_report")
+      .then(setRestoreReport)
+      .catch(() => setRestoreReport(null));
+  }, []);
+
+  useEffect(() => {
+    void refreshNetworkWarehouses();
+  }, [refreshNetworkWarehouses]);
 
   useEffect(() => {
     if (page === "overview") void refreshDashboard();
     if (page === "quality") void refreshQualityItems();
     if (page === "inventory") void refreshInventory();
-  }, [page, refreshDashboard, refreshInventory, refreshQualityItems]);
+  }, [mode, networkStatus?.authenticated, page, refreshDashboard, refreshInventory, refreshQualityItems]);
 
   useEffect(() => {
     setSelectedBarcodes(new Set());
     setQualityNotice(null);
   }, [inspectionKind]);
+
+  function switchMode(nextMode: WorkspaceMode) {
+    setMode(nextMode);
+    setNetworkAuthNotice(null);
+  }
+
+  async function submitNetworkLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setNetworkAuthNotice(null);
+    if (!networkBaseUrl.trim() || !networkTenantId.trim() || !networkLogin.trim() || !networkPassword) {
+      setNetworkAuthNotice({ type: "error", text: "请填写 API 地址、租户 ID、账号和密码。" });
+      return;
+    }
+    setNetworkAuthLoading(true);
+    try {
+      const status = await invoke<NetworkStatus>("v2_network_login", {
+        baseUrl: networkBaseUrl.trim(),
+        tenantId: networkTenantId.trim(),
+        login: networkLogin.trim(),
+        password: networkPassword,
+        deviceId: getNetworkDeviceId(),
+      });
+      try {
+        window.localStorage.setItem("inventory-v2-network-url", networkBaseUrl.trim().replace(/\/+$/, ""));
+        window.localStorage.setItem("inventory-v2-network-tenant", networkTenantId.trim());
+        if (networkWarehouseId.trim()) window.localStorage.setItem("inventory-v2-network-warehouse", networkWarehouseId.trim());
+      } catch {
+        // Endpoint preferences are optional; credentials remain memory-only.
+      }
+      setNetworkStatus(status);
+      setNetworkPassword("");
+      setNetworkAuthNotice({ type: "success", text: "网络版登录成功，已使用服务端授权和租户权限。" });
+      setPage("overview");
+    } catch (error) {
+      setNetworkAuthNotice({ type: "error", text: `登录失败：${displayError(error)}` });
+    } finally {
+      setNetworkAuthLoading(false);
+    }
+  }
+
+  async function logoutNetwork() {
+    setNetworkAuthLoading(true);
+    try {
+      await invoke<NetworkStatus>("v2_network_logout");
+      setNetworkStatus((current) => current ? { ...current, authenticated: false, tenant_id: null, user_id: null } : current);
+      setNetworkAuthNotice({ type: "success", text: "已退出网络版。" });
+    } catch (error) {
+      setNetworkAuthNotice({ type: "error", text: `退出失败：${displayError(error)}` });
+    } finally {
+      setNetworkAuthLoading(false);
+    }
+  }
 
   async function submitReceipt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -488,7 +834,7 @@ export default function InventoryWorkspace({
     setReceiptLoading(true);
     try {
       const operationId = createId();
-      const request: PostReceiptRequest = {
+      const common = {
         request_id: operationId,
         idempotency_key: `receipt:${operationId}`,
         receipt_no: makeDocumentNumber("RK"),
@@ -497,11 +843,22 @@ export default function InventoryWorkspace({
         sku_name: skuName.trim(),
         source_reference: sourceReference.trim() || null,
         received_at: toUtcIso(receivedAt),
-        actor_id: resolvedActorId,
         barcodes,
         notes: null,
       };
-      const response = await invoke<PostReceiptResponse>("v2_post_receipt", { input: request });
+      let response: PostReceiptResponse;
+      if (mode === "network") {
+        if (!networkWarehouseId.trim()) {
+          throw new Error("网络版入库需要填写默认仓库 ID");
+        }
+        response = await invoke<PostReceiptResponse>("v2_network_post_receipt", {
+          input: { ...common, warehouse_id: networkWarehouseId.trim() } satisfies NetworkPostReceiptRequest,
+        });
+      } else {
+        response = await invoke<PostReceiptResponse>("v2_post_receipt", {
+          input: { ...common, actor_id: resolvedActorId } satisfies PostReceiptRequest,
+        });
+      }
       setReceiptNotice({
         type: "success",
         text: `${response.receipt_no} 已原子入库 ${response.received_count} 件${
@@ -543,12 +900,11 @@ export default function InventoryWorkspace({
     setQualityLoading(true);
     try {
       const operationId = createId();
-      const request: CompleteInspectionRequest = {
+      const common = {
         request_id: operationId,
         idempotency_key: `inspection:${operationId}`,
         inspection_no: makeDocumentNumber("ZJ"),
         inspection_kind: inspectionKind,
-        inspector_id: resolvedActorId,
         inspected_at: new Date().toISOString(),
         results: Array.from(selectedBarcodes).map((barcode) => ({
           barcode,
@@ -558,7 +914,16 @@ export default function InventoryWorkspace({
           notes: inspectionNotes.trim() || null,
         })),
       };
-      const response = await invoke<CompleteInspectionResponse>("v2_complete_inspection", { input: request });
+      let response: CompleteInspectionResponse;
+      if (mode === "network") {
+        response = await invoke<CompleteInspectionResponse>("v2_network_complete_inspection", {
+          input: common satisfies NetworkCompleteInspectionRequest,
+        });
+      } else {
+        response = await invoke<CompleteInspectionResponse>("v2_complete_inspection", {
+          input: { ...common, inspector_id: resolvedActorId } satisfies CompleteInspectionRequest,
+        });
+      }
       setQualityNotice({
         type: "success",
         text: `${response.inspection_no} 已完成：合格 ${response.passed_count} 件，不合格 ${response.failed_count} 件${
@@ -568,9 +933,8 @@ export default function InventoryWorkspace({
       setDefectCode("");
       setInspectionNotes("");
       setSelectedBarcodes(new Set());
-      const listResponse = await invoke<InventoryListResponse>("v2_list_inventory", {
-        query: emptyInventoryQuery(),
-      });
+      const listCommand = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
+      const listResponse = await invoke<InventoryListResponse>(listCommand, { query: emptyInventoryQuery() });
       setQualityItems(
         listResponse.items.filter(
           (item) => item.quality_status === "untested" || item.quality_status === "failed",
@@ -599,19 +963,21 @@ export default function InventoryWorkspace({
     setOutboundLoading(true);
     try {
       const operationId = createId();
-      const response = await invoke<CreateOutboundOrderResponse>("v2_create_outbound_order", {
-        input: {
-          request_id: operationId,
-          idempotency_key: `outbound-order:${operationId}`,
-          order_no: outboundOrderNo.trim(),
-          upstream_receiver_name: outboundReceiver.trim(),
-          sku_code: outboundSkuCode.trim(),
-          sku_name: outboundSkuName.trim(),
-          required_quantity: quantity,
-          required_at: null,
-          actor_id: resolvedActorId,
-        } satisfies CreateOutboundOrderRequest,
-      });
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-order:${operationId}`,
+        order_no: outboundOrderNo.trim(),
+        upstream_receiver_name: outboundReceiver.trim(),
+        sku_code: outboundSkuCode.trim(),
+        sku_name: outboundSkuName.trim(),
+        required_quantity: quantity,
+        required_at: null,
+      };
+      const command = mode === "network" ? "v2_network_create_outbound_order" : "v2_create_outbound_order";
+      const input = mode === "network"
+        ? (common satisfies NetworkCreateOutboundOrderRequest)
+        : ({ ...common, actor_id: resolvedActorId } satisfies CreateOutboundOrderRequest);
+      const response = await invoke<CreateOutboundOrderResponse>(command, { input });
       setOutboundOrder(response);
       setOutboundAllocation(null);
       setOutboundShipment(null);
@@ -632,16 +998,18 @@ export default function InventoryWorkspace({
     setOutboundNotice(null);
     try {
       const operationId = createId();
-      const response = await invoke<AllocateOutboundResponse>("v2_allocate_outbound_order", {
-        input: {
-          request_id: operationId,
-          idempotency_key: `outbound-allocation:${operationId}`,
-          order_id: outboundOrder.order_id,
-          order_line_id: outboundOrder.order_line_id,
-          barcodes: outboundBarcodes.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-          actor_id: resolvedActorId,
-        },
-      });
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-allocation:${operationId}`,
+        order_id: outboundOrder.order_id,
+        order_line_id: outboundOrder.order_line_id,
+        barcodes: outboundBarcodes.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      };
+      const command = mode === "network" ? "v2_network_allocate_outbound_order" : "v2_allocate_outbound_order";
+      const input = mode === "network"
+        ? (common satisfies NetworkAllocateOutboundRequest)
+        : ({ ...common, actor_id: resolvedActorId });
+      const response = await invoke<AllocateOutboundResponse>(command, { input });
       setOutboundAllocation(response);
       setOutboundBarcodes("");
       setOutboundNotice({ type: "success", text: `已分配 ${response.allocated_count} 件，状态：${response.order_status}。` });
@@ -658,18 +1026,20 @@ export default function InventoryWorkspace({
     setOutboundNotice(null);
     try {
       const operationId = createId();
-      const response = await invoke<ShipOutboundResponse>("v2_ship_outbound_order", {
-        input: {
-          request_id: operationId,
-          idempotency_key: `outbound-shipment:${operationId}`,
-          order_id: outboundOrder.order_id,
-          shipment_no: outboundShipmentNo.trim() || makeDocumentNumber("CK"),
-          allocation_ids: outboundAllocation.allocations.map((item) => item.allocation_id),
-          barcodes: [],
-          shipped_at: new Date().toISOString(),
-          actor_id: resolvedActorId,
-        },
-      });
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-shipment:${operationId}`,
+        order_id: outboundOrder.order_id,
+        shipment_no: outboundShipmentNo.trim() || makeDocumentNumber("CK"),
+        allocation_ids: outboundAllocation.allocations.map((item) => item.allocation_id),
+        barcodes: [],
+        shipped_at: new Date().toISOString(),
+      };
+      const command = mode === "network" ? "v2_network_ship_outbound_order" : "v2_ship_outbound_order";
+      const input = mode === "network"
+        ? (common satisfies NetworkShipOutboundRequest)
+        : ({ ...common, actor_id: resolvedActorId });
+      const response = await invoke<ShipOutboundResponse>(command, { input });
       setOutboundShipment(response);
       setOutboundShipmentNo(response.shipment_no);
       setOutboundNotice({ type: "success", text: `${response.shipment_no} 已出库 ${response.shipped_count} 件。` });
@@ -691,18 +1061,20 @@ export default function InventoryWorkspace({
     setOutboundNotice(null);
     try {
       const operationId = createId();
-      const response = await invoke<ConfirmOutboundDeliveryResponse>("v2_confirm_outbound_delivery", {
-        input: {
-          request_id: operationId,
-          idempotency_key: `outbound-delivery:${operationId}`,
-          shipment_id: outboundShipment.shipment_id,
-          confirmation_code: outboundConfirmationCode.trim(),
-          shipment_line_ids: [],
-          confirmed_at: new Date().toISOString(),
-          confirmed_by: resolvedActorId,
-          notes: null,
-        },
-      });
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-delivery:${operationId}`,
+        shipment_id: outboundShipment.shipment_id,
+        confirmation_code: outboundConfirmationCode.trim(),
+        shipment_line_ids: [],
+        confirmed_at: new Date().toISOString(),
+        notes: null,
+      };
+      const command = mode === "network" ? "v2_network_confirm_outbound_delivery" : "v2_confirm_outbound_delivery";
+      const input = mode === "network"
+        ? (common satisfies NetworkConfirmOutboundDeliveryRequest)
+        : ({ ...common, confirmed_by: resolvedActorId });
+      const response = await invoke<ConfirmOutboundDeliveryResponse>(command, { input });
       setOutboundNotice({ type: "success", text: `已确认交货 ${response.delivered_count} 件，批次状态：${response.shipment_status}。` });
       await refreshDashboard();
     } catch (error) {
@@ -722,18 +1094,20 @@ export default function InventoryWorkspace({
     setOutboundNotice(null);
     try {
       const operationId = createId();
-      const response = await invoke<ReturnOutboundShipmentResponse>("v2_return_outbound_shipment", {
-        input: {
-          request_id: operationId,
-          idempotency_key: `outbound-return:${operationId}`,
-          shipment_id: outboundShipment.shipment_id,
-          shipment_line_ids: [],
-          return_no: makeDocumentNumber("TH"),
-          returned_at: new Date().toISOString(),
-          reason: outboundReturnReason.trim(),
-          actor_id: resolvedActorId,
-        },
-      });
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-return:${operationId}`,
+        shipment_id: outboundShipment.shipment_id,
+        shipment_line_ids: [],
+        return_no: makeDocumentNumber("TH"),
+        returned_at: new Date().toISOString(),
+        reason: outboundReturnReason.trim(),
+      };
+      const command = mode === "network" ? "v2_network_return_outbound_shipment" : "v2_return_outbound_shipment";
+      const input = mode === "network"
+        ? (common satisfies NetworkReturnOutboundShipmentRequest)
+        : ({ ...common, actor_id: resolvedActorId });
+      const response = await invoke<ReturnOutboundShipmentResponse>(command, { input });
       setOutboundNotice({ type: "success", text: `${response.return_no} 已登记退回 ${response.quarantined_count} 件，并进入隔离区待复检。` });
       setOutboundReturnReason("");
       await refreshDashboard();
@@ -742,6 +1116,154 @@ export default function InventoryWorkspace({
     } finally {
       setOutboundLoading(false);
     }
+  }
+
+  async function createOfflineBackup() {
+    setDataNotice(null);
+    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const destination = await save({
+      title: "保存离线备份",
+      defaultPath: `inventory-backup-${stamp}.invbackup`,
+    });
+    if (!destination) return;
+    setDataOperationLoading(true);
+    try {
+      const metadata = await invoke<BackupMetadata>("v2_create_offline_backup", { destination });
+      setDataNotice({
+        type: "success",
+        text: `备份已完成：${destination}（${metadata.database_bytes.toLocaleString()} 字节，SHA-256 ${metadata.database_sha256.slice(0, 12)}…）`,
+      });
+    } catch (error) {
+      setDataNotice({ type: "error", text: `备份失败：${displayError(error)}` });
+    } finally {
+      setDataOperationLoading(false);
+    }
+  }
+
+  async function restoreOfflineBackup() {
+    setDataNotice(null);
+    const selected = await open({
+      title: "选择离线备份包",
+      directory: true,
+      multiple: false,
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setDataOperationLoading(true);
+    try {
+      const metadata = await invoke<BackupMetadata>("v2_verify_offline_backup", {
+        packagePath: selected,
+      });
+      const approved = await confirm(
+        `将当前离线库恢复到 ${formatDateTime(metadata.exported_at)} 的状态。应用会重启，当前数据库会先生成保护性备份。`,
+        { title: "确认恢复离线数据", kind: "warning" },
+      );
+      if (!approved) return;
+      setDataNotice({ type: "success", text: "备份校验通过，正在重启并原子恢复…" });
+      await invoke("v2_restore_offline_backup", { packagePath: selected });
+    } catch (error) {
+      setDataNotice({ type: "error", text: `恢复失败：${displayError(error)}` });
+    } finally {
+      setDataOperationLoading(false);
+    }
+  }
+
+  async function exportUpgradePackage() {
+    setDataNotice(null);
+    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const destination = await save({
+      title: "保存一次性升级包",
+      defaultPath: `inventory-upgrade-${stamp}.invpack`,
+    });
+    if (!destination) return;
+    setDataOperationLoading(true);
+    try {
+      const output = await invoke<UpgradeExportOutput>("v2_export_upgrade_package", {
+        input: {
+          destination,
+          export_id: createId(),
+          exported_at: new Date().toISOString(),
+        },
+      });
+      setUpgradeExport(output);
+      setUpgradePackagePath(output.path);
+      setDataNotice({
+        type: "success",
+        text: `升级包已验证：${output.path}（checksum ${output.checksum.slice(0, 12)}…）`,
+      });
+    } catch (error) {
+      setDataNotice({ type: "error", text: `升级包导出失败：${displayError(error)}` });
+    } finally {
+      setDataOperationLoading(false);
+    }
+  }
+
+  async function chooseUpgradePackage() {
+    const selected = await open({
+      title: "选择一次性升级包",
+      directory: true,
+      multiple: false,
+    });
+    if (selected && !Array.isArray(selected)) setUpgradePackagePath(selected);
+  }
+
+  async function upgradeOfflineToNetwork() {
+    setDataNotice(null);
+    if (!networkStatus?.authenticated) {
+      setDataNotice({ type: "error", text: "请先切换到网络版并登录有升级权限的账号。" });
+      return;
+    }
+    if (!upgradePackagePath.trim() || !upgradeTargetWorkspaceId.trim()) {
+      setDataNotice({ type: "error", text: "请选择升级包并填写目标工作区 ID。" });
+      return;
+    }
+    const approved = await confirm(
+      "导入成功后，当前离线工作区将永久冻结为只读，网络 PostgreSQL 成为唯一事实源。该操作不会启用双向同步。",
+      { title: "确认一次性升级", kind: "warning" },
+    );
+    if (!approved) return;
+    setDataOperationLoading(true);
+    try {
+      const output = await invoke<UpgradeImportOutput>("v2_upgrade_offline_to_network", {
+        input: {
+          package_path: upgradePackagePath.trim(),
+          target_workspace_id: upgradeTargetWorkspaceId.trim(),
+        },
+      });
+      setUpgradeImport(output);
+      setDataNotice({
+        type: "success",
+        text: `网络导入${output.import.status === "already_imported" ? "已幂等确认" : "成功"}，本地工作区${output.local_archived ? "已冻结为只读" : "尚未冻结"}。`,
+      });
+    } catch (error) {
+      setDataNotice({ type: "error", text: `一次性升级失败：${displayError(error)}` });
+    } finally {
+      setDataOperationLoading(false);
+    }
+  }
+
+  function renderNetworkLogin() {
+    return (
+      <section className="v2-page v2-network-gate" aria-labelledby="v2-network-login-title">
+        <div className="v2-page-heading">
+          <div>
+            <span className="v2-eyebrow">网络多用户版</span>
+            <h2 id="v2-network-login-title">连接库存服务</h2>
+            <p>登录由服务端验证账号、租户、角色和有效授权；桌面端不会保存 PostgreSQL 凭据。</p>
+          </div>
+        </div>
+        <form className="v2-panel v2-network-login-form" onSubmit={submitNetworkLogin}>
+          <label><span>API 地址 *</span><input value={networkBaseUrl} onChange={(event) => setNetworkBaseUrl(event.target.value)} placeholder="https://inventory.example" autoComplete="url" /></label>
+          <label><span>租户 ID *</span><input value={networkTenantId} onChange={(event) => setNetworkTenantId(event.target.value)} placeholder="UUID" autoComplete="organization" /></label>
+          <label><span>账号 *</span><input value={networkLogin} onChange={(event) => setNetworkLogin(event.target.value)} autoComplete="username" /></label>
+          <label><span>密码 *</span><input type="password" value={networkPassword} onChange={(event) => setNetworkPassword(event.target.value)} autoComplete="current-password" /></label>
+          {networkAuthNotice && <div className={`v2-notice ${networkAuthNotice.type}`}>{networkAuthNotice.text}</div>}
+          <div className="v2-form-actions">
+            <button className="v2-button" type="button" onClick={() => switchMode("offline")}>{offlineActivated ? "切换离线版" : "切换离线只读"}</button>
+            <button className="v2-button primary" type="submit" disabled={networkAuthLoading}>{networkAuthLoading ? "正在登录…" : "登录网络版"}</button>
+          </div>
+        </form>
+      </section>
+    );
   }
 
   function renderOverview() {
@@ -802,6 +1324,14 @@ export default function InventoryWorkspace({
             <label><span>型号编码 *</span><input value={skuCode} onChange={(event) => setSkuCode(event.target.value)} placeholder="例如：DDR4-32G-3200" autoComplete="off" /></label>
             <label><span>型号名称 *</span><input value={skuName} onChange={(event) => setSkuName(event.target.value)} placeholder="例如：32G 3200 内存" autoComplete="off" /></label>
             <label><span>入库时间 *</span><input type="datetime-local" step="1" value={receivedAt} onChange={(event) => setReceivedAt(event.target.value)} /></label>
+            {mode === "network" && <label><span>入库仓库 *</span><select value={networkWarehouseId} onChange={(event) => {
+              const value = event.target.value;
+              setNetworkWarehouseId(value);
+              try { window.localStorage.setItem("inventory-v2-network-warehouse", value); } catch { /* optional preference */ }
+            }} disabled={networkWarehousesLoading || networkWarehouses.length === 0}>
+              {networkWarehouses.length === 0 && <option value="">{networkWarehousesLoading ? "正在读取仓库…" : "没有可用收货仓库"}</option>}
+              {networkWarehouses.map((warehouse) => <option key={warehouse.warehouse_id} value={warehouse.warehouse_id}>{warehouse.warehouse_name}（{warehouse.warehouse_code}）</option>)}
+            </select>{networkWarehousesError && <small className="v2-field-error">仓库读取失败：{networkWarehousesError}</small>}</label>}
             <label className="v2-span-two"><span>来源单号 / 备注</span><input value={sourceReference} onChange={(event) => setSourceReference(event.target.value)} placeholder="可选，例如供应商送货单号" autoComplete="off" /></label>
           </div>
           <label className="v2-scan-field">
@@ -876,9 +1406,9 @@ export default function InventoryWorkspace({
           <div className="v2-table-meta">共 {inventoryTotal} 件{inventoryTotal > inventoryItems.length ? `，当前显示前 ${inventoryItems.length} 件` : ""}</div>
           <div className="v2-table-wrap">
             <table>
-              <thead><tr><th>条码 / SN</th><th>货主</th><th>产品型号</th><th>入库时间</th><th>库存状态</th><th>质检状态</th></tr></thead>
+              <thead><tr><th>条码 / SN</th><th>货主</th><th>产品型号</th><th>入库时间</th><th>库存状态</th><th>质检状态</th><th aria-label="操作" /></tr></thead>
               <tbody>
-                {!inventoryLoading && inventoryItems.length === 0 && <tr><td className="v2-table-empty" colSpan={6}>没有匹配的库存记录</td></tr>}
+                {!inventoryLoading && inventoryItems.length === 0 && <tr><td className="v2-table-empty" colSpan={7}>没有匹配的库存记录</td></tr>}
                 {inventoryItems.map((item) => (
                   <tr key={item.inventory_unit_id}>
                     <td><strong className="v2-mono">{item.barcode}</strong><small>{item.receipt_no}</small></td>
@@ -887,12 +1417,34 @@ export default function InventoryWorkspace({
                     <td>{formatDateTime(item.received_at)}</td>
                     <td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td>
                     <td><span className={`v2-badge quality-${item.quality_status}`}>{qualityStatusLabels[item.quality_status]}</span></td>
+                    <td><button className="v2-icon-button" type="button" onClick={() => void openInventoryTrace(item.barcode)} aria-label={`查看 ${item.barcode} 完整追溯`} title="查看完整追溯"><Search size={16} /></button></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+        {inventoryTraceBarcode && <div className="v2-trace-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setInventoryTraceBarcode(null);
+        }}>
+          <section className="v2-trace-drawer" role="dialog" aria-modal="true" aria-labelledby="v2-trace-title">
+            <header><div><span>单件完整追溯</span><h3 id="v2-trace-title">{inventoryTraceBarcode}</h3></div><button className="v2-icon-button" type="button" onClick={() => setInventoryTraceBarcode(null)} aria-label="关闭追溯详情" title="关闭"><X size={18} /></button></header>
+            {inventoryTraceLoading && <div className="v2-empty"><RefreshCw className="v2-spin" size={24} /> 正在读取业务事实</div>}
+            {inventoryTraceError && <div className="v2-notice error">读取追溯失败：{inventoryTraceError}</div>}
+            {inventoryTrace && <div className="v2-trace-content">
+              <dl className="v2-trace-summary">
+                <div><dt>货主</dt><dd>{inventoryTrace.owner_name}</dd></div>
+                <div><dt>产品型号</dt><dd>{inventoryTrace.sku_code} · {inventoryTrace.sku_name}</dd></div>
+                <div><dt>入库单</dt><dd>{inventoryTrace.receipt_no}</dd></div>
+                <div><dt>入库时间</dt><dd>{formatDateTime(inventoryTrace.received_at)}</dd></div>
+                <div><dt>库存状态</dt><dd>{inventoryStatusLabels[inventoryTrace.inventory_status]}</dd></div>
+                <div><dt>质检状态</dt><dd>{qualityStatusLabels[inventoryTrace.quality_status]}</dd></div>
+              </dl>
+              <section className="v2-trace-section"><h4>质检记录</h4>{inventoryTrace.inspections.length === 0 ? <p>尚无质检记录</p> : <div className="v2-trace-list">{inventoryTrace.inspections.map((inspection) => <article key={`${inspection.inspection_no}-${inspection.inspected_at}`}><strong>{inspection.inspection_no} · {inspection.inspection_type === "initial" ? "初检" : "复检"}</strong><span>{inspection.result === "passed" ? "合格" : "不合格"} · {formatDateTime(inspection.inspected_at)}</span>{inspection.defect_code && <small>缺陷：{inspection.defect_code}</small>}{inspection.notes && <small>{inspection.notes}</small>}</article>)}</div>}</section>
+              <section className="v2-trace-section"><h4>凑单、出库与交货</h4>{inventoryTrace.outbound.length === 0 ? <p>尚未参与上游订单</p> : <div className="v2-trace-list">{inventoryTrace.outbound.map((event) => <article key={event.allocation_id}><strong>{event.order_no} · {event.upstream_receiver_name}</strong><span>分配：{formatDateTime(event.allocated_at)}（{event.allocation_status}）</span>{event.shipment_no && <span>出库：{event.shipment_no} · {formatDateTime(event.shipped_at ?? "")}</span>}{event.confirmation_code && <span>交货确认：{event.confirmation_code} · {formatDateTime(event.confirmed_at ?? "")}</span>}{event.return_no && <span>退回：{event.return_no} · {formatDateTime(event.returned_at ?? "")}</span>}{event.return_reason && <small>{event.return_reason}（{event.return_disposition}）</small>}</article>)}</div>}</section>
+            </div>}
+          </section>
+        </div>}
       </section>
     );
   }
@@ -941,10 +1493,53 @@ export default function InventoryWorkspace({
     );
   }
 
+  function renderSettings() {
+    return (
+      <section className="v2-page" aria-labelledby="v2-settings-title">
+        <div className="v2-page-heading">
+          <div><span className="v2-eyebrow">数据安全</span><h2 id="v2-settings-title">备份、恢复与版本升级</h2><p>离线数据恢复和一次性网络升级。</p></div>
+        </div>
+        <div className="v2-settings-grid">
+          <section className="v2-panel v2-settings-panel">
+            <div className="v2-settings-heading"><div><h3>离线 SQLite 备份</h3><small>工作区一致性快照</small></div><Warehouse size={20} /></div>
+            <button className="v2-button primary wide" type="button" onClick={() => void createOfflineBackup()} disabled={dataOperationLoading}>创建备份</button>
+            <button className="v2-button wide" type="button" onClick={() => void restoreOfflineBackup()} disabled={dataOperationLoading}>验证并恢复备份</button>
+            {restoreReport && <div className={`v2-restore-report ${restoreReport.status}`}>
+              <strong>{restoreReport.status === "restored" ? "最近恢复成功" : "最近恢复失败"}</strong>
+              <span>{formatDateTime(restoreReport.completed_at)}</span>
+              {restoreReport.pre_restore_backup && <small>恢复前备份：{restoreReport.pre_restore_backup}</small>}
+              {restoreReport.error && <small>{restoreReport.error}</small>}
+            </div>}
+          </section>
+
+          <section className="v2-panel v2-settings-panel v2-upgrade-panel">
+            <div className="v2-settings-heading"><div><h3>一次性升级到网络版</h3><small>离线 SQLite → 网络 PostgreSQL</small></div><ShieldAlert size={20} /></div>
+            <div className="v2-upgrade-steps">
+              <div><span>1</span><strong>生成升级包</strong><button className="v2-button" type="button" onClick={() => void exportUpgradePackage()} disabled={dataOperationLoading}>导出 .invpack</button></div>
+              <div><span>2</span><strong>选择升级包</strong><button className="v2-button" type="button" onClick={() => void chooseUpgradePackage()} disabled={dataOperationLoading}>选择目录</button></div>
+              <div><span>3</span><strong>导入空工作区</strong><button className="v2-button primary" type="button" onClick={() => void upgradeOfflineToNetwork()} disabled={dataOperationLoading || !networkStatus?.authenticated}>执行升级</button></div>
+            </div>
+            <label className="v2-settings-field"><span>升级包路径</span><input value={upgradePackagePath} onChange={(event) => setUpgradePackagePath(event.target.value)} placeholder="选择 .invpack 目录" /></label>
+            <label className="v2-settings-field"><span>目标网络工作区 ID</span><input value={upgradeTargetWorkspaceId} onChange={(event) => setUpgradeTargetWorkspaceId(event.target.value)} placeholder="UUID" /></label>
+            <div className="v2-rule-hint"><ShieldAlert size={17} /><span>服务端确认条码、关系、计数和 checksum 完全一致后，本地库才会冻结。冻结后不再允许新增或修改业务数据。</span></div>
+            {!networkStatus?.authenticated && <div className="v2-notice error">执行导入前，请切换到网络版并登录具备升级权限的账号。</div>}
+            {upgradeExport && <div className="v2-upgrade-result"><strong>已生成升级包</strong><span>export_id：{upgradeExport.export_id}</span><span>checksum：{upgradeExport.checksum}</span></div>}
+            {upgradeImport && <div className="v2-upgrade-result success"><strong>服务端已确认导入</strong><span>migration_id：{upgradeImport.import.migration_id}</span><span>状态：{upgradeImport.import.status}</span><span>本地归档：{upgradeImport.local_archived ? "已完成" : "未完成"}</span></div>}
+          </section>
+        </div>
+        {dataNotice && <div className={`v2-notice ${dataNotice.type}`}>{dataNotice.text}</div>}
+      </section>
+    );
+  }
+
   return (
     <div className="v2-workspace">
       <aside className="v2-sidebar">
-        <div className="v2-brand"><span><Boxes size={22} /></span><div><strong>库存管理 V2</strong><small>离线单用户工作区</small></div></div>
+        <div className="v2-brand"><span><Boxes size={22} /></span><div><strong>库存管理 V2</strong><small>{mode === "network" ? "网络多用户工作区" : "离线单用户工作区"}</small></div></div>
+        <div className="v2-mode-switch" aria-label="工作模式">
+          <button type="button" className={mode === "offline" ? "active" : ""} onClick={() => switchMode("offline")}>离线 SQLite</button>
+          <button type="button" className={mode === "network" ? "active" : ""} onClick={() => switchMode("network")}>网络 PostgreSQL</button>
+        </div>
         <nav aria-label="库存模块">
           {navigationItems.map((item) => {
             const Icon = item.icon;
@@ -952,16 +1547,23 @@ export default function InventoryWorkspace({
           })}
         </nav>
         <div className="v2-sidebar-footer">
-          <span>本地数据模式</span><small>SQLite · 单用户 · 原子事务</small>
+          <span>{mode === "network" ? "网络数据模式" : "本地数据模式"}</span>
+          <small>{mode === "network" ? (networkStatus?.authenticated ? `已登录 · ${networkStatus.user_id ?? ""}` : "PostgreSQL · 多用户 · 服务端授权") : (offlineActivated ? "SQLite · 单用户 · 原子事务" : "SQLite · 授权无效 · 只读和备份可用")}</small>
+          {mode === "network" && networkStatus?.authenticated && <button className="v2-back-button" type="button" onClick={() => void logoutNetwork()} disabled={networkAuthLoading}><LogOut size={15} /> 退出网络版</button>}
+          {mode === "offline" && !offlineActivated && onRequestActivation && <button className="v2-back-button" type="button" onClick={onRequestActivation}><ShieldAlert size={15} /> 离线激活</button>}
           {onBackToLegacy && <button className="v2-back-button" type="button" onClick={onBackToLegacy}><ArrowLeft size={16} /> 返回旧版工具</button>}
         </div>
       </aside>
       <main className="v2-content">
-        {page === "overview" && renderOverview()}
-        {page === "receipt" && renderReceipt()}
-        {page === "quality" && renderQuality()}
-        {page === "inventory" && renderInventory()}
-        {page === "outbound" && renderOutbound()}
+        {mode === "offline" && !offlineActivated && <div className="v2-readonly-banner"><ShieldAlert size={17} /><span>离线授权当前无效：查询、备份和恢复仍可使用，入库、质检、凑单、出库与退回已锁定。</span></div>}
+        {mode === "network" && !networkStatus?.authenticated ? renderNetworkLogin() : <>
+          {page === "overview" && renderOverview()}
+          {page === "receipt" && renderReceipt()}
+          {page === "quality" && renderQuality()}
+          {page === "inventory" && renderInventory()}
+          {page === "outbound" && renderOutbound()}
+          {page === "settings" && renderSettings()}
+        </>}
       </main>
     </div>
   );

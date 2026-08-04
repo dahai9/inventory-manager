@@ -32,6 +32,11 @@ const MANIFEST_FILE: &str = "manifest.json";
 const CHECKSUMS_FILE: &str = "checksums.json";
 const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// The first network upload implementation intentionally uses one bounded
+/// JSON request.  Larger workspaces need a resumable streaming protocol rather
+/// than silently allocating unbounded memory in the desktop and server.
+pub const MAX_NETWORK_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_NETWORK_REQUEST_BYTES: usize = 80 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
@@ -143,6 +148,160 @@ impl ValidatedPackage {
     pub fn data_file_path(&self, relative_path: &str) -> Result<PathBuf, UpgradeError> {
         safe_existing_package_file(&self.root, relative_path)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkUpgradeFile {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkUpgradeImportRequest {
+    pub target_workspace_id: Uuid,
+    pub manifest_json: String,
+    pub checksums_json: String,
+    pub files: Vec<NetworkUpgradeFile>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkUpgradeImportStatus {
+    Imported,
+    AlreadyImported,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkUpgradeImportResponse {
+    pub status: NetworkUpgradeImportStatus,
+    pub export_id: String,
+    pub migration_id: String,
+    pub checksum: String,
+    pub imported_at: Option<String>,
+    pub entity_counts: BTreeMap<String, u64>,
+}
+
+/// Owns the server-side temporary directory for as long as the validated
+/// package is being imported. Dropping it after success or error removes every
+/// uploaded member.
+pub struct StagedNetworkUpgrade {
+    package: ValidatedPackage,
+    _guard: StagingGuard,
+}
+
+impl StagedNetworkUpgrade {
+    pub fn package(&self) -> &ValidatedPackage {
+        &self.package
+    }
+}
+
+/// Convert an already validated local directory into the bounded wire format.
+/// Every member is re-read from the canonical package root so callers cannot
+/// inject an unrelated path after local validation.
+pub fn build_network_upgrade_request(
+    package: &ValidatedPackage,
+    target_workspace_id: Uuid,
+) -> Result<NetworkUpgradeImportRequest, UpgradeError> {
+    let manifest_path = package.data_file_path(MANIFEST_FILE)?;
+    let checksums_path = package.data_file_path(CHECKSUMS_FILE)?;
+    let manifest_json = read_utf8_package_member(&manifest_path, MAX_METADATA_BYTES)?;
+    let checksums_json = read_utf8_package_member(&checksums_path, MAX_METADATA_BYTES)?;
+    let mut total_bytes = checked_upload_size(0, manifest_json.len(), MANIFEST_FILE)?;
+    total_bytes = checked_upload_size(total_bytes, checksums_json.len(), CHECKSUMS_FILE)?;
+    let mut files = Vec::with_capacity(package.manifest.files.len());
+    for digest in &package.manifest.files {
+        let path = package.data_file_path(&digest.path)?;
+        let content = read_utf8_package_member(&path, MAX_NETWORK_PACKAGE_BYTES)?;
+        total_bytes = checked_upload_size(total_bytes, content.len(), &digest.path)?;
+        files.push(NetworkUpgradeFile {
+            path: digest.path.clone(),
+            content,
+        });
+    }
+    Ok(NetworkUpgradeImportRequest {
+        target_workspace_id,
+        manifest_json,
+        checksums_json,
+        files,
+    })
+}
+
+/// Reconstruct and fully validate a network upload before opening a
+/// PostgreSQL transaction. Only the exact format-v1 member allowlist is
+/// accepted, and all files are written with `create_new` under a private
+/// server-generated directory.
+pub fn stage_network_upgrade_request(
+    request: NetworkUpgradeImportRequest,
+) -> Result<StagedNetworkUpgrade, UpgradeError> {
+    let expected_paths: Vec<&str> = DATA_FILES.iter().map(|spec| spec.path).collect();
+    let supplied_paths: Vec<&str> = request
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    if supplied_paths != expected_paths {
+        return Err(UpgradeError::Integrity(format!(
+            "network package files must be exactly {expected_paths:?} in canonical order"
+        )));
+    }
+    let mut total_bytes = checked_upload_size(0, request.manifest_json.len(), MANIFEST_FILE)?;
+    total_bytes = checked_upload_size(total_bytes, request.checksums_json.len(), CHECKSUMS_FILE)?;
+    for file in &request.files {
+        validate_relative_path(&file.path)?;
+        total_bytes = checked_upload_size(total_bytes, file.content.len(), &file.path)?;
+    }
+    let root = std::env::temp_dir().join(format!(
+        "inventory-network-upload-{}.invpack",
+        Uuid::now_v7()
+    ));
+    fs::create_dir(&root).map_err(|source| UpgradeError::Io {
+        path: root.clone(),
+        source,
+    })?;
+    let guard = StagingGuard::new(root.clone());
+    write_new_file(
+        &safe_new_package_file(&root, MANIFEST_FILE)?,
+        request.manifest_json.as_bytes(),
+    )?;
+    write_new_file(
+        &safe_new_package_file(&root, CHECKSUMS_FILE)?,
+        request.checksums_json.as_bytes(),
+    )?;
+    for file in request.files {
+        write_new_file(
+            &safe_new_package_file(&root, &file.path)?,
+            file.content.as_bytes(),
+        )?;
+    }
+    let package = validate_package(&root)?;
+    Ok(StagedNetworkUpgrade {
+        package,
+        _guard: guard,
+    })
+}
+
+fn read_utf8_package_member(path: &Path, max_bytes: u64) -> Result<String, UpgradeError> {
+    String::from_utf8(read_limited(path, max_bytes)?)
+        .map_err(|_| UpgradeError::Integrity(format!("{} is not valid UTF-8", path.display())))
+}
+
+fn checked_upload_size(
+    current: u64,
+    member_bytes: usize,
+    member: &str,
+) -> Result<u64, UpgradeError> {
+    let member_bytes = u64::try_from(member_bytes)
+        .map_err(|_| UpgradeError::Integrity(format!("{member} size cannot be represented")))?;
+    let total = current
+        .checked_add(member_bytes)
+        .ok_or_else(|| UpgradeError::Integrity("network package size overflow".to_owned()))?;
+    if total > MAX_NETWORK_PACKAGE_BYTES {
+        return Err(UpgradeError::Integrity(format!(
+            "network package exceeds the {} byte upload limit",
+            MAX_NETWORK_PACKAGE_BYTES
+        )));
+    }
+    Ok(total)
 }
 
 #[derive(Clone, Copy)]
@@ -324,14 +483,16 @@ impl<'a> OfflineUpgradeExporter<'a> {
         let mut guard = StagingGuard::new(staging_path.clone());
 
         let mut transaction = self.pool.begin().await?;
-        let database_schema_version: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
-                .fetch_one(&mut *transaction)
-                .await?;
-        if database_schema_version != Some(LOGICAL_SCHEMA_VERSION) {
+        let logical_schema_available: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = ?1 AND success = 1)",
+        )
+        .bind(LOGICAL_SCHEMA_VERSION)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !logical_schema_available {
             return Err(UpgradeError::Incompatible(format!(
-                "SQLite schema version {:?}, expected {}",
-                database_schema_version, LOGICAL_SCHEMA_VERSION
+                "SQLite does not contain required logical schema version {}",
+                LOGICAL_SCHEMA_VERSION
             )));
         }
 
@@ -1690,7 +1851,7 @@ pub trait PostgresUpgradeTransaction {
     fn record_imported(
         &mut self,
         claim: MigrationClaim,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<String, Self::Error>> + Send;
 
     fn commit(self) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
@@ -1747,6 +1908,7 @@ impl<E: std::error::Error + 'static> std::error::Error for PostgresImportError<E
 pub enum ImportOutcome {
     Imported {
         migration_id: String,
+        imported_at: String,
     },
     AlreadyImported {
         migration_id: String,
@@ -1846,7 +2008,7 @@ pub async fn import_to_postgres<A: PostgresUpgradeAdapter>(
         .apply_staged_package(package.manifest.clone(), target)
         .await
         .map_err(PostgresImportError::Adapter)?;
-    transaction
+    let imported_at = transaction
         .record_imported(claim)
         .await
         .map_err(PostgresImportError::Adapter)?;
@@ -1856,6 +2018,7 @@ pub async fn import_to_postgres<A: PostgresUpgradeAdapter>(
         .map_err(PostgresImportError::Adapter)?;
     Ok(ImportOutcome::Imported {
         migration_id: package.manifest.migration_id.clone(),
+        imported_at,
     })
 }
 
@@ -1889,22 +2052,22 @@ pub enum PgUpgradeError {
 /// `import_to_postgres` still receives a target object for the generic trait,
 /// but the concrete transaction rejects a tenant or actor that differs from
 /// this verified principal.
-pub struct PgUpgradeAdapter<'a> {
-    pool: &'a PgPool,
+pub struct PgUpgradeAdapter {
+    pool: PgPool,
     tenant_id: Uuid,
     session_token: String,
     required_permission: String,
 }
 
-impl<'a> PgUpgradeAdapter<'a> {
+impl PgUpgradeAdapter {
     pub fn new(
-        database: &'a NetworkDatabase,
+        database: &NetworkDatabase,
         tenant_id: Uuid,
         session_token: impl Into<String>,
         required_permission: impl Into<String>,
     ) -> Self {
         Self {
-            pool: database.pool(),
+            pool: database.pool().clone(),
             tenant_id,
             session_token: session_token.into(),
             required_permission: required_permission.into(),
@@ -1912,13 +2075,13 @@ impl<'a> PgUpgradeAdapter<'a> {
     }
 
     pub fn from_pool(
-        pool: &'a PgPool,
+        pool: &PgPool,
         tenant_id: Uuid,
         session_token: impl Into<String>,
         required_permission: impl Into<String>,
     ) -> Self {
         Self {
-            pool,
+            pool: pool.clone(),
             tenant_id,
             session_token: session_token.into(),
             required_permission: required_permission.into(),
@@ -1932,7 +2095,7 @@ pub struct PgUpgradeTransaction<'a> {
     actor_id: Uuid,
 }
 
-impl<'a> PostgresUpgradeAdapter for PgUpgradeAdapter<'a> {
+impl PostgresUpgradeAdapter for PgUpgradeAdapter {
     type Error = PgUpgradeError;
     type Transaction<'tx>
         = PgUpgradeTransaction<'tx>
@@ -2203,10 +2366,37 @@ impl<'a> PgUpgradeTransaction<'a> {
         self.apply_quality(tenant_id, actor_id, &records).await?;
         self.apply_outbound(tenant_id, actor_id, &records).await?;
         self.apply_audit(tenant_id, actor_id, &records).await?;
+        self.verify_live_counts(tenant_id, &records).await?;
         Ok(())
     }
 
-    async fn record_imported_impl(&mut self, claim: MigrationClaim) -> Result<(), PgUpgradeError> {
+    async fn verify_live_counts(
+        &mut self,
+        tenant_id: Uuid,
+        records: &BTreeMap<String, Vec<Map<String, Value>>>,
+    ) -> Result<(), PgUpgradeError> {
+        for table in all_table_names() {
+            let expected = i64::try_from(records_for(records, table).len()).map_err(|_| {
+                PgUpgradeError::Data(format!("{table} row count exceeds PostgreSQL bigint"))
+            })?;
+            let query = format!("SELECT count(*) FROM {table} WHERE tenant_id = $1");
+            let actual: i64 = sqlx::query_scalar(&query)
+                .bind(tenant_id)
+                .fetch_one(&mut *self.transaction)
+                .await?;
+            if actual != expected {
+                return Err(PgUpgradeError::Data(format!(
+                    "post-apply count mismatch for {table}: expected {expected}, got {actual}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_imported_impl(
+        &mut self,
+        claim: MigrationClaim,
+    ) -> Result<String, PgUpgradeError> {
         let tenant_id = parse_target_uuid("tenant_id", &claim.target.tenant_id)?;
         let workspace_id = parse_target_uuid("workspace_id", &claim.target.workspace_id)?;
         let actor_id = parse_target_uuid("actor_id", &claim.target.actor_id)?;
@@ -2219,7 +2409,7 @@ impl<'a> PgUpgradeTransaction<'a> {
                 "migration record target does not match authenticated context".to_owned(),
             ));
         }
-        sqlx::query(
+        let imported_at: String = sqlx::query_scalar(
             r#"
             INSERT INTO migration_packages
                 (tenant_id, id, workspace_id, export_id, direction,
@@ -2227,6 +2417,7 @@ impl<'a> PgUpgradeTransaction<'a> {
                  migration_id, source_instance_id, source_workspace_id, actor_id)
             VALUES ($1, $2, $3, $4, 'offline_to_network', $5, $6, 'imported',
                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $7, $8, $9, $10)
+            RETURNING imported_at::text
             "#,
         )
         .bind(tenant_id)
@@ -2243,9 +2434,9 @@ impl<'a> PgUpgradeTransaction<'a> {
         .bind(source_instance_id)
         .bind(source_workspace_id)
         .bind(actor_id)
-        .execute(&mut *self.transaction)
+        .fetch_one(&mut *self.transaction)
         .await?;
-        Ok(())
+        Ok(imported_at)
     }
 
     async fn staged_file_rows(&mut self) -> Result<BTreeMap<String, u64>, PgUpgradeError> {
@@ -3134,7 +3325,7 @@ impl<'a> PostgresUpgradeTransaction for PgUpgradeTransaction<'a> {
     fn record_imported(
         &mut self,
         claim: MigrationClaim,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<String, Self::Error>> + Send {
         async move { self.record_imported_impl(claim).await }
     }
 
@@ -3317,7 +3508,7 @@ fn json_field(
 mod tests {
     use super::*;
     use crate::v2::auth::{hash_token, TokenKind};
-    use crate::v2::network::PERMISSION_NETWORK_ACCESS;
+    use crate::v2::network::{NetworkService, PERMISSION_NETWORK_ACCESS};
     use crate::v2::postgres::NetworkDatabaseConfig;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -3476,6 +3667,48 @@ mod tests {
         assert!(matches!(error, UpgradeError::Integrity(_)));
     }
 
+    #[tokio::test]
+    async fn network_upload_round_trips_only_canonical_members_and_cleans_staging() {
+        let (pool, workspace_id, _) = test_pool().await;
+        sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (2, 1)")
+            .execute(&pool)
+            .await
+            .expect("record newer physical migration");
+        let directory = TestDirectory::new();
+        let package_path = directory.path().join("network-upload.invpack");
+        OfflineUpgradeExporter::new(&pool)
+            .export(&package_path, export_request(workspace_id))
+            .await
+            .expect("export package");
+        let package = validate_package(&package_path).expect("validate package");
+        let target_workspace_id = Uuid::now_v7();
+        let request = build_network_upgrade_request(&package, target_workspace_id)
+            .expect("build upload request");
+        assert_eq!(request.target_workspace_id, target_workspace_id);
+        assert_eq!(
+            request
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            DATA_FILES.iter().map(|file| file.path).collect::<Vec<_>>()
+        );
+        let staged = stage_network_upgrade_request(request.clone()).expect("stage upload");
+        assert_eq!(staged.package().manifest, package.manifest);
+        assert_eq!(staged.package().package_checksum, package.package_checksum);
+        let staged_root = staged.package().root().to_owned();
+        assert!(staged_root.exists());
+        drop(staged);
+        assert!(!staged_root.exists());
+
+        let mut unsafe_request = request;
+        unsafe_request.files[0].path = "../master-data.jsonl".to_owned();
+        assert!(matches!(
+            stage_network_upgrade_request(unsafe_request),
+            Err(UpgradeError::Integrity(_)) | Err(UpgradeError::UnsafePath(_))
+        ));
+    }
+
     #[test]
     fn traversal_and_non_invpack_paths_are_rejected() {
         assert!(matches!(
@@ -3605,11 +3838,11 @@ mod tests {
         fn record_imported(
             &mut self,
             _claim: MigrationClaim,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        ) -> impl Future<Output = Result<String, Self::Error>> + Send {
             let events = Arc::clone(&self.events);
             async move {
                 events.lock().expect("event lock").push("record".into());
-                Ok(())
+                Ok("2026-08-04 00:00:00+00".to_owned())
             }
         }
 
@@ -3675,7 +3908,8 @@ mod tests {
         assert_eq!(
             outcome,
             ImportOutcome::Imported {
-                migration_id: package.manifest.migration_id.clone()
+                migration_id: package.manifest.migration_id.clone(),
+                imported_at: "2026-08-04 00:00:00+00".to_owned(),
             }
         );
         assert_eq!(
@@ -3891,25 +4125,20 @@ mod tests {
         let runtime = NetworkDatabase::connect(&NetworkDatabaseConfig::new(runtime_url))
             .await
             .expect("connect restricted runtime");
-        let adapter = PgUpgradeAdapter::new(
-            &runtime,
-            tenant_id,
-            session_token.clone(),
-            "inventory.upgrade.import",
-        );
-        let target = NetworkUpgradeTarget {
-            tenant_id: tenant_id.to_string(),
-            workspace_id: target_workspace_id.to_string(),
-            actor_id: user_id.to_string(),
-        };
-        let first = import_to_postgres(&adapter, &validated, target.clone())
+        let service = NetworkService::new(runtime).expect("network service");
+        let upload = build_network_upgrade_request(&validated, target_workspace_id)
+            .expect("build network upload");
+        let first = service
+            .import_upgrade_package(tenant_id, &session_token, upload.clone())
             .await
             .expect("import package");
-        assert!(matches!(first, ImportOutcome::Imported { .. }));
-        let replay = import_to_postgres(&adapter, &validated, target)
+        assert_eq!(first.status, NetworkUpgradeImportStatus::Imported);
+        assert_eq!(first.checksum, validated.package_checksum);
+        let replay = service
+            .import_upgrade_package(tenant_id, &session_token, upload)
             .await
             .expect("idempotent replay");
-        assert!(matches!(replay, ImportOutcome::AlreadyImported { .. }));
+        assert_eq!(replay.status, NetworkUpgradeImportStatus::AlreadyImported);
 
         let mut verification = admin.begin().await.expect("begin verification");
         sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
