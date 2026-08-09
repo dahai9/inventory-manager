@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -85,6 +85,8 @@ pub struct PostReceiptResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceCatalog {
     pub products: Vec<CatalogProduct>,
+    #[serde(default)]
+    pub parties: Vec<CatalogParty>,
     pub goods_owners: Vec<CatalogParty>,
     pub suppliers: Vec<CatalogParty>,
 }
@@ -102,6 +104,20 @@ pub struct CatalogProduct {
 pub struct CatalogParty {
     pub party_id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub roles: Vec<CatalogPartyRole>,
+    #[serde(default)]
+    pub contact_name: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
+    #[serde(default)]
+    pub wechat: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,18 +130,32 @@ pub struct CreateCatalogProductRequest {
     pub serial_forbidden_chars: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogPartyRole {
     GoodsOwner,
+    UpstreamReceiver,
     Supplier,
+    Carrier,
 }
 
 impl CatalogPartyRole {
     pub(crate) fn database_value(self) -> &'static str {
         match self {
             Self::GoodsOwner => "goods_owner",
+            Self::UpstreamReceiver => "upstream_receiver",
             Self::Supplier => "supplier",
+            Self::Carrier => "carrier",
+        }
+    }
+
+    pub(crate) fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "goods_owner" => Some(Self::GoodsOwner),
+            "upstream_receiver" => Some(Self::UpstreamReceiver),
+            "supplier" => Some(Self::Supplier),
+            "carrier" => Some(Self::Carrier),
+            _ => None,
         }
     }
 }
@@ -134,6 +164,26 @@ impl CatalogPartyRole {
 pub struct CreateCatalogPartyRequest {
     pub display_name: String,
     pub role: CatalogPartyRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveCatalogPartyRequest {
+    #[serde(default)]
+    pub party_id: Option<String>,
+    pub display_name: String,
+    pub roles: Vec<CatalogPartyRole>,
+    #[serde(default)]
+    pub contact_name: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
+    #[serde(default)]
+    pub wechat: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,13 +365,22 @@ impl OfflineDatabase {
             }
         }
 
-        let owner_party_id = lookup_catalog_party(
-            &mut transaction,
-            workspace_id,
-            &request.owner_name,
-            CatalogPartyRole::GoodsOwner,
-        )
-        .await?;
+        let supplier_is_owner = request
+            .owner_name
+            .eq_ignore_ascii_case(&request.supplier_name);
+        let legacy_owner_party_id = if supplier_is_owner {
+            None
+        } else {
+            Some(
+                lookup_catalog_party(
+                    &mut transaction,
+                    workspace_id,
+                    &request.owner_name,
+                    CatalogPartyRole::GoodsOwner,
+                )
+                .await?,
+            )
+        };
         let supplier_party_id = lookup_catalog_party(
             &mut transaction,
             workspace_id,
@@ -329,6 +388,7 @@ impl OfflineDatabase {
             CatalogPartyRole::Supplier,
         )
         .await?;
+        let owner_party_id = legacy_owner_party_id.unwrap_or_else(|| supplier_party_id.clone());
         let sku = lookup_catalog_sku(
             &mut transaction,
             workspace_id,
@@ -862,14 +922,20 @@ impl OfflineDatabase {
             })
         })
         .collect::<ApplicationResult<Vec<_>>>()?;
-        let goods_owners = self
-            .list_catalog_parties(CatalogPartyRole::GoodsOwner)
-            .await?;
-        let suppliers = self
-            .list_catalog_parties(CatalogPartyRole::Supplier)
-            .await?;
+        let parties = self.list_catalog_parties().await?;
+        let goods_owners = parties
+            .iter()
+            .filter(|party| party.roles.contains(&CatalogPartyRole::GoodsOwner))
+            .cloned()
+            .collect();
+        let suppliers = parties
+            .iter()
+            .filter(|party| party.roles.contains(&CatalogPartyRole::Supplier))
+            .cloned()
+            .collect();
         Ok(ReferenceCatalog {
             products,
+            parties,
             goods_owners,
             suppliers,
         })
@@ -956,39 +1022,226 @@ impl OfflineDatabase {
         Ok(CatalogParty {
             party_id,
             display_name: input.display_name,
+            roles: vec![input.role],
+            contact_name: None,
+            phone: None,
+            wechat: None,
+            email: None,
+            address: None,
+            notes: None,
         })
     }
 
-    async fn list_catalog_parties(
+    pub async fn save_catalog_party(
         &self,
-        role: CatalogPartyRole,
-    ) -> ApplicationResult<Vec<CatalogParty>> {
+        input: SaveCatalogPartyRequest,
+    ) -> ApplicationResult<CatalogParty> {
+        let input = normalize_saved_catalog_party(input)?;
+        let workspace_id = self.workspace_id();
+        let now = application_now()?;
+        let normalized_name = input.display_name.to_lowercase();
+        let mut transaction = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| storage("begin catalog party save transaction", error))?;
+        ensure_workspace_writable(&mut transaction, workspace_id).await?;
+
+        let party_id = if let Some(party_id) = &input.party_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM business_parties WHERE workspace_id = ?1 AND id = ?2)",
+            )
+            .bind(workspace_id)
+            .bind(party_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| storage("find catalog party for update", error))?;
+            if !exists {
+                return Err(ApplicationError::NotFound {
+                    entity: "business_party".to_owned(),
+                    key: party_id.clone(),
+                });
+            }
+            party_id.clone()
+        } else {
+            let candidate_id = new_id();
+            sqlx::query(
+                r#"
+                INSERT INTO business_parties
+                    (id, workspace_id, normalized_name, display_name, contact_name,
+                     phone, wechat, email, address, notes, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT (workspace_id, normalized_name) DO NOTHING
+                "#,
+            )
+            .bind(&candidate_id)
+            .bind(workspace_id)
+            .bind(&normalized_name)
+            .bind(&input.display_name)
+            .bind(&input.contact_name)
+            .bind(&input.phone)
+            .bind(&input.wechat)
+            .bind(&input.email)
+            .bind(&input.address)
+            .bind(&input.notes)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| storage("create unified catalog party", error))?;
+            sqlx::query_scalar(
+                "SELECT id FROM business_parties WHERE workspace_id = ?1 AND normalized_name = ?2",
+            )
+            .bind(workspace_id)
+            .bind(&normalized_name)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| storage("load unified catalog party", error))?
+        };
+
+        let conflicting_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM business_parties WHERE workspace_id = ?1 AND normalized_name = ?2 AND id <> ?3",
+        )
+        .bind(workspace_id)
+        .bind(&normalized_name)
+        .bind(&party_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| storage("check catalog party name", error))?;
+        if conflicting_id.is_some() {
+            return Err(ApplicationError::Conflict {
+                entity: "business_party".to_owned(),
+                key: input.display_name,
+                message: "party name already exists in this workspace".to_owned(),
+            });
+        }
+
         sqlx::query(
             r#"
-            SELECT bp.id, bp.display_name
-              FROM business_parties bp
-              JOIN party_roles pr ON pr.party_id = bp.id AND pr.workspace_id = bp.workspace_id
-             WHERE bp.workspace_id = ?1 AND pr.role = ?2
-             ORDER BY bp.display_name COLLATE NOCASE, bp.id
+            UPDATE business_parties
+               SET normalized_name = ?1, display_name = ?2, contact_name = ?3,
+                   phone = ?4, wechat = ?5, email = ?6, address = ?7, notes = ?8
+             WHERE workspace_id = ?9 AND id = ?10
+            "#,
+        )
+        .bind(&normalized_name)
+        .bind(&input.display_name)
+        .bind(&input.contact_name)
+        .bind(&input.phone)
+        .bind(&input.wechat)
+        .bind(&input.email)
+        .bind(&input.address)
+        .bind(&input.notes)
+        .bind(workspace_id)
+        .bind(&party_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| storage("update unified catalog party", error))?;
+
+        sqlx::query("DELETE FROM party_roles WHERE workspace_id = ?1 AND party_id = ?2")
+            .bind(workspace_id)
+            .bind(&party_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| storage("replace catalog party roles", error))?;
+        for role in &input.roles {
+            sqlx::query(
+                "INSERT INTO party_roles (workspace_id, party_id, role, created_at) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(workspace_id)
+            .bind(&party_id)
+            .bind(role.database_value())
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| storage("save catalog party role", error))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| storage("commit catalog party save", error))?;
+
+        Ok(CatalogParty {
+            party_id,
+            display_name: input.display_name,
+            roles: input.roles,
+            contact_name: input.contact_name,
+            phone: input.phone,
+            wechat: input.wechat,
+            email: input.email,
+            address: input.address,
+            notes: input.notes,
+        })
+    }
+
+    async fn list_catalog_parties(&self) -> ApplicationResult<Vec<CatalogParty>> {
+        let party_rows = sqlx::query(
+            r#"
+            SELECT id, display_name, contact_name, phone, wechat, email, address, notes
+              FROM business_parties
+             WHERE workspace_id = ?1
+             ORDER BY display_name COLLATE NOCASE, id
             "#,
         )
         .bind(self.workspace_id())
-        .bind(role.database_value())
         .fetch_all(self.pool())
         .await
-        .map_err(|error| storage("list catalog parties", error))?
-        .into_iter()
-        .map(|row| {
-            Ok(CatalogParty {
-                party_id: row
+        .map_err(|error| storage("list unified catalog parties", error))?;
+        let role_rows = sqlx::query(
+            "SELECT party_id, role FROM party_roles WHERE workspace_id = ?1 ORDER BY party_id, role",
+        )
+        .bind(self.workspace_id())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("list catalog party roles", error))?;
+        let mut roles_by_party: HashMap<String, Vec<CatalogPartyRole>> = HashMap::new();
+        for row in role_rows {
+            let party_id: String = row
+                .try_get("party_id")
+                .map_err(|error| storage("read catalog party role owner", error))?;
+            let role: String = row
+                .try_get("role")
+                .map_err(|error| storage("read catalog party role", error))?;
+            let role = CatalogPartyRole::from_database_value(&role).ok_or_else(|| {
+                validation("party role", &format!("unsupported stored role {role}"))
+            })?;
+            roles_by_party.entry(party_id).or_default().push(role);
+        }
+        for roles in roles_by_party.values_mut() {
+            roles.sort();
+        }
+        party_rows
+            .into_iter()
+            .map(|row| {
+                let party_id: String = row
                     .try_get("id")
-                    .map_err(|error| storage("read catalog party id", error))?,
-                display_name: row
-                    .try_get("display_name")
-                    .map_err(|error| storage("read catalog party name", error))?,
+                    .map_err(|error| storage("read catalog party id", error))?;
+                Ok(CatalogParty {
+                    roles: roles_by_party.remove(&party_id).unwrap_or_default(),
+                    party_id,
+                    display_name: row
+                        .try_get("display_name")
+                        .map_err(|error| storage("read catalog party name", error))?,
+                    contact_name: row
+                        .try_get("contact_name")
+                        .map_err(|error| storage("read catalog party contact", error))?,
+                    phone: row
+                        .try_get("phone")
+                        .map_err(|error| storage("read catalog party phone", error))?,
+                    wechat: row
+                        .try_get("wechat")
+                        .map_err(|error| storage("read catalog party wechat", error))?,
+                    email: row
+                        .try_get("email")
+                        .map_err(|error| storage("read catalog party email", error))?,
+                    address: row
+                        .try_get("address")
+                        .map_err(|error| storage("read catalog party address", error))?,
+                    notes: row
+                        .try_get("notes")
+                        .map_err(|error| storage("read catalog party notes", error))?,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     pub async fn inventory_summary(
@@ -1097,6 +1350,46 @@ fn normalize_catalog_party(
 ) -> ApplicationResult<CreateCatalogPartyRequest> {
     input.display_name = normalized_display_name("party name", input.display_name)?;
     Ok(input)
+}
+
+fn normalize_saved_catalog_party(
+    mut input: SaveCatalogPartyRequest,
+) -> ApplicationResult<SaveCatalogPartyRequest> {
+    input.party_id = clean_optional(input.party_id);
+    if let Some(party_id) = &input.party_id {
+        Uuid::parse_str(party_id).map_err(|_| validation("party_id", "must be a UUID"))?;
+    }
+    input.display_name = normalized_display_name("party name", input.display_name)?;
+    input.roles.sort();
+    input.roles.dedup();
+    if input.roles.is_empty() {
+        return Err(validation("roles", "select at least one party role"));
+    }
+    input.contact_name = normalize_optional_party_field("contact_name", input.contact_name, 120)?;
+    input.phone = normalize_optional_party_field("phone", input.phone, 120)?;
+    input.wechat = normalize_optional_party_field("wechat", input.wechat, 120)?;
+    input.email = normalize_optional_party_field("email", input.email, 254)?;
+    input.address = normalize_optional_party_field("address", input.address, 1000)?;
+    input.notes = normalize_optional_party_field("notes", input.notes, 2000)?;
+    Ok(input)
+}
+
+fn normalize_optional_party_field(
+    field: &str,
+    value: Option<String>,
+    max_chars: usize,
+) -> ApplicationResult<Option<String>> {
+    let value = clean_optional(value);
+    if value
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > max_chars)
+    {
+        return Err(validation(
+            field,
+            &format!("must be at most {max_chars} characters"),
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_barcodes_for_sku(barcodes: &[String], rules: &SkuScanRules) -> ApplicationResult<()> {
@@ -2133,6 +2426,94 @@ mod tests {
         assert_eq!(catalog_after_receipt.products.len(), 1);
         assert_eq!(catalog_after_receipt.goods_owners.len(), 1);
         assert_eq!(catalog_after_receipt.suppliers.len(), 1);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn unified_party_contacts_and_supplier_only_receipt_are_persisted() {
+        let (database, path) = test_database().await;
+        let product = database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "CONTACT-SKU".to_owned(),
+                name: "Contact Product".to_owned(),
+                serial_prefix: Some("CT".to_owned()),
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create contact test product");
+        let party = database
+            .save_catalog_party(SaveCatalogPartyRequest {
+                party_id: None,
+                display_name: "  Unified Partner  ".to_owned(),
+                roles: vec![
+                    CatalogPartyRole::Supplier,
+                    CatalogPartyRole::UpstreamReceiver,
+                ],
+                contact_name: Some("Contact A".to_owned()),
+                phone: Some("13800138000".to_owned()),
+                wechat: Some("contact-a".to_owned()),
+                email: Some("contact@example.com".to_owned()),
+                address: Some("Shenzhen".to_owned()),
+                notes: Some("Priority".to_owned()),
+            })
+            .await
+            .expect("save unified party");
+        assert_eq!(party.display_name, "Unified Partner");
+        assert!(party.roles.contains(&CatalogPartyRole::Supplier));
+        assert!(party.roles.contains(&CatalogPartyRole::UpstreamReceiver));
+        assert_eq!(party.phone.as_deref(), Some("13800138000"));
+
+        let catalog = database
+            .list_reference_catalog()
+            .await
+            .expect("list unified catalog");
+        assert_eq!(catalog.parties, vec![party.clone()]);
+        assert_eq!(catalog.suppliers, vec![party.clone()]);
+        assert!(catalog.goods_owners.is_empty());
+
+        let mut request = receipt_request(
+            "supplier-only-request",
+            "supplier-only-key",
+            "supplier-only-receipt",
+            &["CT0001"],
+        );
+        request.owner_name = party.display_name.clone();
+        request.supplier_name = party.display_name.clone();
+        request.sku_code = product.code;
+        request.sku_name = product.name;
+        let receipt = database
+            .post_receipt(request)
+            .await
+            .expect("post supplier-only receipt");
+        assert_eq!(receipt.owner_party_id, party.party_id);
+        assert_eq!(
+            receipt.supplier_party_id.as_deref(),
+            Some(party.party_id.as_str())
+        );
+
+        let updated = database
+            .save_catalog_party(SaveCatalogPartyRequest {
+                party_id: Some(party.party_id.clone()),
+                display_name: party.display_name,
+                roles: vec![CatalogPartyRole::Supplier, CatalogPartyRole::GoodsOwner],
+                contact_name: Some("Contact B".to_owned()),
+                phone: Some("0755-12345678".to_owned()),
+                wechat: None,
+                email: None,
+                address: Some("Guangzhou".to_owned()),
+                notes: None,
+            })
+            .await
+            .expect("update unified party");
+        assert_eq!(updated.party_id, receipt.owner_party_id);
+        assert_eq!(updated.contact_name.as_deref(), Some("Contact B"));
+        let party_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM business_parties WHERE workspace_id = ?1")
+                .bind(database.workspace_id())
+                .fetch_one(database.pool())
+                .await
+                .expect("count unified parties");
+        assert_eq!(party_count, 1);
         close_and_remove(database, path).await;
     }
 

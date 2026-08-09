@@ -19,6 +19,7 @@ import {
   Gauge,
   LogOut,
   PackagePlus,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -38,7 +39,7 @@ import "./InventoryWorkspace.css";
 type WorkspacePage = "overview" | "catalog" | "receipt" | "quality" | "inventory" | "outbound" | "legacy-import" | "users" | "settings";
 type WorkspaceMode = "offline" | "network";
 type NavigationGroupId = "operations" | "inventory_data" | "catalog" | "system";
-type CatalogTab = "products" | "goods_owners" | "suppliers";
+type CatalogTab = "products" | "parties";
 type InventoryStatus =
   | "received"
   | "available"
@@ -118,10 +119,18 @@ interface CatalogProduct {
 interface CatalogParty {
   party_id: string;
   display_name: string;
+  roles: CatalogPartyRole[];
+  contact_name: string | null;
+  phone: string | null;
+  wechat: string | null;
+  email: string | null;
+  address: string | null;
+  notes: string | null;
 }
 
 interface ReferenceCatalog {
   products: CatalogProduct[];
+  parties: CatalogParty[];
   goods_owners: CatalogParty[];
   suppliers: CatalogParty[];
 }
@@ -133,11 +142,18 @@ interface CreateCatalogProductRequest {
   serial_forbidden_chars: string;
 }
 
-type CatalogPartyRole = "goods_owner" | "supplier";
+type CatalogPartyRole = "supplier" | "goods_owner" | "upstream_receiver" | "carrier";
 
-interface CreateCatalogPartyRequest {
+interface SaveCatalogPartyRequest {
+  party_id: string | null;
   display_name: string;
-  role: CatalogPartyRole;
+  roles: CatalogPartyRole[];
+  contact_name: string | null;
+  phone: string | null;
+  wechat: string | null;
+  email: string | null;
+  address: string | null;
+  notes: string | null;
 }
 
 interface InspectionResultInput {
@@ -523,6 +539,13 @@ const qualityStatusLabels: Record<QualityStatus, string> = {
   waived: "例外放行",
 };
 
+const catalogPartyRoleLabels: Record<CatalogPartyRole, string> = {
+  supplier: "供应商",
+  goods_owner: "货主",
+  upstream_receiver: "客户",
+  carrier: "承运商",
+};
+
 function createId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -671,9 +694,16 @@ export default function InventoryWorkspace({
   const [newProductName, setNewProductName] = useState("");
   const [newProductSerialPrefix, setNewProductSerialPrefix] = useState("");
   const [newProductForbiddenChars, setNewProductForbiddenChars] = useState("-, ");
+  const [editingPartyId, setEditingPartyId] = useState<string | null>(null);
   const [newPartyName, setNewPartyName] = useState("");
+  const [newPartyRoles, setNewPartyRoles] = useState<Set<CatalogPartyRole>>(() => new Set(["supplier"]));
+  const [newPartyContactName, setNewPartyContactName] = useState("");
+  const [newPartyPhone, setNewPartyPhone] = useState("");
+  const [newPartyWechat, setNewPartyWechat] = useState("");
+  const [newPartyEmail, setNewPartyEmail] = useState("");
+  const [newPartyAddress, setNewPartyAddress] = useState("");
+  const [newPartyNotes, setNewPartyNotes] = useState("");
 
-  const [ownerName, setOwnerName] = useState("");
   const [supplierName, setSupplierName] = useState("");
   const [selectedProductId, setSelectedProductId] = useState("");
   const [receivedAt, setReceivedAt] = useState(getLocalDateTimeValue);
@@ -752,6 +782,15 @@ export default function InventoryWorkspace({
     () => catalog?.products.find((product) => product.sku_id === selectedProductId) ?? null,
     [catalog, selectedProductId],
   );
+  const receiptMissingDetails = [
+    !selectedProduct ? "商品" : null,
+    !catalog?.suppliers.some((party) => party.display_name === supplierName) ? "供应商" : null,
+    !receivedAt ? "入库时间" : null,
+    mode === "network" && !networkWarehouses.some((warehouse) => warehouse.warehouse_id === networkWarehouseId)
+      ? "入库仓库"
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  const receiptDetailsReady = receiptMissingDetails.length === 0;
   const barcodes = scannedBarcodes;
 
   const eligibleQualityItems = useMemo(() => {
@@ -781,9 +820,6 @@ export default function InventoryWorkspace({
       setSelectedProductId((current) => nextCatalog.products.some((product) => product.sku_id === current)
         ? current
         : (nextCatalog.products[0]?.sku_id ?? ""));
-      setOwnerName((current) => nextCatalog.goods_owners.some((party) => party.display_name === current)
-        ? current
-        : (nextCatalog.goods_owners[0]?.display_name ?? ""));
       setSupplierName((current) => nextCatalog.suppliers.some((party) => party.display_name === current)
         ? current
         : (nextCatalog.suppliers[0]?.display_name ?? ""));
@@ -969,7 +1005,7 @@ export default function InventoryWorkspace({
 
   useEffect(() => {
     let focusFrame: number | null = null;
-    if (page === "receipt") {
+    if (page === "receipt" && receiptDetailsReady && !catalogLoading && !receiptLoading && !scanChecking) {
       focusFrame = window.requestAnimationFrame(() => scannerInputRef.current?.focus());
     } else if (page === "quality" && !qualityLoading && !qualityScanChecking) {
       focusFrame = window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
@@ -979,7 +1015,7 @@ export default function InventoryWorkspace({
     return () => {
       if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
     };
-  }, [page, outboundAllocation, outboundLoading, outboundScanChecking, outboundShipment, qualityLoading, qualityScanChecking]);
+  }, [catalogLoading, page, outboundAllocation, outboundLoading, outboundScanChecking, outboundShipment, qualityLoading, qualityScanChecking, receiptDetailsReady, receiptLoading, scanChecking]);
 
   function toggleNavGroup(groupId: NavigationGroupId) {
     setExpandedNavGroups((current) => {
@@ -992,14 +1028,54 @@ export default function InventoryWorkspace({
     setNewProductName("");
     setNewProductSerialPrefix("");
     setNewProductForbiddenChars("-, ");
+    setEditingPartyId(null);
     setNewPartyName("");
+    setNewPartyRoles(new Set(["supplier"]));
+    setNewPartyContactName("");
+    setNewPartyPhone("");
+    setNewPartyWechat("");
+    setNewPartyEmail("");
+    setNewPartyAddress("");
+    setNewPartyNotes("");
   }
 
-  function openCatalogCreate(tab: CatalogTab = catalogTab) {
+  function openCatalogCreate(tab: CatalogTab = catalogTab, initialRoles: CatalogPartyRole[] = ["supplier"]) {
     resetCatalogDraft();
     setCatalogTab(tab);
+    if (tab === "parties") setNewPartyRoles(new Set(initialRoles));
     setCatalogNotice(null);
     setCatalogCreateOpen(true);
+  }
+
+  function openCatalogCreateFromReceipt(tab: CatalogTab) {
+    if (workspaceOperationInProgress()) return;
+    openCatalogCreate(tab, ["supplier"]);
+    setPage("catalog");
+  }
+
+  function openCatalogPartyEdit(party: CatalogParty) {
+    resetCatalogDraft();
+    setCatalogTab("parties");
+    setEditingPartyId(party.party_id);
+    setNewPartyName(party.display_name);
+    setNewPartyRoles(new Set(party.roles));
+    setNewPartyContactName(party.contact_name ?? "");
+    setNewPartyPhone(party.phone ?? "");
+    setNewPartyWechat(party.wechat ?? "");
+    setNewPartyEmail(party.email ?? "");
+    setNewPartyAddress(party.address ?? "");
+    setNewPartyNotes(party.notes ?? "");
+    setCatalogNotice(null);
+    setCatalogCreateOpen(true);
+  }
+
+  function toggleNewPartyRole(role: CatalogPartyRole) {
+    setNewPartyRoles((current) => {
+      const next = new Set(current);
+      if (next.has(role)) next.delete(role);
+      else next.add(role);
+      return next;
+    });
   }
 
   function closeCatalogCreate() {
@@ -1052,7 +1128,6 @@ export default function InventoryWorkspace({
     setCatalogCreateOpen(false);
     resetCatalogDraft();
     setSelectedProductId("");
-    setOwnerName("");
     setSupplierName("");
 
     setScannedBarcodes([]);
@@ -1249,18 +1324,31 @@ export default function InventoryWorkspace({
       setCatalogNotice({ type: "error", text: "请填写名称。" });
       return;
     }
-    const partyRole: CatalogPartyRole = catalogTab === "suppliers" ? "supplier" : "goods_owner";
+    if (newPartyRoles.size === 0) {
+      setCatalogNotice({ type: "error", text: "请至少选择一个角色。" });
+      return;
+    }
     setCatalogLoading(true);
     try {
-      const input: CreateCatalogPartyRequest = { display_name: newPartyName, role: partyRole };
-      const command = mode === "network" ? "v2_network_create_catalog_party" : "v2_create_catalog_party";
+      const optional = (value: string) => value.trim() || null;
+      const input: SaveCatalogPartyRequest = {
+        party_id: editingPartyId,
+        display_name: newPartyName,
+        roles: Array.from(newPartyRoles),
+        contact_name: optional(newPartyContactName),
+        phone: optional(newPartyPhone),
+        wechat: optional(newPartyWechat),
+        email: optional(newPartyEmail),
+        address: optional(newPartyAddress),
+        notes: optional(newPartyNotes),
+      };
+      const command = mode === "network" ? "v2_network_save_catalog_party" : "v2_save_catalog_party";
       const party = await invoke<CatalogParty>(command, { input });
-      if (partyRole === "goods_owner") setOwnerName(party.display_name);
-      else setSupplierName(party.display_name);
-      setNewPartyName("");
-      setCatalogNotice({ type: "success", text: `已保存${partyRole === "goods_owner" ? "货主/客户" : "供应商"} ${party.display_name}。` });
+      if (party.roles.includes("supplier")) setSupplierName(party.display_name);
+      setCatalogNotice({ type: "success", text: `已保存往来方 ${party.display_name}。` });
       await refreshCatalog();
       setCatalogCreateOpen(false);
+      resetCatalogDraft();
     } catch (error) {
       setCatalogNotice({ type: "error", text: `保存往来方失败：${displayError(error)}` });
     } finally {
@@ -1307,7 +1395,7 @@ export default function InventoryWorkspace({
 
   async function addScannedBarcode() {
     const rawBarcode = scannerInput;
-    if (!rawBarcode.trim() || scanCheckingRef.current) return;
+    if (!receiptDetailsReady || !rawBarcode.trim() || scanCheckingRef.current) return;
     scanCheckingRef.current = true;
     setScanChecking(true);
     try {
@@ -1326,7 +1414,7 @@ export default function InventoryWorkspace({
 
   async function importReceiptBarcodes() {
     const candidates = parseBarcodeLines(receiptBulkInput);
-    if (candidates.length === 0 || scanCheckingRef.current) return;
+    if (!receiptDetailsReady || candidates.length === 0 || scanCheckingRef.current) return;
     scanCheckingRef.current = true;
     setScanChecking(true);
     try {
@@ -1371,8 +1459,8 @@ export default function InventoryWorkspace({
   async function submitReceipt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setReceiptNotice(null);
-    if (!ownerName.trim() || !supplierName.trim() || !selectedProduct) {
-      setReceiptNotice({ type: "error", text: "请选择货主/客户、供应商和商品。" });
+    if (!receiptDetailsReady || !selectedProduct) {
+      setReceiptNotice({ type: "error", text: `入库资料不完整：请补充${receiptMissingDetails.join("、")}。` });
       return;
     }
     if (barcodes.length === 0) {
@@ -1387,7 +1475,7 @@ export default function InventoryWorkspace({
         request_id: operationId,
         idempotency_key: `receipt:${operationId}`,
         receipt_no: makeDocumentNumber("RK"),
-        owner_name: ownerName.trim(),
+        owner_name: supplierName.trim(),
         supplier_name: supplierName.trim(),
         sku_code: selectedProduct.code,
         sku_name: selectedProduct.name,
@@ -2134,13 +2222,10 @@ export default function InventoryWorkspace({
 
   function renderCatalog() {
     const products = catalog?.products ?? [];
-    const goodsOwners = catalog?.goods_owners ?? [];
-    const suppliers = catalog?.suppliers ?? [];
+    const parties = catalog?.parties ?? [];
     const mutationDisabled = mode === "offline" && !offlineActivated;
-    const activeParties = catalogTab === "goods_owners" ? goodsOwners : suppliers;
-    const activeTabLabel = catalogTab === "products" ? "商品" : catalogTab === "goods_owners" ? "货主 / 客户" : "供应商";
-    const createButtonLabel = catalogTab === "products" ? "新增商品" : catalogTab === "goods_owners" ? "新增货主 / 客户" : "新增供应商";
-    const CatalogIcon = catalogTab === "products" ? Tags : catalogTab === "goods_owners" ? Users : Warehouse;
+    const activeTabLabel = catalogTab === "products" ? "商品" : "往来方";
+    const createButtonLabel = catalogTab === "products" ? "新增商品" : "新增往来方";
 
     return (
       <section className="v2-page" aria-labelledby="v2-catalog-title">
@@ -2148,7 +2233,7 @@ export default function InventoryWorkspace({
           <div>
             <span className="v2-eyebrow">基础资料</span>
             <h2 id="v2-catalog-title">商品与往来方</h2>
-            <p>维护入库所需档案。</p>
+            <p>维护商品和业务往来方档案。</p>
           </div>
           <button className="v2-button" type="button" onClick={() => void refreshCatalog()} disabled={catalogLoading}>
             <RefreshCw size={16} className={catalogLoading ? "v2-spin" : ""} /> 刷新
@@ -2160,13 +2245,12 @@ export default function InventoryWorkspace({
         <div className="v2-catalog-toolbar">
           <div className="v2-catalog-tabs" role="tablist" aria-label="基础资料类型">
             <button id="v2-catalog-tab-products" type="button" role="tab" aria-selected={catalogTab === "products"} className={catalogTab === "products" ? "active" : ""} onClick={() => setCatalogTab("products")}><Tags size={16} /> 商品 <span>{products.length}</span></button>
-            <button id="v2-catalog-tab-owners" type="button" role="tab" aria-selected={catalogTab === "goods_owners"} className={catalogTab === "goods_owners" ? "active" : ""} onClick={() => setCatalogTab("goods_owners")}><Users size={16} /> 货主 / 客户 <span>{goodsOwners.length}</span></button>
-            <button id="v2-catalog-tab-suppliers" type="button" role="tab" aria-selected={catalogTab === "suppliers"} className={catalogTab === "suppliers" ? "active" : ""} onClick={() => setCatalogTab("suppliers")}><Warehouse size={16} /> 供应商 <span>{suppliers.length}</span></button>
+            <button id="v2-catalog-tab-parties" type="button" role="tab" aria-selected={catalogTab === "parties"} className={catalogTab === "parties" ? "active" : ""} onClick={() => setCatalogTab("parties")}><Users size={16} /> 往来方 <span>{parties.length}</span></button>
           </div>
           <button className="v2-button primary" type="button" onClick={() => openCatalogCreate()} disabled={catalogLoading || mutationDisabled}><Plus size={16} /> {createButtonLabel}</button>
         </div>
 
-        <section className="v2-panel v2-catalog-directory" role="tabpanel" aria-labelledby={catalogTab === "products" ? "v2-catalog-tab-products" : catalogTab === "goods_owners" ? "v2-catalog-tab-owners" : "v2-catalog-tab-suppliers"} aria-busy={catalogLoading}>
+        <section className="v2-panel v2-catalog-directory" role="tabpanel" aria-labelledby={catalogTab === "products" ? "v2-catalog-tab-products" : "v2-catalog-tab-parties"} aria-busy={catalogLoading}>
           {catalogTab === "products" ? <>
             <div className="v2-section-heading compact">
               <div><h3>商品目录</h3><small>{products.length} 个商品</small></div>
@@ -2192,14 +2276,20 @@ export default function InventoryWorkspace({
             </div>
           </> : <>
             <div className="v2-section-heading compact">
-              <div><h3>{activeTabLabel}目录</h3><small>{activeParties.length} 个档案</small></div>
+              <div><h3>往来方目录</h3><small>{parties.length} 个档案</small></div>
             </div>
             <div className="v2-table-wrap">
               <table className="v2-catalog-party-table">
-                <thead><tr><th>名称</th></tr></thead>
+                <thead><tr><th>名称</th><th>角色</th><th>联系方式</th><th>地址</th><th aria-label="操作" /></tr></thead>
                 <tbody>
-                  {!catalogLoading && activeParties.length === 0 && <tr><td className="v2-table-empty"><div className="v2-catalog-empty"><CatalogIcon size={28} /><strong>暂无{activeTabLabel}</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate(catalogTab)} disabled={mutationDisabled}><Plus size={16} /> {createButtonLabel}</button></div></td></tr>}
-                  {activeParties.map((party) => <tr key={party.party_id}><td><strong>{party.display_name}</strong></td></tr>)}
+                  {!catalogLoading && parties.length === 0 && <tr><td className="v2-table-empty" colSpan={5}><div className="v2-catalog-empty"><Users size={28} /><strong>暂无往来方</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate("parties")} disabled={mutationDisabled}><Plus size={16} /> 新增往来方</button></div></td></tr>}
+                  {parties.map((party) => <tr key={party.party_id}>
+                    <td><strong>{party.display_name}</strong>{party.contact_name && <small>{party.contact_name}</small>}</td>
+                    <td><div className="v2-party-role-list">{party.roles.map((role) => <span key={role}>{catalogPartyRoleLabels[role]}</span>)}</div></td>
+                    <td><div className="v2-party-contact">{party.phone && <span>{party.phone}</span>}{party.wechat && <span>微信：{party.wechat}</span>}{party.email && <span>{party.email}</span>}{!party.phone && !party.wechat && !party.email && <span className="v2-muted-value">未填写</span>}</div></td>
+                    <td>{party.address || <span className="v2-muted-value">未填写</span>}</td>
+                    <td><button className="v2-icon-button" type="button" onClick={() => openCatalogPartyEdit(party)} disabled={mutationDisabled || catalogLoading} aria-label={`编辑往来方 ${party.display_name}`} title="编辑往来方"><Pencil size={16} /></button></td>
+                  </tr>)}
                 </tbody>
               </table>
             </div>
@@ -2209,7 +2299,7 @@ export default function InventoryWorkspace({
         {catalogCreateOpen && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeCatalogCreate(); }} onKeyDown={(event) => { if (event.key === "Escape") closeCatalogCreate(); }}>
           <section className="v2-catalog-modal" role="dialog" aria-modal="true" aria-labelledby="v2-catalog-create-title">
             <header>
-              <div><span>{activeTabLabel}</span><h3 id="v2-catalog-create-title">{createButtonLabel}</h3></div>
+              <div><span>{activeTabLabel}</span><h3 id="v2-catalog-create-title">{catalogTab === "parties" && editingPartyId ? "编辑往来方" : createButtonLabel}</h3></div>
               <button className="v2-icon-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading} aria-label="关闭新增窗口" title="关闭"><X size={17} /></button>
             </header>
             {catalogTab === "products" ? <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogProduct}>
@@ -2222,9 +2312,21 @@ export default function InventoryWorkspace({
               {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
               <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}><Plus size={16} /> 保存商品</button></div>
             </form> : <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogParty}>
-              <label><span>{activeTabLabel}名称 *</span><input value={newPartyName} onChange={(event) => setNewPartyName(event.target.value)} placeholder={catalogTab === "goods_owners" ? "例如 客户 A" : "例如 供应商 A"} autoComplete="organization" autoFocus required disabled={catalogLoading || mutationDisabled} /></label>
+              <div className="v2-form-grid">
+                <label><span>名称 *</span><input value={newPartyName} onChange={(event) => setNewPartyName(event.target.value)} placeholder="例如 深圳某某科技" autoComplete="organization" autoFocus required disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>联系人</span><input value={newPartyContactName} onChange={(event) => setNewPartyContactName(event.target.value)} placeholder="姓名" autoComplete="name" disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>电话</span><input type="tel" value={newPartyPhone} onChange={(event) => setNewPartyPhone(event.target.value)} placeholder="手机号或座机" autoComplete="tel" disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>微信号</span><input value={newPartyWechat} onChange={(event) => setNewPartyWechat(event.target.value)} placeholder="微信号" autoComplete="off" disabled={catalogLoading || mutationDisabled} /></label>
+                <label className="v2-span-two"><span>电子邮箱</span><input type="email" value={newPartyEmail} onChange={(event) => setNewPartyEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" disabled={catalogLoading || mutationDisabled} /></label>
+                <label className="v2-span-two"><span>地址</span><input value={newPartyAddress} onChange={(event) => setNewPartyAddress(event.target.value)} placeholder="省市区及详细地址" autoComplete="street-address" disabled={catalogLoading || mutationDisabled} /></label>
+                <label className="v2-span-two"><span>备注</span><textarea value={newPartyNotes} onChange={(event) => setNewPartyNotes(event.target.value)} rows={3} disabled={catalogLoading || mutationDisabled} /></label>
+              </div>
+              <fieldset className="v2-role-checklist v2-party-role-checklist">
+                <legend>业务角色 *</legend>
+                {(Object.entries(catalogPartyRoleLabels) as [CatalogPartyRole, string][]).map(([role, label]) => <label key={role}><input type="checkbox" checked={newPartyRoles.has(role)} onChange={() => toggleNewPartyRole(role)} disabled={catalogLoading || mutationDisabled} /><span><strong>{label}</strong></span></label>)}
+              </fieldset>
               {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
-              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}><Plus size={16} /> 保存{activeTabLabel}</button></div>
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}>{editingPartyId ? <CheckCircle2 size={16} /> : <Plus size={16} />} 保存往来方</button></div>
             </form>}
           </section>
         </div>}
@@ -2234,16 +2336,19 @@ export default function InventoryWorkspace({
 
   function renderReceipt() {
     const products = catalog?.products ?? [];
-    const goodsOwners = catalog?.goods_owners ?? [];
     const suppliers = catalog?.suppliers ?? [];
     const productLocked = scannedBarcodes.length > 0;
     const mutationDisabled = mode === "offline" && !offlineActivated;
-    const networkWarehouseReady = mode !== "network"
-      || networkWarehouses.some((warehouse) => warehouse.warehouse_id === networkWarehouseId);
-    const detailsReady = Boolean(receivedAt && selectedProduct && ownerName.trim() && supplierName.trim() && networkWarehouseReady);
-    const receiptReady = detailsReady && barcodes.length > 0;
-    const stepOneState = detailsReady ? "complete" : "active";
-    const stepTwoState = barcodes.length > 0 ? "complete" : detailsReady ? "active" : "pending";
+    const missingCatalogEntries = [
+      products.length === 0 ? "商品" : null,
+      suppliers.length === 0 ? "供应商" : null,
+    ].filter((value): value is string => Boolean(value));
+    const firstMissingCatalogTab: CatalogTab = products.length === 0
+      ? "products"
+      : "parties";
+    const receiptReady = receiptDetailsReady && barcodes.length > 0;
+    const stepOneState = receiptDetailsReady ? "complete" : "active";
+    const stepTwoState = barcodes.length > 0 ? "complete" : receiptDetailsReady ? "active" : "pending";
     const stepThreeState = receiptReady ? "active" : "pending";
     const forbiddenTokens = selectedProduct ? parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars) : [];
 
@@ -2258,22 +2363,19 @@ export default function InventoryWorkspace({
 
         <form className="v2-panel v2-form v2-receipt-form" onSubmit={submitReceipt}>
           <ol className="v2-receipt-progress" aria-label="入库步骤">
-            <li className={stepOneState}><span>1</span><div><strong>选择资料</strong><small>{detailsReady ? "已就绪" : "待选择"}</small></div></li>
+            <li className={stepOneState}><span>1</span><div><strong>选择资料</strong><small>{receiptDetailsReady ? "已就绪" : "待选择"}</small></div></li>
             <li className={stepTwoState}><span>2</span><div><strong>扫描 SN</strong><small>{barcodes.length > 0 ? `${barcodes.length} 件` : "待扫描"}</small></div></li>
             <li className={stepThreeState}><span>3</span><div><strong>确认入库</strong><small>{receiptReady ? "可提交" : "待完成"}</small></div></li>
           </ol>
 
           <section className="v2-receipt-details-step" aria-labelledby="v2-receipt-details-title">
-            <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{detailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
+            <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{receiptDetailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
+            {!catalogLoading && catalog && missingCatalogEntries.length > 0 && <div className="v2-notice warning v2-receipt-prerequisite" role="alert"><span>缺少基础资料：{missingCatalogEntries.join("、")}。请先新增后再扫码。</span><button className="v2-button" type="button" onClick={() => openCatalogCreateFromReceipt(firstMissingCatalogTab)}><Plus size={16} /> 新增{missingCatalogEntries[0]}</button></div>}
             <div className="v2-form-grid">
             <label><span>商品 *</span><select value={selectedProductId} onChange={(event) => { setSelectedProductId(event.target.value); setScannerInput(""); setReceiptNotice(null); }} required disabled={catalogLoading || scanChecking || productLocked || products.length === 0}>
               {products.length === 0 && <option value="">{catalogLoading ? "正在读取商品…" : "没有可用商品"}</option>}
               {products.map((product) => <option key={product.sku_id} value={product.sku_id}>{product.code} · {product.name}</option>)}
             </select>{productLocked && <small>当前批次已有 SN，商品已锁定。</small>}</label>
-            <label><span>货主 / 客户 *</span><select value={ownerName} onChange={(event) => setOwnerName(event.target.value)} required disabled={catalogLoading || goodsOwners.length === 0}>
-              {goodsOwners.length === 0 && <option value="">{catalogLoading ? "正在读取货主/客户…" : "没有可用货主/客户"}</option>}
-              {goodsOwners.map((party) => <option key={party.party_id} value={party.display_name}>{party.display_name}</option>)}
-            </select></label>
             <label><span>供应商 *</span><select value={supplierName} onChange={(event) => setSupplierName(event.target.value)} required disabled={catalogLoading || suppliers.length === 0}>
               {suppliers.length === 0 && <option value="">{catalogLoading ? "正在读取供应商…" : "没有可用供应商"}</option>}
               {suppliers.map((party) => <option key={party.party_id} value={party.display_name}>{party.display_name}</option>)}
@@ -2291,9 +2393,9 @@ export default function InventoryWorkspace({
             </div>
           </section>
 
-          <section className="v2-scanner-section" aria-labelledby="v2-scanner-title">
+          <section className={`v2-scanner-section ${receiptDetailsReady ? "" : "locked"}`} aria-labelledby="v2-scanner-title" aria-disabled={!receiptDetailsReady}>
             <div className="v2-scanner-heading">
-              <div className="v2-receipt-section-heading"><span>2</span><div><h3 id="v2-scanner-title">扫描 SN</h3><small>逐件校验</small></div></div>
+              <div className="v2-receipt-section-heading"><span>2</span><div><h3 id="v2-scanner-title">扫描 SN</h3><small>{receiptDetailsReady ? "逐件校验" : "等待资料完整"}</small></div></div>
               <strong>{barcodes.length}<small>件</small></strong>
             </div>
 
@@ -2312,8 +2414,8 @@ export default function InventoryWorkspace({
                     event.preventDefault();
                     void addScannedBarcode();
                   }
-                }} placeholder="请扫描 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
-                <button className="v2-button" type="button" onClick={() => void addScannedBarcode()} disabled={!scannerInput.trim() || scanChecking || receiptLoading || mutationDisabled}>{scanChecking ? "正在校验…" : "手动加入"}</button>
+                }} placeholder={receiptDetailsReady ? "请扫描 SN（扫码枪自动回车）" : "请先完成入库资料"} autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={!receiptDetailsReady || scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
+                <button className="v2-button" type="button" onClick={() => void addScannedBarcode()} disabled={!receiptDetailsReady || !scannerInput.trim() || scanChecking || receiptLoading || mutationDisabled}>{scanChecking ? "正在校验…" : "手动加入"}</button>
               </div>
               <small>扫描后会自动回到输入框；每个 SN 即时精确查重，提交时数据库再次校验唯一性。</small>
             </label>
@@ -2337,8 +2439,8 @@ export default function InventoryWorkspace({
             <details className="v2-alternative-entry">
               <summary><span>备用录入</span><small>批量粘贴 SN，仅在扫码枪不可用时使用</small><ChevronDown size={16} /></summary>
               <div className="v2-alternative-content">
-                <label><span>每行一个 SN</span><textarea value={receiptBulkInput} onChange={(event) => setReceiptBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={scanChecking || receiptLoading || mutationDisabled} /></label>
-                <button className="v2-button" type="button" onClick={() => void importReceiptBarcodes()} disabled={!receiptBulkInput.trim() || scanChecking || receiptLoading || mutationDisabled}>校验并加入批次</button>
+                <label><span>每行一个 SN</span><textarea value={receiptBulkInput} onChange={(event) => setReceiptBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={!receiptDetailsReady || scanChecking || receiptLoading || mutationDisabled} /></label>
+                <button className="v2-button" type="button" onClick={() => void importReceiptBarcodes()} disabled={!receiptDetailsReady || !receiptBulkInput.trim() || scanChecking || receiptLoading || mutationDisabled}>校验并加入批次</button>
               </div>
             </details>
           </section>
@@ -2347,7 +2449,6 @@ export default function InventoryWorkspace({
             <div className="v2-receipt-section-heading"><span>3</span><div><h3 id="v2-receipt-confirm-title">确认入库</h3><small>{receiptReady ? "核对后提交" : "完成前两步后提交"}</small></div></div>
             <div className="v2-receipt-confirm-summary">
               <span><small>商品</small><strong>{selectedProduct?.code ?? "—"}</strong></span>
-              <span><small>货主 / 客户</small><strong>{ownerName || "—"}</strong></span>
               <span><small>供应商</small><strong>{supplierName || "—"}</strong></span>
               <span><small>数量</small><strong>{barcodes.length} 件</strong></span>
             </div>

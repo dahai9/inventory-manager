@@ -7,7 +7,7 @@
 use super::application::{
     CatalogParty, CatalogProduct, CompleteInspectionResponse, CreateCatalogPartyRequest,
     CreateCatalogProductRequest, InventoryListResponse, InventorySummaryResponse,
-    PostReceiptResponse, ReferenceCatalog,
+    PostReceiptResponse, ReferenceCatalog, SaveCatalogPartyRequest,
 };
 use super::identity_admin::{
     CreateTenantUserRequest, CreateTenantUserResponse, DisableTenantUserRequest,
@@ -279,6 +279,14 @@ impl NetworkClient {
         request: &CreateCatalogPartyRequest,
     ) -> Result<CatalogParty, NetworkClientError> {
         self.authorized_json(Method::POST, "/v1/reference/parties", request)
+            .await
+    }
+
+    pub async fn save_catalog_party(
+        &self,
+        request: &SaveCatalogPartyRequest,
+    ) -> Result<CatalogParty, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/reference/parties/save", request)
             .await
     }
 

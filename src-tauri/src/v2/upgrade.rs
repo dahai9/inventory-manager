@@ -2556,14 +2556,29 @@ impl<'a> PgUpgradeTransaction<'a> {
             sqlx::query(
                 r#"
                 INSERT INTO business_parties
-                    (tenant_id, id, normalized_name, display_name, created_at)
-                VALUES ($1, $2, $3, $4, $5::timestamptz)
+                    (tenant_id, id, normalized_name, display_name, contact_name,
+                     phone, wechat, email, address, notes, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
             .bind(uuid_field(record, "business_parties", "id")?)
             .bind(string_field(record, "business_parties", "normalized_name")?)
             .bind(string_field(record, "business_parties", "display_name")?)
+            .bind(optional_string_field(
+                record,
+                "business_parties",
+                "contact_name",
+            )?)
+            .bind(optional_string_field(record, "business_parties", "phone")?)
+            .bind(optional_string_field(record, "business_parties", "wechat")?)
+            .bind(optional_string_field(record, "business_parties", "email")?)
+            .bind(optional_string_field(
+                record,
+                "business_parties",
+                "address",
+            )?)
+            .bind(optional_string_field(record, "business_parties", "notes")?)
             .bind(string_field(record, "business_parties", "created_at")?)
             .execute(&mut *self.transaction)
             .await?;

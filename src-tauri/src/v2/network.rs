@@ -8,7 +8,7 @@ use super::application::{
     CatalogParty, CatalogPartyRole, CatalogProduct, CreateCatalogPartyRequest,
     CreateCatalogProductRequest, InventoryListItem, InventoryListQuery, InventoryListResponse,
     InventorySummaryQuery, InventorySummaryResponse, PostReceiptResponse, ReceiptUnit,
-    ReferenceCatalog,
+    ReferenceCatalog, SaveCatalogPartyRequest,
 };
 use super::auth::{
     authenticate_password, issue_session, revoke_session, rotate_refresh_token, AuthError,
@@ -144,13 +144,22 @@ impl NetworkService {
         .bind(request.warehouse_id)
         .fetch_one(&mut **transaction)
         .await?;
-        let owner_id = lookup_catalog_party(
-            transaction,
-            tenant_id,
-            &request.owner_name,
-            CatalogPartyRole::GoodsOwner,
-        )
-        .await?;
+        let supplier_is_owner = request
+            .owner_name
+            .eq_ignore_ascii_case(&request.supplier_name);
+        let legacy_owner_id = if supplier_is_owner {
+            None
+        } else {
+            Some(
+                lookup_catalog_party(
+                    transaction,
+                    tenant_id,
+                    &request.owner_name,
+                    CatalogPartyRole::GoodsOwner,
+                )
+                .await?,
+            )
+        };
         let supplier_id = lookup_catalog_party(
             transaction,
             tenant_id,
@@ -158,6 +167,7 @@ impl NetworkService {
             CatalogPartyRole::Supplier,
         )
         .await?;
+        let owner_id = legacy_owner_id.unwrap_or(supplier_id);
         let sku = lookup_catalog_sku(transaction, tenant_id, &request.sku_code, &request.sku_name)
             .await?;
         validate_barcodes_for_sku(&request.barcodes, &sku)?;
@@ -450,13 +460,21 @@ impl NetworkService {
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        let goods_owners =
-            list_catalog_parties(transaction, tenant_id, CatalogPartyRole::GoodsOwner).await?;
-        let suppliers =
-            list_catalog_parties(transaction, tenant_id, CatalogPartyRole::Supplier).await?;
+        let parties = list_catalog_parties(transaction, tenant_id).await?;
+        let goods_owners = parties
+            .iter()
+            .filter(|party| party.roles.contains(&CatalogPartyRole::GoodsOwner))
+            .cloned()
+            .collect();
+        let suppliers = parties
+            .iter()
+            .filter(|party| party.roles.contains(&CatalogPartyRole::Supplier))
+            .cloned()
+            .collect();
         authorized.commit().await?;
         Ok(ReferenceCatalog {
             products,
+            parties,
             goods_owners,
             suppliers,
         })
@@ -530,6 +548,138 @@ impl NetworkService {
         Ok(CatalogParty {
             party_id: party_id.to_string(),
             display_name,
+            roles: vec![input.role],
+            contact_name: None,
+            phone: None,
+            wechat: None,
+            email: None,
+            address: None,
+            notes: None,
+        })
+    }
+
+    pub async fn save_catalog_party(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        input: SaveCatalogPartyRequest,
+    ) -> NetworkResult<CatalogParty> {
+        let input = normalize_saved_catalog_party(input)?;
+        let normalized_name = input.display_name.to_lowercase();
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_RECEIPT_WRITE)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+
+        let party_id = if let Some(party_id) = input.party_id {
+            let party_id = Uuid::parse_str(&party_id)
+                .map_err(|_| NetworkServiceError::Invalid("party_id must be a UUID".to_owned()))?;
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM business_parties WHERE tenant_id = $1 AND id = $2)",
+            )
+            .bind(tenant_id)
+            .bind(party_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !exists {
+                return Err(NetworkServiceError::Conflict {
+                    entity: "business_party".to_owned(),
+                    key: party_id.to_string(),
+                });
+            }
+            party_id
+        } else {
+            sqlx::query_scalar(
+                r#"
+                INSERT INTO business_parties
+                    (tenant_id, id, normalized_name, display_name, contact_name,
+                     phone, wechat, email, address, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (tenant_id, normalized_name) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    contact_name = EXCLUDED.contact_name,
+                    phone = EXCLUDED.phone,
+                    wechat = EXCLUDED.wechat,
+                    email = EXCLUDED.email,
+                    address = EXCLUDED.address,
+                    notes = EXCLUDED.notes
+                RETURNING id
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(Uuid::now_v7())
+            .bind(&normalized_name)
+            .bind(&input.display_name)
+            .bind(&input.contact_name)
+            .bind(&input.phone)
+            .bind(&input.wechat)
+            .bind(&input.email)
+            .bind(&input.address)
+            .bind(&input.notes)
+            .fetch_one(&mut **transaction)
+            .await?
+        };
+
+        let conflicting_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM business_parties WHERE tenant_id = $1 AND normalized_name = $2 AND id <> $3",
+        )
+        .bind(tenant_id)
+        .bind(&normalized_name)
+        .bind(party_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if conflicting_id.is_some() {
+            return Err(NetworkServiceError::Conflict {
+                entity: "business_party".to_owned(),
+                key: input.display_name,
+            });
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE business_parties
+               SET normalized_name = $1, display_name = $2, contact_name = $3,
+                   phone = $4, wechat = $5, email = $6, address = $7, notes = $8
+             WHERE tenant_id = $9 AND id = $10
+            "#,
+        )
+        .bind(&normalized_name)
+        .bind(&input.display_name)
+        .bind(&input.contact_name)
+        .bind(&input.phone)
+        .bind(&input.wechat)
+        .bind(&input.email)
+        .bind(&input.address)
+        .bind(&input.notes)
+        .bind(tenant_id)
+        .bind(party_id)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query("DELETE FROM party_roles WHERE tenant_id = $1 AND party_id = $2")
+            .bind(tenant_id)
+            .bind(party_id)
+            .execute(&mut **transaction)
+            .await?;
+        for role in &input.roles {
+            sqlx::query("INSERT INTO party_roles (tenant_id, party_id, role) VALUES ($1, $2, $3)")
+                .bind(tenant_id)
+                .bind(party_id)
+                .bind(role.database_value())
+                .execute(&mut **transaction)
+                .await?;
+        }
+        authorized.commit().await?;
+        Ok(CatalogParty {
+            party_id: party_id.to_string(),
+            display_name: input.display_name,
+            roles: input.roles,
+            contact_name: input.contact_name,
+            phone: input.phone,
+            wechat: input.wechat,
+            email: input.email,
+            address: input.address,
+            notes: input.notes,
         })
     }
 
@@ -1120,6 +1270,46 @@ fn normalize_catalog_product(
     Ok(input)
 }
 
+fn normalize_saved_catalog_party(
+    mut input: SaveCatalogPartyRequest,
+) -> NetworkResult<SaveCatalogPartyRequest> {
+    input.party_id = normalize_optional_party_field("party_id", input.party_id, 64)?;
+    input.display_name = normalized_display_name("party name", input.display_name)?;
+    input.roles.sort();
+    input.roles.dedup();
+    if input.roles.is_empty() {
+        return Err(NetworkServiceError::Invalid(
+            "select at least one party role".to_owned(),
+        ));
+    }
+    input.contact_name = normalize_optional_party_field("contact_name", input.contact_name, 120)?;
+    input.phone = normalize_optional_party_field("phone", input.phone, 120)?;
+    input.wechat = normalize_optional_party_field("wechat", input.wechat, 120)?;
+    input.email = normalize_optional_party_field("email", input.email, 254)?;
+    input.address = normalize_optional_party_field("address", input.address, 1000)?;
+    input.notes = normalize_optional_party_field("notes", input.notes, 2000)?;
+    Ok(input)
+}
+
+fn normalize_optional_party_field(
+    field: &str,
+    value: Option<String>,
+    max_chars: usize,
+) -> NetworkResult<Option<String>> {
+    let value = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if value
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > max_chars)
+    {
+        return Err(NetworkServiceError::Invalid(format!(
+            "{field} must be at most {max_chars} characters"
+        )));
+    }
+    Ok(value)
+}
+
 fn validate_barcodes_for_sku(barcodes: &[String], sku: &NetworkSku) -> NetworkResult<()> {
     let forbidden = parse_forbidden_serial_tokens(&sku.serial_forbidden_chars);
     for barcode in barcodes {
@@ -1159,31 +1349,54 @@ fn parse_forbidden_serial_tokens(value: &str) -> Vec<String> {
 async fn list_catalog_parties(
     transaction: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
-    role: CatalogPartyRole,
 ) -> NetworkResult<Vec<CatalogParty>> {
     let rows = sqlx::query(
         r#"
-        SELECT bp.id, bp.display_name
+        SELECT bp.id, bp.display_name, bp.contact_name, bp.phone, bp.wechat,
+               bp.email, bp.address, bp.notes,
+               COALESCE(
+                   array_agg(pr.role ORDER BY pr.role) FILTER (WHERE pr.role IS NOT NULL),
+                   ARRAY[]::text[]
+               ) AS roles
           FROM business_parties bp
-          JOIN party_roles pr
+          LEFT JOIN party_roles pr
             ON pr.tenant_id = bp.tenant_id AND pr.party_id = bp.id
-         WHERE bp.tenant_id = $1 AND pr.role = $2
+         WHERE bp.tenant_id = $1
+         GROUP BY bp.id, bp.display_name, bp.contact_name, bp.phone, bp.wechat,
+                  bp.email, bp.address, bp.notes
          ORDER BY lower(bp.display_name), bp.id
         "#,
     )
     .bind(tenant_id)
-    .bind(role.database_value())
     .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
+            let role_values: Vec<String> = row.try_get("roles")?;
+            let mut roles = role_values
+                .into_iter()
+                .map(|role| {
+                    CatalogPartyRole::from_database_value(&role).ok_or_else(|| {
+                        NetworkServiceError::Invalid(format!(
+                            "unsupported stored party role {role}"
+                        ))
+                    })
+                })
+                .collect::<NetworkResult<Vec<_>>>()?;
+            roles.sort();
             Ok(CatalogParty {
                 party_id: row.try_get::<Uuid, _>("id")?.to_string(),
                 display_name: row.try_get("display_name")?,
+                roles,
+                contact_name: row.try_get("contact_name")?,
+                phone: row.try_get("phone")?,
+                wechat: row.try_get("wechat")?,
+                email: row.try_get("email")?,
+                address: row.try_get("address")?,
+                notes: row.try_get("notes")?,
             })
         })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(Into::into)
+        .collect()
 }
 
 async fn claim_idempotency(
