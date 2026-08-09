@@ -3,24 +3,29 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
+  Bell,
   Boxes,
   CheckCircle2,
+  ChevronDown,
   ClipboardCheck,
   FileSpreadsheet,
   Gauge,
   LogOut,
   PackagePlus,
+  Plus,
   RefreshCw,
   Search,
   Settings,
   ShieldAlert,
   Truck,
+  Tags,
   Users,
   Warehouse,
   X,
@@ -30,8 +35,10 @@ import IdentityAdminPanel from "./IdentityAdminPanel";
 import LegacyImportPanel from "./LegacyImportPanel";
 import "./InventoryWorkspace.css";
 
-type WorkspacePage = "overview" | "receipt" | "quality" | "inventory" | "outbound" | "legacy-import" | "users" | "settings";
+type WorkspacePage = "overview" | "catalog" | "receipt" | "quality" | "inventory" | "outbound" | "legacy-import" | "users" | "settings";
 type WorkspaceMode = "offline" | "network";
+type NavigationGroupId = "operations" | "inventory_data" | "catalog" | "system";
+type CatalogTab = "products" | "goods_owners" | "suppliers";
 type InventoryStatus =
   | "received"
   | "available"
@@ -45,7 +52,7 @@ type InventoryStatus =
 type QualityStatus = "untested" | "testing" | "passed" | "failed" | "waived";
 type InspectionKind = "initial" | "retest";
 type QualityOutcome = "passed" | "failed";
-type Notice = { type: "success" | "error"; text: string };
+type Notice = { type: "success" | "warning" | "error"; text: string };
 
 export interface InventoryWorkspaceProps {
   onBackToLegacy?: () => void;
@@ -59,6 +66,7 @@ interface PostReceiptRequest {
   idempotency_key: string;
   receipt_no: string;
   owner_name: string;
+  supplier_name: string;
   sku_code: string;
   sku_name: string;
   source_reference: string | null;
@@ -73,6 +81,7 @@ interface NetworkPostReceiptRequest {
   idempotency_key: string;
   receipt_no: string;
   owner_name: string;
+  supplier_name: string;
   sku_code: string;
   sku_name: string;
   warehouse_id: string;
@@ -96,6 +105,39 @@ interface PostReceiptResponse {
   received_count: number;
   units: ReceiptUnitDto[];
   idempotent_replay: boolean;
+}
+
+interface CatalogProduct {
+  sku_id: string;
+  code: string;
+  name: string;
+  serial_prefix: string | null;
+  serial_forbidden_chars: string;
+}
+
+interface CatalogParty {
+  party_id: string;
+  display_name: string;
+}
+
+interface ReferenceCatalog {
+  products: CatalogProduct[];
+  goods_owners: CatalogParty[];
+  suppliers: CatalogParty[];
+}
+
+interface CreateCatalogProductRequest {
+  code: string;
+  name: string;
+  serial_prefix: string | null;
+  serial_forbidden_chars: string;
+}
+
+type CatalogPartyRole = "goods_owner" | "supplier";
+
+interface CreateCatalogPartyRequest {
+  display_name: string;
+  role: CatalogPartyRole;
 }
 
 interface InspectionResultInput {
@@ -180,6 +222,11 @@ interface InventoryListResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+interface InventoryBarcodeExistsResponse {
+  barcode: string;
+  exists: boolean;
 }
 
 interface InventoryTrace {
@@ -427,18 +474,33 @@ interface NavigationItem {
   label: string;
   description: string;
   icon: LucideIcon;
+  group: NavigationGroupId | null;
   mode?: WorkspaceMode;
 }
 
+interface NavigationGroup {
+  id: NavigationGroupId;
+  label: string;
+  icon: LucideIcon;
+}
+
+const navigationGroups: NavigationGroup[] = [
+  { id: "operations", label: "日常作业", icon: ClipboardCheck },
+  { id: "inventory_data", label: "库存与数据", icon: Boxes },
+  { id: "catalog", label: "基础资料", icon: Tags },
+  { id: "system", label: "系统管理", icon: Settings },
+];
+
 const navigationItems: NavigationItem[] = [
-  { id: "overview", label: "概览", description: "库存与质检态势", icon: Gauge },
-  { id: "receipt", label: "入库", description: "批量扫码收货", icon: PackagePlus },
-  { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck },
-  { id: "inventory", label: "库存", description: "单件库存查询", icon: Boxes },
-  { id: "outbound", label: "出库", description: "凑单交货与退回", icon: Truck },
-  { id: "legacy-import", label: "Excel 导入", description: "历史数据迁移", icon: FileSpreadsheet, mode: "offline" },
-  { id: "users", label: "用户与角色", description: "账号和权限", icon: Users, mode: "network" },
-  { id: "settings", label: "数据与设置", description: "备份、恢复和升级", icon: Settings },
+  { id: "overview", label: "概览", description: "库存与质检态势", icon: Gauge, group: null },
+  { id: "receipt", label: "入库", description: "扫码收货", icon: PackagePlus, group: "operations" },
+  { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck, group: "operations" },
+  { id: "outbound", label: "出库", description: "凑单、交货与退回", icon: Truck, group: "operations" },
+  { id: "inventory", label: "库存查询", description: "单件库存与追溯", icon: Boxes, group: "inventory_data" },
+  { id: "legacy-import", label: "Excel 导入", description: "历史数据迁移", icon: FileSpreadsheet, group: "inventory_data", mode: "offline" },
+  { id: "catalog", label: "资料维护", description: "商品与往来方", icon: Tags, group: "catalog" },
+  { id: "users", label: "用户与角色", description: "账号和权限", icon: Users, group: "system", mode: "network" },
+  { id: "settings", label: "数据与设置", description: "备份、恢复和升级", icon: Settings, group: "system" },
 ];
 
 const inventoryStatusLabels: Record<InventoryStatus, string> = {
@@ -546,6 +608,32 @@ function emptyInventoryQuery(): InventoryListQuery {
   };
 }
 
+function parseForbiddenSerialTokens(value: string): string[] {
+  return value.split(",").flatMap((token) => {
+    if (token === " ") return [" "];
+    const normalized = token.trim().toUpperCase();
+    return normalized ? [normalized] : [];
+  });
+}
+
+function parseBarcodeLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((barcode) => barcode.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function isInspectionEligible(
+  item: Pick<InventoryListItem, "inventory_status" | "quality_status">,
+  kind: InspectionKind,
+): boolean {
+  if (kind === "initial") {
+    return item.inventory_status === "received" && item.quality_status === "untested";
+  }
+  return item.inventory_status === "quarantined"
+    && (item.quality_status === "failed" || item.quality_status === "passed" || item.quality_status === "waived");
+}
+
 export default function InventoryWorkspace({
   onBackToLegacy,
   onRequestActivation,
@@ -554,7 +642,9 @@ export default function InventoryWorkspace({
 }: InventoryWorkspaceProps) {
   const [page, setPage] = useState<WorkspacePage>("overview");
   const [mode, setMode] = useState<WorkspaceMode>(offlineActivated ? "offline" : "network");
+  const [expandedNavGroups, setExpandedNavGroups] = useState<Set<NavigationGroupId>>(() => new Set(["operations"]));
   const [resolvedActorId] = useState(() => actorId?.trim() || getDefaultActorId());
+  const workspaceContextRef = useRef(0);
 
   const [networkStatus, setNetworkStatus] = useState<NetworkStatus | null>(null);
   const [networkBaseUrl, setNetworkBaseUrl] = useState(() => getStoredNetworkValue("inventory-v2-network-url"));
@@ -572,12 +662,28 @@ export default function InventoryWorkspace({
   const [dashboardLoading, setDashboardLoading] = useState(false);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
 
+  const [catalog, setCatalog] = useState<ReferenceCatalog | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogNotice, setCatalogNotice] = useState<Notice | null>(null);
+  const [catalogTab, setCatalogTab] = useState<CatalogTab>("products");
+  const [catalogCreateOpen, setCatalogCreateOpen] = useState(false);
+  const [newProductCode, setNewProductCode] = useState("");
+  const [newProductName, setNewProductName] = useState("");
+  const [newProductSerialPrefix, setNewProductSerialPrefix] = useState("");
+  const [newProductForbiddenChars, setNewProductForbiddenChars] = useState("-, ");
+  const [newPartyName, setNewPartyName] = useState("");
+
   const [ownerName, setOwnerName] = useState("");
-  const [skuCode, setSkuCode] = useState("");
-  const [skuName, setSkuName] = useState("");
+  const [supplierName, setSupplierName] = useState("");
+  const [selectedProductId, setSelectedProductId] = useState("");
   const [receivedAt, setReceivedAt] = useState(getLocalDateTimeValue);
   const [sourceReference, setSourceReference] = useState("");
-  const [barcodeLines, setBarcodeLines] = useState("");
+  const [scannerInput, setScannerInput] = useState("");
+  const [receiptBulkInput, setReceiptBulkInput] = useState("");
+  const [scannedBarcodes, setScannedBarcodes] = useState<string[]>([]);
+  const scannerInputRef = useRef<HTMLInputElement>(null);
+  const scanCheckingRef = useRef(false);
+  const [scanChecking, setScanChecking] = useState(false);
   const [receiptLoading, setReceiptLoading] = useState(false);
   const [receiptNotice, setReceiptNotice] = useState<Notice | null>(null);
 
@@ -585,6 +691,12 @@ export default function InventoryWorkspace({
   const [qualityLoading, setQualityLoading] = useState(false);
   const [qualityNotice, setQualityNotice] = useState<Notice | null>(null);
   const [selectedBarcodes, setSelectedBarcodes] = useState<Set<string>>(() => new Set());
+  const [qualityScannerInput, setQualityScannerInput] = useState("");
+  const [qualityBulkInput, setQualityBulkInput] = useState("");
+  const [qualityScanNotice, setQualityScanNotice] = useState<Notice | null>(null);
+  const [qualityScanChecking, setQualityScanChecking] = useState(false);
+  const qualityScannerInputRef = useRef<HTMLInputElement>(null);
+  const qualityScanCheckingRef = useRef(false);
   const [inspectionKind, setInspectionKind] = useState<InspectionKind>("initial");
   const [inspectionOutcome, setInspectionOutcome] = useState<QualityOutcome>("passed");
   const [defectCode, setDefectCode] = useState("");
@@ -608,6 +720,13 @@ export default function InventoryWorkspace({
   const [outboundSkuName, setOutboundSkuName] = useState("");
   const [outboundQuantity, setOutboundQuantity] = useState("1");
   const [outboundBarcodes, setOutboundBarcodes] = useState("");
+  const [outboundScannerInput, setOutboundScannerInput] = useState("");
+  const [outboundBulkInput, setOutboundBulkInput] = useState("");
+  const [outboundScannedBarcodes, setOutboundScannedBarcodes] = useState<string[]>([]);
+  const [outboundScanNotice, setOutboundScanNotice] = useState<Notice | null>(null);
+  const outboundScannerInputRef = useRef<HTMLInputElement>(null);
+  const outboundScanCheckingRef = useRef(false);
+  const [outboundScanChecking, setOutboundScanChecking] = useState(false);
   const [outboundShipmentNo, setOutboundShipmentNo] = useState("");
   const [outboundConfirmationCode, setOutboundConfirmationCode] = useState("");
   const [outboundReturnReason, setOutboundReturnReason] = useState("");
@@ -616,8 +735,12 @@ export default function InventoryWorkspace({
   const [outboundOrder, setOutboundOrder] = useState<CreateOutboundOrderResponse | null>(null);
   const [outboundAllocation, setOutboundAllocation] = useState<AllocateOutboundResponse | null>(null);
   const [outboundShipment, setOutboundShipment] = useState<ShipOutboundResponse | null>(null);
+  const [outboundResolved, setOutboundResolved] = useState(false);
 
   const [dataOperationLoading, setDataOperationLoading] = useState(false);
+  const dataOperationRef = useRef(false);
+  const [childPanelBusy, setChildPanelBusy] = useState(false);
+  const childPanelBusyRef = useRef(false);
   const [dataNotice, setDataNotice] = useState<Notice | null>(null);
   const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
   const [upgradePackagePath, setUpgradePackagePath] = useState("");
@@ -625,50 +748,96 @@ export default function InventoryWorkspace({
   const [upgradeExport, setUpgradeExport] = useState<UpgradeExportOutput | null>(null);
   const [upgradeImport, setUpgradeImport] = useState<UpgradeImportOutput | null>(null);
 
-  const barcodes = useMemo(
-    () => barcodeLines.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-    [barcodeLines],
+  const selectedProduct = useMemo(
+    () => catalog?.products.find((product) => product.sku_id === selectedProductId) ?? null,
+    [catalog, selectedProductId],
   );
+  const barcodes = scannedBarcodes;
 
   const eligibleQualityItems = useMemo(() => {
-    const requiredStatus: QualityStatus = inspectionKind === "initial" ? "untested" : "failed";
-    return qualityItems.filter((item) => item.quality_status === requiredStatus);
+    return qualityItems.filter((item) => isInspectionEligible(item, inspectionKind));
   }, [inspectionKind, qualityItems]);
 
+  const outboundAllocatedBarcodes = useMemo(
+    () => outboundAllocation?.allocations.map((item) => item.barcode.toUpperCase()) ?? [],
+    [outboundAllocation],
+  );
+  const outboundScanComplete = outboundAllocatedBarcodes.length > 0
+    && outboundScannedBarcodes.length === outboundAllocatedBarcodes.length
+    && outboundScannedBarcodes.every((barcode) => outboundAllocatedBarcodes.includes(barcode));
+
+  const refreshCatalog = useCallback(async () => {
+    const context = workspaceContextRef.current;
+    if (mode === "network" && !networkStatus?.authenticated) {
+      setCatalog(null);
+      return;
+    }
+    setCatalogLoading(true);
+    try {
+      const command = mode === "network" ? "v2_network_list_reference_catalog" : "v2_list_reference_catalog";
+      const nextCatalog = await invoke<ReferenceCatalog>(command);
+      if (context !== workspaceContextRef.current) return;
+      setCatalog(nextCatalog);
+      setSelectedProductId((current) => nextCatalog.products.some((product) => product.sku_id === current)
+        ? current
+        : (nextCatalog.products[0]?.sku_id ?? ""));
+      setOwnerName((current) => nextCatalog.goods_owners.some((party) => party.display_name === current)
+        ? current
+        : (nextCatalog.goods_owners[0]?.display_name ?? ""));
+      setSupplierName((current) => nextCatalog.suppliers.some((party) => party.display_name === current)
+        ? current
+        : (nextCatalog.suppliers[0]?.display_name ?? ""));
+    } catch (error) {
+      if (context === workspaceContextRef.current) {
+        setCatalogNotice({ type: "error", text: `读取基础资料失败：${displayError(error)}` });
+      }
+    } finally {
+      if (context === workspaceContextRef.current) setCatalogLoading(false);
+    }
+  }, [mode, networkStatus?.authenticated]);
+
   const refreshDashboard = useCallback(async () => {
+    const context = workspaceContextRef.current;
     if (mode === "network" && !networkStatus?.authenticated) return;
     setDashboardLoading(true);
     setDashboardError(null);
     try {
       const command = mode === "network" ? "v2_network_get_dashboard" : "v2_get_dashboard";
       const response = await invoke<DashboardDto>(command, { query: { owner_party_id: null, sku_id: null } });
-      setDashboard(response);
+      if (context === workspaceContextRef.current) setDashboard(response);
     } catch (error) {
-      setDashboardError(displayError(error));
+      if (context === workspaceContextRef.current) setDashboardError(displayError(error));
     } finally {
-      setDashboardLoading(false);
+      if (context === workspaceContextRef.current) setDashboardLoading(false);
     }
   }, [mode, networkStatus?.authenticated]);
 
   const refreshQualityItems = useCallback(async () => {
+    if (qualityScanCheckingRef.current) return;
+    const context = workspaceContextRef.current;
     if (mode === "network" && !networkStatus?.authenticated) return;
     setQualityLoading(true);
     setQualityNotice(null);
     try {
       const command = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
       const response = await invoke<InventoryListResponse>(command, { query: emptyInventoryQuery() });
+      if (context !== workspaceContextRef.current) return;
       setQualityItems(
-        response.items.filter((item) => item.quality_status === "untested" || item.quality_status === "failed"),
+        response.items.filter(
+          (item) => isInspectionEligible(item, "initial") || isInspectionEligible(item, "retest"),
+        ),
       );
-      setSelectedBarcodes(new Set());
     } catch (error) {
-      setQualityNotice({ type: "error", text: `读取待检库存失败：${displayError(error)}` });
+      if (context === workspaceContextRef.current) {
+        setQualityNotice({ type: "error", text: `读取待检库存失败：${displayError(error)}` });
+      }
     } finally {
-      setQualityLoading(false);
+      if (context === workspaceContextRef.current) setQualityLoading(false);
     }
   }, [mode, networkStatus?.authenticated]);
 
   const refreshInventory = useCallback(async () => {
+    const context = workspaceContextRef.current;
     if (mode === "network" && !networkStatus?.authenticated) return;
     setInventoryLoading(true);
     setInventoryError(null);
@@ -681,32 +850,36 @@ export default function InventoryWorkspace({
       };
       const command = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
       const response = await invoke<InventoryListResponse>(command, { query });
+      if (context !== workspaceContextRef.current) return;
       setInventoryItems(response.items);
       setInventoryTotal(response.total);
     } catch (error) {
-      setInventoryError(displayError(error));
+      if (context === workspaceContextRef.current) setInventoryError(displayError(error));
     } finally {
-      setInventoryLoading(false);
+      if (context === workspaceContextRef.current) setInventoryLoading(false);
     }
   }, [inventorySearch, inventoryStatus, qualityStatus, mode, networkStatus?.authenticated]);
 
   async function openInventoryTrace(barcode: string) {
+    const context = workspaceContextRef.current;
     setInventoryTraceBarcode(barcode);
     setInventoryTrace(null);
     setInventoryTraceError(null);
     setInventoryTraceLoading(true);
     try {
       const command = mode === "network" ? "v2_network_inventory_trace" : "v2_inventory_trace";
-      setInventoryTrace(await invoke<InventoryTrace>(command, { barcode }));
+      const trace = await invoke<InventoryTrace>(command, { barcode });
+      if (context === workspaceContextRef.current) setInventoryTrace(trace);
     } catch (error) {
-      setInventoryTraceError(displayError(error));
+      if (context === workspaceContextRef.current) setInventoryTraceError(displayError(error));
     } finally {
-      setInventoryTraceLoading(false);
+      if (context === workspaceContextRef.current) setInventoryTraceLoading(false);
     }
   }
 
   const refreshNetworkWarehouses = useCallback(async () => {
-    if (!networkStatus?.authenticated) {
+    const context = workspaceContextRef.current;
+    if (mode !== "network" || !networkStatus?.authenticated) {
       setNetworkWarehouses([]);
       return;
     }
@@ -714,10 +887,15 @@ export default function InventoryWorkspace({
     setNetworkWarehousesError(null);
     try {
       const warehouses = await invoke<NetworkWarehouse[]>("v2_network_list_warehouses");
+      if (context !== workspaceContextRef.current) return;
       setNetworkWarehouses(warehouses);
       setNetworkWarehouseId((current) => {
-        const selected = warehouses.some((warehouse) => warehouse.warehouse_id === current)
+        const stored = getStoredNetworkValue("inventory-v2-network-warehouse");
+        const preferred = warehouses.some((warehouse) => warehouse.warehouse_id === current)
           ? current
+          : stored;
+        const selected = warehouses.some((warehouse) => warehouse.warehouse_id === preferred)
+          ? preferred
           : (warehouses[0]?.warehouse_id ?? "");
         try {
           if (selected) window.localStorage.setItem("inventory-v2-network-warehouse", selected);
@@ -727,21 +905,24 @@ export default function InventoryWorkspace({
         return selected;
       });
     } catch (error) {
-      setNetworkWarehouses([]);
-      setNetworkWarehousesError(displayError(error));
+      if (context === workspaceContextRef.current) {
+        setNetworkWarehouses([]);
+        setNetworkWarehousesError(displayError(error));
+      }
     } finally {
-      setNetworkWarehousesLoading(false);
+      if (context === workspaceContextRef.current) setNetworkWarehousesLoading(false);
     }
-  }, [networkStatus?.authenticated]);
+  }, [mode, networkStatus?.authenticated]);
 
   useEffect(() => {
     let cancelled = false;
+    const context = workspaceContextRef.current;
     void invoke<NetworkStatus>("v2_network_status")
       .then((status) => {
-        if (!cancelled) setNetworkStatus(status);
+        if (!cancelled && context === workspaceContextRef.current) setNetworkStatus(status);
       })
       .catch(() => {
-        if (!cancelled) setNetworkStatus(null);
+        if (!cancelled && context === workspaceContextRef.current) setNetworkStatus(null);
       });
     return () => {
       cancelled = true;
@@ -759,6 +940,19 @@ export default function InventoryWorkspace({
   }, [refreshNetworkWarehouses]);
 
   useEffect(() => {
+    if (page === "catalog" || page === "receipt") void refreshCatalog();
+  }, [page, refreshCatalog]);
+
+  useEffect(() => {
+    const activeGroup = navigationItems.find((item) => item.id === page)?.group;
+    if (!activeGroup) return;
+    setExpandedNavGroups((current) => {
+      if (current.has(activeGroup)) return current;
+      return new Set([activeGroup]);
+    });
+  }, [page]);
+
+  useEffect(() => {
     if (page === "overview") void refreshDashboard();
     if (page === "quality") void refreshQualityItems();
     if (page === "inventory") void refreshInventory();
@@ -766,10 +960,197 @@ export default function InventoryWorkspace({
 
   useEffect(() => {
     setSelectedBarcodes(new Set());
+    setQualityScannerInput("");
+    setQualityBulkInput("");
+    setQualityScanNotice(null);
     setQualityNotice(null);
+    window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
   }, [inspectionKind]);
 
-  function switchMode(nextMode: WorkspaceMode) {
+  useEffect(() => {
+    let focusFrame: number | null = null;
+    if (page === "receipt") {
+      focusFrame = window.requestAnimationFrame(() => scannerInputRef.current?.focus());
+    } else if (page === "quality" && !qualityLoading && !qualityScanChecking) {
+      focusFrame = window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
+    } else if (page === "outbound" && outboundAllocation && !outboundLoading && !outboundScanChecking && !outboundShipment) {
+      focusFrame = window.requestAnimationFrame(() => outboundScannerInputRef.current?.focus());
+    }
+    return () => {
+      if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
+    };
+  }, [page, outboundAllocation, outboundLoading, outboundScanChecking, outboundShipment, qualityLoading, qualityScanChecking]);
+
+  function toggleNavGroup(groupId: NavigationGroupId) {
+    setExpandedNavGroups((current) => {
+      return current.has(groupId) ? new Set<NavigationGroupId>() : new Set([groupId]);
+    });
+  }
+
+  function resetCatalogDraft() {
+    setNewProductCode("");
+    setNewProductName("");
+    setNewProductSerialPrefix("");
+    setNewProductForbiddenChars("-, ");
+    setNewPartyName("");
+  }
+
+  function openCatalogCreate(tab: CatalogTab = catalogTab) {
+    resetCatalogDraft();
+    setCatalogTab(tab);
+    setCatalogNotice(null);
+    setCatalogCreateOpen(true);
+  }
+
+  function closeCatalogCreate() {
+    if (catalogLoading) return;
+    setCatalogCreateOpen(false);
+    resetCatalogDraft();
+  }
+
+  function resetOutboundWorkflow(preserveOrderDetails: boolean) {
+    setOutboundOrder(null);
+    setOutboundAllocation(null);
+    setOutboundShipment(null);
+    setOutboundResolved(false);
+    if (!preserveOrderDetails) {
+      setOutboundReceiver("");
+      setOutboundOrderNo("");
+      setOutboundSkuCode("");
+      setOutboundSkuName("");
+    } else {
+      setOutboundOrderNo("");
+    }
+    setOutboundQuantity("1");
+    setOutboundBarcodes("");
+    setOutboundScannerInput("");
+    setOutboundBulkInput("");
+    setOutboundScannedBarcodes([]);
+    setOutboundShipmentNo("");
+    setOutboundConfirmationCode("");
+    setOutboundReturnReason("");
+    setOutboundScanNotice(null);
+    setOutboundNotice(null);
+  }
+
+  function resetWorkspaceTransientState() {
+    workspaceContextRef.current += 1;
+    scanCheckingRef.current = false;
+    qualityScanCheckingRef.current = false;
+    outboundScanCheckingRef.current = false;
+    setScanChecking(false);
+    setQualityScanChecking(false);
+    setOutboundScanChecking(false);
+
+    setDashboard(null);
+    setDashboardLoading(false);
+    setDashboardError(null);
+
+    setCatalog(null);
+    setCatalogLoading(false);
+    setCatalogNotice(null);
+    setCatalogCreateOpen(false);
+    resetCatalogDraft();
+    setSelectedProductId("");
+    setOwnerName("");
+    setSupplierName("");
+
+    setScannedBarcodes([]);
+    setScannerInput("");
+    setReceiptBulkInput("");
+    setReceiptNotice(null);
+    setReceiptLoading(false);
+    setSourceReference("");
+    setReceivedAt(getLocalDateTimeValue());
+
+    setQualityItems([]);
+    setQualityLoading(false);
+    setSelectedBarcodes(new Set());
+    setQualityScannerInput("");
+    setQualityBulkInput("");
+    setQualityScanNotice(null);
+    setQualityNotice(null);
+    setDefectCode("");
+    setInspectionNotes("");
+
+    setInventoryItems([]);
+    setInventoryTotal(0);
+    setInventoryLoading(false);
+    setInventoryError(null);
+    setInventoryTrace(null);
+    setInventoryTraceBarcode(null);
+    setInventoryTraceLoading(false);
+    setInventoryTraceError(null);
+
+    resetOutboundWorkflow(false);
+    setOutboundLoading(false);
+
+    setNetworkWarehouses([]);
+    setNetworkWarehouseId("");
+    setNetworkWarehousesLoading(false);
+    setNetworkWarehousesError(null);
+    dataOperationRef.current = false;
+    setDataOperationLoading(false);
+    childPanelBusyRef.current = false;
+    setChildPanelBusy(false);
+    setDataNotice(null);
+    setUpgradeTargetWorkspaceId("");
+    setUpgradeImport(null);
+  }
+
+  function workspaceOperationInProgress(): boolean {
+    return scanCheckingRef.current
+      || qualityScanCheckingRef.current
+      || outboundScanCheckingRef.current
+      || receiptLoading
+      || qualityLoading
+      || outboundLoading
+      || catalogLoading
+      || dataOperationRef.current
+      || dataOperationLoading
+      || childPanelBusyRef.current
+      || childPanelBusy
+      || networkAuthLoading;
+  }
+
+  function navigateToPage(nextPage: WorkspacePage) {
+    if (nextPage === page || workspaceOperationInProgress()) return;
+    setPage(nextPage);
+  }
+
+  function beginDataOperation(): boolean {
+    if (dataOperationRef.current) return false;
+    dataOperationRef.current = true;
+    setDataOperationLoading(true);
+    return true;
+  }
+
+  function endDataOperation() {
+    dataOperationRef.current = false;
+    setDataOperationLoading(false);
+  }
+
+  const handleChildPanelBusyChange = useCallback((busy: boolean) => {
+    childPanelBusyRef.current = busy;
+    setChildPanelBusy(busy);
+  }, []);
+
+  async function confirmWorkspaceReset(action: string, title: string): Promise<boolean> {
+    const activeScanCount = scannedBarcodes.length + selectedBarcodes.size + outboundScannedBarcodes.length;
+    const hasOpenOutboundOrder = Boolean(outboundOrder && !outboundResolved);
+    if (activeScanCount === 0 && !hasOpenOutboundOrder) return true;
+    const details = [
+      activeScanCount > 0 ? `${activeScanCount} 个尚未提交的扫码记录` : null,
+      hasOpenOutboundOrder ? `未结束的出库订单 ${outboundOrder?.order_no ?? ""}` : null,
+    ].filter(Boolean).join("和");
+    return confirm(`${action}会清空${details}，确定继续吗？`, { title, kind: "warning" });
+  }
+
+  async function switchMode(nextMode: WorkspaceMode) {
+    if (nextMode === mode || workspaceOperationInProgress()) return;
+    if (!await confirmWorkspaceReset("切换版本", "切换工作模式")) return;
+    if (workspaceOperationInProgress()) return;
+    resetWorkspaceTransientState();
     setMode(nextMode);
     if ((page === "legacy-import" && nextMode !== "offline") || (page === "users" && nextMode !== "network")) {
       setPage("overview");
@@ -779,6 +1160,7 @@ export default function InventoryWorkspace({
 
   async function submitNetworkLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (workspaceOperationInProgress()) return;
     setNetworkAuthNotice(null);
     if (!networkBaseUrl.trim() || !networkTenantId.trim() || !networkLogin.trim() || !networkPassword) {
       setNetworkAuthNotice({ type: "error", text: "请填写 API 地址、租户 ID、账号和密码。" });
@@ -793,10 +1175,10 @@ export default function InventoryWorkspace({
         password: networkPassword,
         deviceId: getNetworkDeviceId(),
       });
+      resetWorkspaceTransientState();
       try {
         window.localStorage.setItem("inventory-v2-network-url", networkBaseUrl.trim().replace(/\/+$/, ""));
         window.localStorage.setItem("inventory-v2-network-tenant", networkTenantId.trim());
-        if (networkWarehouseId.trim()) window.localStorage.setItem("inventory-v2-network-warehouse", networkWarehouseId.trim());
       } catch {
         // Endpoint preferences are optional; credentials remain memory-only.
       }
@@ -812,9 +1194,13 @@ export default function InventoryWorkspace({
   }
 
   async function logoutNetwork() {
+    if (workspaceOperationInProgress()) return;
+    if (!await confirmWorkspaceReset("退出团队版", "退出团队版")) return;
+    if (workspaceOperationInProgress()) return;
     setNetworkAuthLoading(true);
     try {
       await invoke<NetworkStatus>("v2_network_logout");
+      resetWorkspaceTransientState();
       setNetworkStatus((current) => current ? { ...current, authenticated: false, tenant_id: null, user_id: null } : current);
       setNetworkAuthNotice({ type: "success", text: "已退出网络版。" });
     } catch (error) {
@@ -824,20 +1210,173 @@ export default function InventoryWorkspace({
     }
   }
 
+  async function submitCatalogProduct(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setCatalogNotice(null);
+    if (!newProductCode.trim() || !newProductName.trim()) {
+      setCatalogNotice({ type: "error", text: "请填写商品编码和商品名称。" });
+      return;
+    }
+    setCatalogLoading(true);
+    try {
+      const input: CreateCatalogProductRequest = {
+        code: newProductCode,
+        name: newProductName,
+        serial_prefix: newProductSerialPrefix.trim() || null,
+        serial_forbidden_chars: newProductForbiddenChars,
+      };
+      const command = mode === "network" ? "v2_network_create_catalog_product" : "v2_create_catalog_product";
+      const product = await invoke<CatalogProduct>(command, { input });
+      setSelectedProductId(product.sku_id);
+      setNewProductCode("");
+      setNewProductName("");
+      setNewProductSerialPrefix("");
+      setNewProductForbiddenChars("-, ");
+      setCatalogNotice({ type: "success", text: `已创建商品 ${product.code}。` });
+      await refreshCatalog();
+      setCatalogCreateOpen(false);
+    } catch (error) {
+      setCatalogNotice({ type: "error", text: `创建商品失败：${displayError(error)}` });
+    } finally {
+      setCatalogLoading(false);
+    }
+  }
+
+  async function submitCatalogParty(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setCatalogNotice(null);
+    if (!newPartyName.trim()) {
+      setCatalogNotice({ type: "error", text: "请填写名称。" });
+      return;
+    }
+    const partyRole: CatalogPartyRole = catalogTab === "suppliers" ? "supplier" : "goods_owner";
+    setCatalogLoading(true);
+    try {
+      const input: CreateCatalogPartyRequest = { display_name: newPartyName, role: partyRole };
+      const command = mode === "network" ? "v2_network_create_catalog_party" : "v2_create_catalog_party";
+      const party = await invoke<CatalogParty>(command, { input });
+      if (partyRole === "goods_owner") setOwnerName(party.display_name);
+      else setSupplierName(party.display_name);
+      setNewPartyName("");
+      setCatalogNotice({ type: "success", text: `已保存${partyRole === "goods_owner" ? "货主/客户" : "供应商"} ${party.display_name}。` });
+      await refreshCatalog();
+      setCatalogCreateOpen(false);
+    } catch (error) {
+      setCatalogNotice({ type: "error", text: `保存往来方失败：${displayError(error)}` });
+    } finally {
+      setCatalogLoading(false);
+    }
+  }
+
+  async function playScannerAlert() {
+    try {
+      await invoke("play_beep");
+    } catch {
+      // A missing output device must not prevent the visual scanner alert.
+    }
+  }
+
+  async function rejectScan(text: string) {
+    setReceiptNotice({ type: "error", text });
+    await playScannerAlert();
+    setScannerInput("");
+    scannerInputRef.current?.focus();
+  }
+
+  async function validateReceiptBarcode(value: string, knownBarcodes: Set<string>): Promise<string> {
+    const barcode = value.trim().toUpperCase();
+    if (!barcode) throw new Error("SN 不能为空。");
+    if (!selectedProduct) throw new Error("请先选择商品；未绑定商品的 SN 不允许入库。");
+    if (knownBarcodes.has(barcode)) throw new Error(`SN ${barcode} 已在当前入库批次中。`);
+    if (selectedProduct.serial_prefix && !barcode.startsWith(selectedProduct.serial_prefix.toUpperCase())) {
+      throw new Error(`SN ${barcode} 不符合商品 ${selectedProduct.code} 的前缀规则。`);
+    }
+    const forbidden = parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars);
+    const forbiddenToken = forbidden.find((token) => barcode.includes(token));
+    if (forbiddenToken) {
+      throw new Error(`SN ${barcode} 含有商品设置的禁用字符或片段 ${forbiddenToken === " " ? "空格" : forbiddenToken}。`);
+    }
+
+    const command = mode === "network"
+      ? "v2_network_inventory_barcode_exists"
+      : "v2_inventory_barcode_exists";
+    const response = await invoke<InventoryBarcodeExistsResponse>(command, { barcode });
+    if (response.exists) throw new Error(`SN ${response.barcode} 已存在于库存中，已拒绝重复入库。`);
+    return response.barcode;
+  }
+
+  async function addScannedBarcode() {
+    const rawBarcode = scannerInput;
+    if (!rawBarcode.trim() || scanCheckingRef.current) return;
+    scanCheckingRef.current = true;
+    setScanChecking(true);
+    try {
+      const barcode = await validateReceiptBarcode(rawBarcode, new Set(scannedBarcodes));
+      setScannedBarcodes((current) => [...current, barcode]);
+      setScannerInput("");
+      setReceiptNotice({ type: "success", text: `已采集 SN ${barcode}。` });
+    } catch (error) {
+      await rejectScan(displayError(error));
+    } finally {
+      scanCheckingRef.current = false;
+      setScanChecking(false);
+      scannerInputRef.current?.focus();
+    }
+  }
+
+  async function importReceiptBarcodes() {
+    const candidates = parseBarcodeLines(receiptBulkInput);
+    if (candidates.length === 0 || scanCheckingRef.current) return;
+    scanCheckingRef.current = true;
+    setScanChecking(true);
+    try {
+      const known = new Set(scannedBarcodes);
+      const validated: string[] = [];
+      for (const candidate of candidates) {
+        const barcode = await validateReceiptBarcode(candidate, known);
+        known.add(barcode);
+        validated.push(barcode);
+      }
+      setScannedBarcodes((current) => [...current, ...validated]);
+      setReceiptBulkInput("");
+      setReceiptNotice({ type: "success", text: `备用批量录入已校验并加入 ${validated.length} 个 SN。` });
+    } catch (error) {
+      await rejectScan(`备用批量录入已取消：${displayError(error)}`);
+    } finally {
+      scanCheckingRef.current = false;
+      setScanChecking(false);
+      scannerInputRef.current?.focus();
+    }
+  }
+
+  function removeScannedBarcode(barcode: string) {
+    setScannedBarcodes((current) => current.filter((item) => item !== barcode));
+    setReceiptNotice({ type: "success", text: `已从当前批次移除 SN ${barcode}。` });
+    scannerInputRef.current?.focus();
+  }
+
+  async function clearScannedBatch() {
+    if (scannedBarcodes.length === 0 || receiptLoading) return;
+    const approved = await confirm(
+      `确定清空当前批次已采集的 ${scannedBarcodes.length} 个 SN 吗？`,
+      { title: "清空入库批次", kind: "warning" },
+    );
+    if (!approved) return;
+    setScannedBarcodes([]);
+    setScannerInput("");
+    setReceiptNotice({ type: "success", text: "当前入库批次已清空。" });
+    scannerInputRef.current?.focus();
+  }
+
   async function submitReceipt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setReceiptNotice(null);
-    const uniqueBarcodes = new Set(barcodes);
-    if (!ownerName.trim() || !skuCode.trim() || !skuName.trim()) {
-      setReceiptNotice({ type: "error", text: "请完整填写货主、型号编码和型号名称。" });
+    if (!ownerName.trim() || !supplierName.trim() || !selectedProduct) {
+      setReceiptNotice({ type: "error", text: "请选择货主/客户、供应商和商品。" });
       return;
     }
     if (barcodes.length === 0) {
-      setReceiptNotice({ type: "error", text: "请至少扫描一个条码，每行一个。" });
-      return;
-    }
-    if (uniqueBarcodes.size !== barcodes.length) {
-      setReceiptNotice({ type: "error", text: "本批次存在重复条码，请检查后再提交。" });
+      setReceiptNotice({ type: "error", text: "请至少扫描一个 SN。" });
       return;
     }
 
@@ -849,8 +1388,9 @@ export default function InventoryWorkspace({
         idempotency_key: `receipt:${operationId}`,
         receipt_no: makeDocumentNumber("RK"),
         owner_name: ownerName.trim(),
-        sku_code: skuCode.trim(),
-        sku_name: skuName.trim(),
+        supplier_name: supplierName.trim(),
+        sku_code: selectedProduct.code,
+        sku_name: selectedProduct.name,
         source_reference: sourceReference.trim() || null,
         received_at: toUtcIso(receivedAt),
         barcodes,
@@ -858,8 +1398,8 @@ export default function InventoryWorkspace({
       };
       let response: PostReceiptResponse;
       if (mode === "network") {
-        if (!networkWarehouseId.trim()) {
-          throw new Error("网络版入库需要填写默认仓库 ID");
+        if (!networkWarehouses.some((warehouse) => warehouse.warehouse_id === networkWarehouseId)) {
+          throw new Error("请选择当前团队工作区中可用的入库仓库");
         }
         response = await invoke<PostReceiptResponse>("v2_network_post_receipt", {
           input: { ...common, warehouse_id: networkWarehouseId.trim() } satisfies NetworkPostReceiptRequest,
@@ -875,28 +1415,137 @@ export default function InventoryWorkspace({
           response.idempotent_replay ? "（幂等回放）" : ""
         }。新入库单件默认标记为未测试。`,
       });
-      setBarcodeLines("");
+      setScannedBarcodes([]);
+      setScannerInput("");
       setSourceReference("");
       setReceivedAt(getLocalDateTimeValue());
-      await refreshDashboard();
+      void refreshDashboard();
     } catch (error) {
-      setReceiptNotice({ type: "error", text: `入库失败：${displayError(error)}` });
+      await rejectScan(`入库失败：${displayError(error)}`);
     } finally {
       setReceiptLoading(false);
+      window.requestAnimationFrame(() => scannerInputRef.current?.focus());
     }
   }
 
   function toggleQualityBarcode(barcode: string) {
+    if (qualityLoading || qualityScanCheckingRef.current) return;
     setSelectedBarcodes((current) => {
       const next = new Set(current);
       if (next.has(barcode)) next.delete(barcode);
       else next.add(barcode);
       return next;
     });
+    setQualityScanNotice({ type: "success", text: `已通过备用列表更新 SN ${barcode}。` });
+    qualityScannerInputRef.current?.focus();
+  }
+
+  async function changeInspectionKind(nextKind: InspectionKind) {
+    if (nextKind === inspectionKind || qualityLoading || qualityScanCheckingRef.current) return;
+    if (selectedBarcodes.size > 0) {
+      const approved = await confirm(
+        `切换质检类型会清空当前已扫描的 ${selectedBarcodes.size} 个 SN，确定继续吗？`,
+        { title: "切换质检类型", kind: "warning" },
+      );
+      if (!approved) return;
+    }
+    setInspectionKind(nextKind);
+  }
+
+  async function rejectQualityScan(text: string) {
+    setQualityScanNotice({ type: "error", text });
+    await playScannerAlert();
+    setQualityScannerInput("");
+    qualityScannerInputRef.current?.focus();
+  }
+
+  async function validateQualityBarcode(value: string, knownBarcodes: Set<string>): Promise<InventoryTrace> {
+    const barcode = value.trim().toUpperCase();
+    if (!barcode) throw new Error("SN 不能为空。");
+    if (knownBarcodes.has(barcode)) throw new Error(`SN ${barcode} 已在当前质检批次中。`);
+    const command = mode === "network" ? "v2_network_inventory_trace" : "v2_inventory_trace";
+    const trace = await invoke<InventoryTrace>(command, { barcode });
+    if (!isInspectionEligible(trace, inspectionKind)) {
+      const required = inspectionKind === "initial" ? "待检入库的未测试库存" : "隔离区内的待复检库存";
+      throw new Error(`SN ${trace.barcode} 当前为“${inventoryStatusLabels[trace.inventory_status]} / ${qualityStatusLabels[trace.quality_status]}”，不属于${required}。`);
+    }
+    return trace;
+  }
+
+  async function addQualityScannedBarcode() {
+    const rawBarcode = qualityScannerInput;
+    if (!rawBarcode.trim() || qualityScanCheckingRef.current) return;
+    qualityScanCheckingRef.current = true;
+    setQualityScanChecking(true);
+    try {
+      const trace = await validateQualityBarcode(rawBarcode, selectedBarcodes);
+      setSelectedBarcodes((current) => new Set([...current, trace.barcode.toUpperCase()]));
+      setQualityScannerInput("");
+      setQualityScanNotice({
+        type: "success",
+        text: `已加入 ${trace.barcode} · ${trace.sku_code} ${trace.sku_name} · ${trace.owner_name}。`,
+      });
+    } catch (error) {
+      await rejectQualityScan(`质检扫码已拒绝：${displayError(error)}`);
+    } finally {
+      qualityScanCheckingRef.current = false;
+      setQualityScanChecking(false);
+      qualityScannerInputRef.current?.focus();
+    }
+  }
+
+  async function importQualityBarcodes() {
+    const candidates = parseBarcodeLines(qualityBulkInput);
+    if (candidates.length === 0 || qualityScanCheckingRef.current) return;
+    qualityScanCheckingRef.current = true;
+    setQualityScanChecking(true);
+    try {
+      const known = new Set(selectedBarcodes);
+      const validated: string[] = [];
+      for (const candidate of candidates) {
+        const trace = await validateQualityBarcode(candidate, known);
+        const barcode = trace.barcode.toUpperCase();
+        known.add(barcode);
+        validated.push(barcode);
+      }
+      setSelectedBarcodes(known);
+      setQualityBulkInput("");
+      setQualityScanNotice({ type: "success", text: `备用批量录入已校验并加入 ${validated.length} 个 SN。` });
+    } catch (error) {
+      await rejectQualityScan(`备用批量录入已取消：${displayError(error)}`);
+    } finally {
+      qualityScanCheckingRef.current = false;
+      setQualityScanChecking(false);
+      qualityScannerInputRef.current?.focus();
+    }
+  }
+
+  function removeQualityBarcode(barcode: string) {
+    if (qualityLoading || qualityScanCheckingRef.current) return;
+    setSelectedBarcodes((current) => {
+      const next = new Set(current);
+      next.delete(barcode);
+      return next;
+    });
+    setQualityScanNotice({ type: "success", text: `已从质检批次移除 SN ${barcode}。` });
+    qualityScannerInputRef.current?.focus();
+  }
+
+  async function clearQualityBatch() {
+    if (selectedBarcodes.size === 0 || qualityLoading || qualityScanCheckingRef.current) return;
+    const approved = await confirm(
+      `确定清空当前质检批次的 ${selectedBarcodes.size} 个 SN 吗？`,
+      { title: "清空质检批次", kind: "warning" },
+    );
+    if (!approved) return;
+    setSelectedBarcodes(new Set());
+    setQualityScanNotice({ type: "success", text: "当前质检扫码批次已清空。" });
+    qualityScannerInputRef.current?.focus();
   }
 
   async function submitInspection(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (qualityLoading || qualityScanCheckingRef.current) return;
     setQualityNotice(null);
     if (selectedBarcodes.size === 0) {
       setQualityNotice({ type: "error", text: "请至少选择一件待检库存。" });
@@ -907,24 +1556,24 @@ export default function InventoryWorkspace({
       return;
     }
 
+    const operationId = createId();
+    const common = {
+      request_id: operationId,
+      idempotency_key: `inspection:${operationId}`,
+      inspection_no: makeDocumentNumber("ZJ"),
+      inspection_kind: inspectionKind,
+      inspected_at: new Date().toISOString(),
+      results: Array.from(selectedBarcodes).map((barcode) => ({
+        barcode,
+        outcome: inspectionOutcome,
+        defect_code: defectCode.trim() || null,
+        measurements: {},
+        notes: inspectionNotes.trim() || null,
+      })),
+    };
+    let response: CompleteInspectionResponse;
     setQualityLoading(true);
     try {
-      const operationId = createId();
-      const common = {
-        request_id: operationId,
-        idempotency_key: `inspection:${operationId}`,
-        inspection_no: makeDocumentNumber("ZJ"),
-        inspection_kind: inspectionKind,
-        inspected_at: new Date().toISOString(),
-        results: Array.from(selectedBarcodes).map((barcode) => ({
-          barcode,
-          outcome: inspectionOutcome,
-          defect_code: defectCode.trim() || null,
-          measurements: {},
-          notes: inspectionNotes.trim() || null,
-        })),
-      };
-      let response: CompleteInspectionResponse;
       if (mode === "network") {
         response = await invoke<CompleteInspectionResponse>("v2_network_complete_inspection", {
           input: common satisfies NetworkCompleteInspectionRequest,
@@ -934,33 +1583,49 @@ export default function InventoryWorkspace({
           input: { ...common, inspector_id: resolvedActorId } satisfies CompleteInspectionRequest,
         });
       }
-      setQualityNotice({
-        type: "success",
-        text: `${response.inspection_no} 已完成：合格 ${response.passed_count} 件，不合格 ${response.failed_count} 件${
-          response.idempotent_replay ? "（幂等回放）" : ""
-        }。`,
-      });
-      setDefectCode("");
-      setInspectionNotes("");
-      setSelectedBarcodes(new Set());
+    } catch (error) {
+      const message = `质检提交失败：${displayError(error)}`;
+      setQualityNotice({ type: "error", text: message });
+      await rejectQualityScan(message);
+      setQualityLoading(false);
+      return;
+    }
+
+    const completionText = `${response.inspection_no} 已完成：合格 ${response.passed_count} 件，不合格 ${response.failed_count} 件${
+      response.idempotent_replay ? "（幂等回放）" : ""
+    }。`;
+    setDefectCode("");
+    setInspectionNotes("");
+    setSelectedBarcodes(new Set());
+    setQualityScannerInput("");
+    setQualityBulkInput("");
+    setQualityScanNotice(null);
+    try {
       const listCommand = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
       const listResponse = await invoke<InventoryListResponse>(listCommand, { query: emptyInventoryQuery() });
       setQualityItems(
         listResponse.items.filter(
-          (item) => item.quality_status === "untested" || item.quality_status === "failed",
+          (item) => isInspectionEligible(item, "initial") || isInspectionEligible(item, "retest"),
         ),
       );
-      await refreshDashboard();
+      setQualityNotice({ type: "success", text: completionText });
     } catch (error) {
-      setQualityNotice({ type: "error", text: `质检提交失败：${displayError(error)}` });
-    } finally {
-      setQualityLoading(false);
+      setQualityNotice({
+        type: "warning",
+        text: `${completionText} 但待检列表刷新失败：${displayError(error)}。请手动刷新列表。`,
+      });
     }
+    setQualityLoading(false);
+    void refreshDashboard();
   }
 
   async function createOutboundOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setOutboundNotice(null);
+    if (outboundOrder) {
+      setOutboundNotice({ type: "error", text: "当前出库订单尚未结束，不能重复建单。" });
+      return;
+    }
     const quantity = Number.parseInt(outboundQuantity, 10);
     if (!outboundReceiver.trim() || !outboundSkuCode.trim() || !outboundSkuName.trim() || !outboundOrderNo.trim()) {
       setOutboundNotice({ type: "error", text: "请完整填写上游收货方、订单号和产品型号。" });
@@ -989,9 +1654,14 @@ export default function InventoryWorkspace({
         : ({ ...common, actor_id: resolvedActorId } satisfies CreateOutboundOrderRequest);
       const response = await invoke<CreateOutboundOrderResponse>(command, { input });
       setOutboundOrder(response);
+      setOutboundResolved(false);
       setOutboundAllocation(null);
       setOutboundShipment(null);
       setOutboundBarcodes("");
+      setOutboundScannerInput("");
+      setOutboundBulkInput("");
+      setOutboundScannedBarcodes([]);
+      setOutboundScanNotice(null);
       setOutboundShipmentNo("");
       setOutboundConfirmationCode("");
       setOutboundNotice({ type: "success", text: `${response.order_no} 已建单，请继续分配可用库存。` });
@@ -1013,7 +1683,7 @@ export default function InventoryWorkspace({
         idempotency_key: `outbound-allocation:${operationId}`,
         order_id: outboundOrder.order_id,
         order_line_id: outboundOrder.order_line_id,
-        barcodes: outboundBarcodes.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+        barcodes: parseBarcodeLines(outboundBarcodes),
       };
       const command = mode === "network" ? "v2_network_allocate_outbound_order" : "v2_allocate_outbound_order";
       const input = mode === "network"
@@ -1022,6 +1692,10 @@ export default function InventoryWorkspace({
       const response = await invoke<AllocateOutboundResponse>(command, { input });
       setOutboundAllocation(response);
       setOutboundBarcodes("");
+      setOutboundScannerInput("");
+      setOutboundBulkInput("");
+      setOutboundScannedBarcodes([]);
+      setOutboundScanNotice(null);
       setOutboundNotice({ type: "success", text: `已分配 ${response.allocated_count} 件，状态：${response.order_status}。` });
     } catch (error) {
       setOutboundNotice({ type: "error", text: `库存分配失败：${displayError(error)}` });
@@ -1030,8 +1704,105 @@ export default function InventoryWorkspace({
     }
   }
 
+  async function rejectOutboundScan(text: string) {
+    setOutboundScanNotice({ type: "error", text });
+    setOutboundScannerInput("");
+    await playScannerAlert();
+    outboundScannerInputRef.current?.focus();
+  }
+
+  function validateOutboundBarcodeBatch(values: string[]): string[] {
+    if (!outboundAllocation || outboundAllocatedBarcodes.length === 0) {
+      throw new Error("请先分配待出库库存，再开始扫码核对。");
+    }
+    const known = new Set(outboundScannedBarcodes);
+    const validated: string[] = [];
+    for (const value of values) {
+      const barcode = value.trim().toUpperCase();
+      if (!barcode) throw new Error("SN 不能为空。");
+      if (known.has(barcode)) throw new Error(`SN ${barcode} 已经扫描过，请勿重复扫描。`);
+      if (!outboundAllocatedBarcodes.includes(barcode)) {
+        throw new Error(`SN ${barcode} 不属于当前订单已分配的库存，禁止出库。`);
+      }
+      known.add(barcode);
+      validated.push(barcode);
+    }
+    return validated;
+  }
+
+  async function addOutboundScannedBarcode() {
+    const rawBarcode = outboundScannerInput;
+    if (!rawBarcode.trim() || outboundScanCheckingRef.current || outboundLoading || outboundShipment) return;
+    outboundScanCheckingRef.current = true;
+    setOutboundScanChecking(true);
+    setOutboundScannerInput("");
+    try {
+      const candidates = parseBarcodeLines(rawBarcode);
+      if (candidates.length !== 1) throw new Error("主扫描区每次只接收一个 SN；多件录入请使用备用录入。");
+      const validated = validateOutboundBarcodeBatch(candidates);
+      const barcode = validated[0];
+      setOutboundScannedBarcodes((current) => [...current, barcode]);
+      const nextCount = outboundScannedBarcodes.length + 1;
+      setOutboundScanNotice({
+        type: "success",
+        text: nextCount === outboundAllocatedBarcodes.length
+          ? `SN ${barcode} 核对通过，当前订单 ${nextCount} 件已全部扫齐。`
+          : `SN ${barcode} 核对通过，还需扫描 ${outboundAllocatedBarcodes.length - nextCount} 件。`,
+      });
+    } catch (error) {
+      await rejectOutboundScan(`出库扫码已拒绝：${displayError(error)}`);
+    } finally {
+      outboundScanCheckingRef.current = false;
+      setOutboundScanChecking(false);
+    }
+  }
+
+  async function importOutboundBarcodes() {
+    const candidates = parseBarcodeLines(outboundBulkInput);
+    if (candidates.length === 0 || outboundScanCheckingRef.current || outboundLoading || outboundShipment) return;
+    outboundScanCheckingRef.current = true;
+    setOutboundScanChecking(true);
+    try {
+      const validated = validateOutboundBarcodeBatch(candidates);
+      setOutboundScannedBarcodes((current) => [...current, ...validated]);
+      setOutboundBulkInput("");
+      setOutboundScanNotice({
+        type: "success",
+        text: `备用批量录入已核对并加入 ${validated.length} 个 SN。`,
+      });
+    } catch (error) {
+      await rejectOutboundScan(`备用批量录入已取消：${displayError(error)}`);
+    } finally {
+      outboundScanCheckingRef.current = false;
+      setOutboundScanChecking(false);
+    }
+  }
+
+  function removeOutboundScannedBarcode(barcode: string) {
+    if (outboundScanCheckingRef.current || outboundLoading) return;
+    setOutboundScannedBarcodes((current) => current.filter((item) => item !== barcode));
+    setOutboundScanNotice({ type: "success", text: `已从出库核对批次移除 SN ${barcode}。` });
+    outboundScannerInputRef.current?.focus();
+  }
+
+  async function clearOutboundScanBatch() {
+    if (outboundScannedBarcodes.length === 0 || outboundScanCheckingRef.current || outboundLoading) return;
+    const approved = await confirm(
+      `确定清空已核对的 ${outboundScannedBarcodes.length} 个出库 SN 吗？`,
+      { title: "清空出库扫码", kind: "warning" },
+    );
+    if (!approved) return;
+    setOutboundScannedBarcodes([]);
+    setOutboundScanNotice({ type: "success", text: "当前出库扫码核对已清空。" });
+    outboundScannerInputRef.current?.focus();
+  }
+
   async function shipOutboundOrder() {
-    if (!outboundOrder || !outboundAllocation || outboundAllocation.allocations.length === 0) return;
+    if (outboundScanCheckingRef.current || !outboundOrder || !outboundAllocation || outboundAllocation.allocations.length === 0) return;
+    if (!outboundScanComplete) {
+      await rejectOutboundScan(`当前只核对 ${outboundScannedBarcodes.length} / ${outboundAllocatedBarcodes.length} 件，必须逐件扫齐后才能出库。`);
+      return;
+    }
     setOutboundLoading(true);
     setOutboundNotice(null);
     try {
@@ -1041,8 +1812,8 @@ export default function InventoryWorkspace({
         idempotency_key: `outbound-shipment:${operationId}`,
         order_id: outboundOrder.order_id,
         shipment_no: outboundShipmentNo.trim() || makeDocumentNumber("CK"),
-        allocation_ids: outboundAllocation.allocations.map((item) => item.allocation_id),
-        barcodes: [],
+        allocation_ids: [],
+        barcodes: outboundScannedBarcodes,
         shipped_at: new Date().toISOString(),
       };
       const command = mode === "network" ? "v2_network_ship_outbound_order" : "v2_ship_outbound_order";
@@ -1053,9 +1824,12 @@ export default function InventoryWorkspace({
       setOutboundShipment(response);
       setOutboundShipmentNo(response.shipment_no);
       setOutboundNotice({ type: "success", text: `${response.shipment_no} 已出库 ${response.shipped_count} 件。` });
-      await refreshDashboard();
+      setOutboundScanNotice({ type: "success", text: `服务端已按实际扫描的 ${response.shipped_count} 个 SN 完成原子出库。` });
+      void refreshDashboard();
     } catch (error) {
-      setOutboundNotice({ type: "error", text: `出库失败：${displayError(error)}` });
+      const message = `出库失败：${displayError(error)}`;
+      setOutboundNotice({ type: "error", text: message });
+      await rejectOutboundScan(message);
     } finally {
       setOutboundLoading(false);
     }
@@ -1086,7 +1860,8 @@ export default function InventoryWorkspace({
         : ({ ...common, confirmed_by: resolvedActorId });
       const response = await invoke<ConfirmOutboundDeliveryResponse>(command, { input });
       setOutboundNotice({ type: "success", text: `已确认交货 ${response.delivered_count} 件，批次状态：${response.shipment_status}。` });
-      await refreshDashboard();
+      setOutboundResolved(true);
+      void refreshDashboard();
     } catch (error) {
       setOutboundNotice({ type: "error", text: `交货确认失败：${displayError(error)}` });
     } finally {
@@ -1120,7 +1895,8 @@ export default function InventoryWorkspace({
       const response = await invoke<ReturnOutboundShipmentResponse>(command, { input });
       setOutboundNotice({ type: "success", text: `${response.return_no} 已登记退回 ${response.quarantined_count} 件，并进入隔离区待复检。` });
       setOutboundReturnReason("");
-      await refreshDashboard();
+      setOutboundResolved(true);
+      void refreshDashboard();
     } catch (error) {
       setOutboundNotice({ type: "error", text: `退回登记失败：${displayError(error)}` });
     } finally {
@@ -1128,16 +1904,34 @@ export default function InventoryWorkspace({
     }
   }
 
+  function startNextOutboundOrder() {
+    setOutboundOrder(null);
+    setOutboundAllocation(null);
+    setOutboundShipment(null);
+    setOutboundResolved(false);
+    setOutboundOrderNo("");
+    setOutboundQuantity("1");
+    setOutboundBarcodes("");
+    setOutboundScannerInput("");
+    setOutboundBulkInput("");
+    setOutboundScannedBarcodes([]);
+    setOutboundShipmentNo("");
+    setOutboundConfirmationCode("");
+    setOutboundReturnReason("");
+    setOutboundScanNotice(null);
+    setOutboundNotice(null);
+  }
+
   async function createOfflineBackup() {
+    if (!beginDataOperation()) return;
     setDataNotice(null);
-    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
-    const destination = await save({
-      title: "保存离线备份",
-      defaultPath: `inventory-backup-${stamp}.invbackup`,
-    });
-    if (!destination) return;
-    setDataOperationLoading(true);
     try {
+      const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+      const destination = await save({
+        title: "保存离线备份",
+        defaultPath: `inventory-backup-${stamp}.invbackup`,
+      });
+      if (!destination) return;
       const metadata = await invoke<BackupMetadata>("v2_create_offline_backup", { destination });
       setDataNotice({
         type: "success",
@@ -1146,20 +1940,20 @@ export default function InventoryWorkspace({
     } catch (error) {
       setDataNotice({ type: "error", text: `备份失败：${displayError(error)}` });
     } finally {
-      setDataOperationLoading(false);
+      endDataOperation();
     }
   }
 
   async function restoreOfflineBackup() {
+    if (!beginDataOperation()) return;
     setDataNotice(null);
-    const selected = await open({
-      title: "选择离线备份包",
-      directory: true,
-      multiple: false,
-    });
-    if (!selected || Array.isArray(selected)) return;
-    setDataOperationLoading(true);
     try {
+      const selected = await open({
+        title: "选择离线备份包",
+        directory: true,
+        multiple: false,
+      });
+      if (!selected || Array.isArray(selected)) return;
       const metadata = await invoke<BackupMetadata>("v2_verify_offline_backup", {
         packagePath: selected,
       });
@@ -1173,20 +1967,20 @@ export default function InventoryWorkspace({
     } catch (error) {
       setDataNotice({ type: "error", text: `恢复失败：${displayError(error)}` });
     } finally {
-      setDataOperationLoading(false);
+      endDataOperation();
     }
   }
 
   async function exportUpgradePackage() {
+    if (!beginDataOperation()) return;
     setDataNotice(null);
-    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
-    const destination = await save({
-      title: "保存一次性升级包",
-      defaultPath: `inventory-upgrade-${stamp}.invpack`,
-    });
-    if (!destination) return;
-    setDataOperationLoading(true);
     try {
+      const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+      const destination = await save({
+        title: "保存一次性升级包",
+        defaultPath: `inventory-upgrade-${stamp}.invpack`,
+      });
+      if (!destination) return;
       const output = await invoke<UpgradeExportOutput>("v2_export_upgrade_package", {
         input: {
           destination,
@@ -1203,17 +1997,24 @@ export default function InventoryWorkspace({
     } catch (error) {
       setDataNotice({ type: "error", text: `升级包导出失败：${displayError(error)}` });
     } finally {
-      setDataOperationLoading(false);
+      endDataOperation();
     }
   }
 
   async function chooseUpgradePackage() {
-    const selected = await open({
-      title: "选择一次性升级包",
-      directory: true,
-      multiple: false,
-    });
-    if (selected && !Array.isArray(selected)) setUpgradePackagePath(selected);
+    if (!beginDataOperation()) return;
+    try {
+      const selected = await open({
+        title: "选择一次性升级包",
+        directory: true,
+        multiple: false,
+      });
+      if (selected && !Array.isArray(selected)) setUpgradePackagePath(selected);
+    } catch (error) {
+      setDataNotice({ type: "error", text: `选择升级包失败：${displayError(error)}` });
+    } finally {
+      endDataOperation();
+    }
   }
 
   async function upgradeOfflineToNetwork() {
@@ -1226,13 +2027,13 @@ export default function InventoryWorkspace({
       setDataNotice({ type: "error", text: "请选择升级包并填写目标工作区 ID。" });
       return;
     }
-    const approved = await confirm(
-      "导入成功后，当前离线工作区将永久冻结为只读，网络 PostgreSQL 成为唯一事实源。该操作不会启用双向同步。",
-      { title: "确认一次性升级", kind: "warning" },
-    );
-    if (!approved) return;
-    setDataOperationLoading(true);
+    if (!beginDataOperation()) return;
     try {
+      const approved = await confirm(
+        "导入成功后，当前离线工作区将永久冻结为只读，网络 PostgreSQL 成为唯一事实源。该操作不会启用双向同步。",
+        { title: "确认一次性升级", kind: "warning" },
+      );
+      if (!approved) return;
       const output = await invoke<UpgradeImportOutput>("v2_upgrade_offline_to_network", {
         input: {
           package_path: upgradePackagePath.trim(),
@@ -1247,7 +2048,7 @@ export default function InventoryWorkspace({
     } catch (error) {
       setDataNotice({ type: "error", text: `一次性升级失败：${displayError(error)}` });
     } finally {
-      setDataOperationLoading(false);
+      endDataOperation();
     }
   }
 
@@ -1256,7 +2057,7 @@ export default function InventoryWorkspace({
       <section className="v2-page v2-network-gate" aria-labelledby="v2-network-login-title">
         <div className="v2-page-heading">
           <div>
-            <span className="v2-eyebrow">网络多用户版</span>
+            <span className="v2-eyebrow">团队版</span>
             <h2 id="v2-network-login-title">连接库存服务</h2>
             <p>登录由服务端验证账号、租户、角色和有效授权；桌面端不会保存 PostgreSQL 凭据。</p>
           </div>
@@ -1268,8 +2069,8 @@ export default function InventoryWorkspace({
           <label><span>密码 *</span><input type="password" value={networkPassword} onChange={(event) => setNetworkPassword(event.target.value)} autoComplete="current-password" /></label>
           {networkAuthNotice && <div className={`v2-notice ${networkAuthNotice.type}`}>{networkAuthNotice.text}</div>}
           <div className="v2-form-actions">
-            <button className="v2-button" type="button" onClick={() => switchMode("offline")}>{offlineActivated ? "切换离线版" : "切换离线只读"}</button>
-            <button className="v2-button primary" type="submit" disabled={networkAuthLoading}>{networkAuthLoading ? "正在登录…" : "登录网络版"}</button>
+          <button className="v2-button" type="button" onClick={() => void switchMode("offline")} disabled={modeSwitchDisabled}>{offlineActivated ? "切换本机版" : "切换本机只读"}</button>
+            <button className="v2-button primary" type="submit" disabled={networkAuthLoading}>{networkAuthLoading ? "正在登录…" : "登录团队版"}</button>
           </div>
         </form>
       </section>
@@ -1292,6 +2093,15 @@ export default function InventoryWorkspace({
           </button>
         </div>
         {dashboardError && <div className="v2-notice error">读取概览失败：{dashboardError}</div>}
+        <section className="v2-overview-shortcuts" aria-label="常用作业">
+          <strong>常用作业</strong>
+          <div>
+            <button type="button" onClick={() => navigateToPage("receipt")} disabled={modeSwitchDisabled}><PackagePlus size={18} /><span><b>入库</b><small>新建扫码批次</small></span></button>
+            <button type="button" onClick={() => navigateToPage("quality")} disabled={modeSwitchDisabled}><ClipboardCheck size={18} /><span><b>质检</b><small>{quality?.untested ?? 0} 件待检</small></span></button>
+            <button type="button" onClick={() => navigateToPage("inventory")} disabled={modeSwitchDisabled}><Boxes size={18} /><span><b>库存</b><small>{dashboard?.total_units ?? 0} 件可追溯</small></span></button>
+            <button type="button" onClick={() => navigateToPage("outbound")} disabled={modeSwitchDisabled}><Truck size={18} /><span><b>出库</b><small>凑单与交货</small></span></button>
+          </div>
+        </section>
         <div className="v2-metric-grid" aria-busy={dashboardLoading}>
           <article className="v2-metric-card primary"><span>库存单件总数</span><strong>{dashboard?.total_units ?? "—"}</strong><small>所有状态的可追踪条码</small></article>
           <article className="v2-metric-card"><span>可用库存</span><strong>{inventory?.available ?? "—"}</strong><small>质检合格，可参与凑单</small></article>
@@ -1322,75 +2132,320 @@ export default function InventoryWorkspace({
     );
   }
 
+  function renderCatalog() {
+    const products = catalog?.products ?? [];
+    const goodsOwners = catalog?.goods_owners ?? [];
+    const suppliers = catalog?.suppliers ?? [];
+    const mutationDisabled = mode === "offline" && !offlineActivated;
+    const activeParties = catalogTab === "goods_owners" ? goodsOwners : suppliers;
+    const activeTabLabel = catalogTab === "products" ? "商品" : catalogTab === "goods_owners" ? "货主 / 客户" : "供应商";
+    const createButtonLabel = catalogTab === "products" ? "新增商品" : catalogTab === "goods_owners" ? "新增货主 / 客户" : "新增供应商";
+    const CatalogIcon = catalogTab === "products" ? Tags : catalogTab === "goods_owners" ? Users : Warehouse;
+
+    return (
+      <section className="v2-page" aria-labelledby="v2-catalog-title">
+        <div className="v2-page-heading">
+          <div>
+            <span className="v2-eyebrow">基础资料</span>
+            <h2 id="v2-catalog-title">商品与往来方</h2>
+            <p>维护入库所需档案。</p>
+          </div>
+          <button className="v2-button" type="button" onClick={() => void refreshCatalog()} disabled={catalogLoading}>
+            <RefreshCw size={16} className={catalogLoading ? "v2-spin" : ""} /> 刷新
+          </button>
+        </div>
+
+        {catalogNotice && <div className={`v2-notice v2-catalog-notice ${catalogNotice.type}`}>{catalogNotice.text}</div>}
+
+        <div className="v2-catalog-toolbar">
+          <div className="v2-catalog-tabs" role="tablist" aria-label="基础资料类型">
+            <button id="v2-catalog-tab-products" type="button" role="tab" aria-selected={catalogTab === "products"} className={catalogTab === "products" ? "active" : ""} onClick={() => setCatalogTab("products")}><Tags size={16} /> 商品 <span>{products.length}</span></button>
+            <button id="v2-catalog-tab-owners" type="button" role="tab" aria-selected={catalogTab === "goods_owners"} className={catalogTab === "goods_owners" ? "active" : ""} onClick={() => setCatalogTab("goods_owners")}><Users size={16} /> 货主 / 客户 <span>{goodsOwners.length}</span></button>
+            <button id="v2-catalog-tab-suppliers" type="button" role="tab" aria-selected={catalogTab === "suppliers"} className={catalogTab === "suppliers" ? "active" : ""} onClick={() => setCatalogTab("suppliers")}><Warehouse size={16} /> 供应商 <span>{suppliers.length}</span></button>
+          </div>
+          <button className="v2-button primary" type="button" onClick={() => openCatalogCreate()} disabled={catalogLoading || mutationDisabled}><Plus size={16} /> {createButtonLabel}</button>
+        </div>
+
+        <section className="v2-panel v2-catalog-directory" role="tabpanel" aria-labelledby={catalogTab === "products" ? "v2-catalog-tab-products" : catalogTab === "goods_owners" ? "v2-catalog-tab-owners" : "v2-catalog-tab-suppliers"} aria-busy={catalogLoading}>
+          {catalogTab === "products" ? <>
+            <div className="v2-section-heading compact">
+              <div><h3>商品目录</h3><small>{products.length} 个商品</small></div>
+            </div>
+            <div className="v2-table-wrap">
+              <table className="v2-catalog-table">
+                <thead><tr><th>商品编码</th><th>商品名称</th><th>SN 前缀</th><th>禁用字符或片段</th></tr></thead>
+                <tbody>
+                  {!catalogLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={4}><div className="v2-catalog-empty"><Tags size={28} /><strong>暂无商品</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate("products")} disabled={mutationDisabled}><Plus size={16} /> 新增商品</button></div></td></tr>}
+                  {products.map((product) => {
+                    const forbiddenTokens = parseForbiddenSerialTokens(product.serial_forbidden_chars);
+                    return (
+                      <tr key={product.sku_id}>
+                        <td><strong className="v2-mono">{product.code}</strong></td>
+                        <td>{product.name}</td>
+                        <td>{product.serial_prefix ? <code className="v2-rule-token">{product.serial_prefix}</code> : <span className="v2-muted-value">不限</span>}</td>
+                        <td>{forbiddenTokens.length > 0 ? <div className="v2-token-list">{forbiddenTokens.map((token, index) => <code className="v2-rule-token danger" key={`${token}-${index}`}>{token === " " ? "空格" : token}</code>)}</div> : <span className="v2-muted-value">无</span>}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </> : <>
+            <div className="v2-section-heading compact">
+              <div><h3>{activeTabLabel}目录</h3><small>{activeParties.length} 个档案</small></div>
+            </div>
+            <div className="v2-table-wrap">
+              <table className="v2-catalog-party-table">
+                <thead><tr><th>名称</th></tr></thead>
+                <tbody>
+                  {!catalogLoading && activeParties.length === 0 && <tr><td className="v2-table-empty"><div className="v2-catalog-empty"><CatalogIcon size={28} /><strong>暂无{activeTabLabel}</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate(catalogTab)} disabled={mutationDisabled}><Plus size={16} /> {createButtonLabel}</button></div></td></tr>}
+                  {activeParties.map((party) => <tr key={party.party_id}><td><strong>{party.display_name}</strong></td></tr>)}
+                </tbody>
+              </table>
+            </div>
+          </>}
+        </section>
+
+        {catalogCreateOpen && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeCatalogCreate(); }} onKeyDown={(event) => { if (event.key === "Escape") closeCatalogCreate(); }}>
+          <section className="v2-catalog-modal" role="dialog" aria-modal="true" aria-labelledby="v2-catalog-create-title">
+            <header>
+              <div><span>{activeTabLabel}</span><h3 id="v2-catalog-create-title">{createButtonLabel}</h3></div>
+              <button className="v2-icon-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading} aria-label="关闭新增窗口" title="关闭"><X size={17} /></button>
+            </header>
+            {catalogTab === "products" ? <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogProduct}>
+              <div className="v2-form-grid">
+                <label><span>商品编码 *</span><input value={newProductCode} onChange={(event) => setNewProductCode(event.target.value)} placeholder="例如 DDR4-32G-3200" autoComplete="off" autoFocus required disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>商品名称 *</span><input value={newProductName} onChange={(event) => setNewProductName(event.target.value)} placeholder="例如 32G 3200 内存" autoComplete="off" required disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>SN 前缀</span><input value={newProductSerialPrefix} onChange={(event) => setNewProductSerialPrefix(event.target.value)} placeholder="可选，例如 RAM" autoComplete="off" disabled={catalogLoading || mutationDisabled} /></label>
+                <label><span>SN 禁用字符或片段</span><input value={newProductForbiddenChars} onChange={(event) => setNewProductForbiddenChars(event.target.value)} placeholder="使用英文逗号分隔" autoComplete="off" disabled={catalogLoading || mutationDisabled} /><small>英文逗号分隔；默认禁止连字符和空格。</small></label>
+              </div>
+              {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}><Plus size={16} /> 保存商品</button></div>
+            </form> : <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogParty}>
+              <label><span>{activeTabLabel}名称 *</span><input value={newPartyName} onChange={(event) => setNewPartyName(event.target.value)} placeholder={catalogTab === "goods_owners" ? "例如 客户 A" : "例如 供应商 A"} autoComplete="organization" autoFocus required disabled={catalogLoading || mutationDisabled} /></label>
+              {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}><Plus size={16} /> 保存{activeTabLabel}</button></div>
+            </form>}
+          </section>
+        </div>}
+      </section>
+    );
+  }
+
   function renderReceipt() {
+    const products = catalog?.products ?? [];
+    const goodsOwners = catalog?.goods_owners ?? [];
+    const suppliers = catalog?.suppliers ?? [];
+    const productLocked = scannedBarcodes.length > 0;
+    const mutationDisabled = mode === "offline" && !offlineActivated;
+    const networkWarehouseReady = mode !== "network"
+      || networkWarehouses.some((warehouse) => warehouse.warehouse_id === networkWarehouseId);
+    const detailsReady = Boolean(receivedAt && selectedProduct && ownerName.trim() && supplierName.trim() && networkWarehouseReady);
+    const receiptReady = detailsReady && barcodes.length > 0;
+    const stepOneState = detailsReady ? "complete" : "active";
+    const stepTwoState = barcodes.length > 0 ? "complete" : detailsReady ? "active" : "pending";
+    const stepThreeState = receiptReady ? "active" : "pending";
+    const forbiddenTokens = selectedProduct ? parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars) : [];
+
     return (
       <section className="v2-page" aria-labelledby="v2-receipt-title">
         <div className="v2-page-heading">
-          <div><span className="v2-eyebrow">入库管理</span><h2 id="v2-receipt-title">新建入库批次</h2><p>同一货主、同一型号的一批货物一次提交，整批成功或整批回滚。</p></div>
+          <div><span className="v2-eyebrow">入库管理</span><h2 id="v2-receipt-title">新建入库批次</h2></div>
+          <button className="v2-button" type="button" onClick={() => navigateToPage("catalog")} disabled={modeSwitchDisabled}><Tags size={16} /> 管理基础资料</button>
         </div>
-        <form className="v2-panel v2-form" onSubmit={submitReceipt}>
-          <div className="v2-form-grid">
-            <label><span>货主 / 供货客户 *</span><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="例如：客户 A" autoComplete="off" /></label>
-            <label><span>型号编码 *</span><input value={skuCode} onChange={(event) => setSkuCode(event.target.value)} placeholder="例如：DDR4-32G-3200" autoComplete="off" /></label>
-            <label><span>型号名称 *</span><input value={skuName} onChange={(event) => setSkuName(event.target.value)} placeholder="例如：32G 3200 内存" autoComplete="off" /></label>
-            <label><span>入库时间 *</span><input type="datetime-local" step="1" value={receivedAt} onChange={(event) => setReceivedAt(event.target.value)} /></label>
+
+        {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
+
+        <form className="v2-panel v2-form v2-receipt-form" onSubmit={submitReceipt}>
+          <ol className="v2-receipt-progress" aria-label="入库步骤">
+            <li className={stepOneState}><span>1</span><div><strong>选择资料</strong><small>{detailsReady ? "已就绪" : "待选择"}</small></div></li>
+            <li className={stepTwoState}><span>2</span><div><strong>扫描 SN</strong><small>{barcodes.length > 0 ? `${barcodes.length} 件` : "待扫描"}</small></div></li>
+            <li className={stepThreeState}><span>3</span><div><strong>确认入库</strong><small>{receiptReady ? "可提交" : "待完成"}</small></div></li>
+          </ol>
+
+          <section className="v2-receipt-details-step" aria-labelledby="v2-receipt-details-title">
+            <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{detailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
+            <div className="v2-form-grid">
+            <label><span>商品 *</span><select value={selectedProductId} onChange={(event) => { setSelectedProductId(event.target.value); setScannerInput(""); setReceiptNotice(null); }} required disabled={catalogLoading || scanChecking || productLocked || products.length === 0}>
+              {products.length === 0 && <option value="">{catalogLoading ? "正在读取商品…" : "没有可用商品"}</option>}
+              {products.map((product) => <option key={product.sku_id} value={product.sku_id}>{product.code} · {product.name}</option>)}
+            </select>{productLocked && <small>当前批次已有 SN，商品已锁定。</small>}</label>
+            <label><span>货主 / 客户 *</span><select value={ownerName} onChange={(event) => setOwnerName(event.target.value)} required disabled={catalogLoading || goodsOwners.length === 0}>
+              {goodsOwners.length === 0 && <option value="">{catalogLoading ? "正在读取货主/客户…" : "没有可用货主/客户"}</option>}
+              {goodsOwners.map((party) => <option key={party.party_id} value={party.display_name}>{party.display_name}</option>)}
+            </select></label>
+            <label><span>供应商 *</span><select value={supplierName} onChange={(event) => setSupplierName(event.target.value)} required disabled={catalogLoading || suppliers.length === 0}>
+              {suppliers.length === 0 && <option value="">{catalogLoading ? "正在读取供应商…" : "没有可用供应商"}</option>}
+              {suppliers.map((party) => <option key={party.party_id} value={party.display_name}>{party.display_name}</option>)}
+            </select></label>
+            <label><span>入库时间 *</span><input type="datetime-local" step="1" value={receivedAt} onChange={(event) => setReceivedAt(event.target.value)} required /></label>
             {mode === "network" && <label><span>入库仓库 *</span><select value={networkWarehouseId} onChange={(event) => {
               const value = event.target.value;
               setNetworkWarehouseId(value);
               try { window.localStorage.setItem("inventory-v2-network-warehouse", value); } catch { /* optional preference */ }
-            }} disabled={networkWarehousesLoading || networkWarehouses.length === 0}>
+            }} required disabled={networkWarehousesLoading || networkWarehouses.length === 0}>
               {networkWarehouses.length === 0 && <option value="">{networkWarehousesLoading ? "正在读取仓库…" : "没有可用收货仓库"}</option>}
               {networkWarehouses.map((warehouse) => <option key={warehouse.warehouse_id} value={warehouse.warehouse_id}>{warehouse.warehouse_name}（{warehouse.warehouse_code}）</option>)}
             </select>{networkWarehousesError && <small className="v2-field-error">仓库读取失败：{networkWarehousesError}</small>}</label>}
             <label className="v2-span-two"><span>来源单号 / 备注</span><input value={sourceReference} onChange={(event) => setSourceReference(event.target.value)} placeholder="可选，例如供应商送货单号" autoComplete="off" /></label>
-          </div>
-          <label className="v2-scan-field">
-            <span>单件条码 / SN *</span>
-            <textarea value={barcodeLines} onChange={(event) => setBarcodeLines(event.target.value)} placeholder={"扫码后按回车，每行一个条码\n也可一次粘贴多行"} autoFocus spellCheck={false} />
-            <small>已识别 {barcodes.length} 件；提交时会在数据库事务中检查所有条码唯一性。</small>
-          </label>
-          {receiptNotice && <div className={`v2-notice ${receiptNotice.type}`}>{receiptNotice.text}</div>}
-          <div className="v2-form-actions">
-            <button className="v2-button" type="button" onClick={() => setBarcodeLines("")} disabled={receiptLoading || barcodes.length === 0}>清空条码</button>
-            <button className="v2-button primary" type="submit" disabled={receiptLoading}>{receiptLoading ? "正在原子入库…" : `确认入库 ${barcodes.length} 件`}</button>
-          </div>
+            </div>
+          </section>
+
+          <section className="v2-scanner-section" aria-labelledby="v2-scanner-title">
+            <div className="v2-scanner-heading">
+              <div className="v2-receipt-section-heading"><span>2</span><div><h3 id="v2-scanner-title">扫描 SN</h3><small>逐件校验</small></div></div>
+              <strong>{barcodes.length}<small>件</small></strong>
+            </div>
+
+            <div className="v2-scan-rule-bar">
+              <span><strong>商品</strong>{selectedProduct ? `${selectedProduct.code} · ${selectedProduct.name}` : "未选择"}</span>
+              <span><strong>前缀</strong>{selectedProduct?.serial_prefix || "不限"}</span>
+              <span><strong>禁用</strong>{forbiddenTokens.length > 0 ? forbiddenTokens.map((token) => token === " " ? "空格" : token).join("、") : "无"}</span>
+            </div>
+
+            <label className="v2-scan-field">
+              <span>扫码枪输入 *</span>
+              <div className="v2-scanner-control">
+                <Bell size={21} aria-hidden="true" />
+                <input ref={scannerInputRef} value={scannerInput} onChange={(event) => setScannerInput(event.target.value)} onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void addScannedBarcode();
+                  }
+                }} placeholder="请扫描 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
+                <button className="v2-button" type="button" onClick={() => void addScannedBarcode()} disabled={!scannerInput.trim() || scanChecking || receiptLoading || mutationDisabled}>{scanChecking ? "正在校验…" : "手动加入"}</button>
+              </div>
+              <small>扫描后会自动回到输入框；每个 SN 即时精确查重，提交时数据库再次校验唯一性。</small>
+            </label>
+
+            {receiptNotice && <div className={`v2-scanner-feedback ${receiptNotice.type}`} role={receiptNotice.type === "error" ? "alert" : "status"} aria-live={receiptNotice.type === "error" ? "assertive" : "polite"}>{receiptNotice.type === "error" ? <Bell size={19} /> : <CheckCircle2 size={19} />}<span>{receiptNotice.text}</span></div>}
+
+            <div className="v2-scanned-heading">
+              <div><strong>当前批次</strong><span>已采集 {barcodes.length} 个 SN</span></div>
+              <button className="v2-button" type="button" onClick={() => void clearScannedBatch()} disabled={scanChecking || receiptLoading || barcodes.length === 0}>清空批次</button>
+            </div>
+            <div className="v2-scanned-list" aria-label="已采集 SN">
+              {barcodes.length === 0 && <div className="v2-scanned-empty"><PackagePlus size={26} /><span>等待扫描</span></div>}
+              {barcodes.map((barcode, index) => (
+                <div className="v2-scanned-row" key={barcode}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <strong>{barcode}</strong>
+                  <button className="v2-icon-button danger" type="button" onClick={() => removeScannedBarcode(barcode)} disabled={scanChecking || receiptLoading} aria-label={`移除 SN ${barcode}`} title="从当前批次移除"><X size={16} /></button>
+                </div>
+              ))}
+            </div>
+            <details className="v2-alternative-entry">
+              <summary><span>备用录入</span><small>批量粘贴 SN，仅在扫码枪不可用时使用</small><ChevronDown size={16} /></summary>
+              <div className="v2-alternative-content">
+                <label><span>每行一个 SN</span><textarea value={receiptBulkInput} onChange={(event) => setReceiptBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={scanChecking || receiptLoading || mutationDisabled} /></label>
+                <button className="v2-button" type="button" onClick={() => void importReceiptBarcodes()} disabled={!receiptBulkInput.trim() || scanChecking || receiptLoading || mutationDisabled}>校验并加入批次</button>
+              </div>
+            </details>
+          </section>
+
+          <section className="v2-receipt-confirm-step" aria-labelledby="v2-receipt-confirm-title">
+            <div className="v2-receipt-section-heading"><span>3</span><div><h3 id="v2-receipt-confirm-title">确认入库</h3><small>{receiptReady ? "核对后提交" : "完成前两步后提交"}</small></div></div>
+            <div className="v2-receipt-confirm-summary">
+              <span><small>商品</small><strong>{selectedProduct?.code ?? "—"}</strong></span>
+              <span><small>货主 / 客户</small><strong>{ownerName || "—"}</strong></span>
+              <span><small>供应商</small><strong>{supplierName || "—"}</strong></span>
+              <span><small>数量</small><strong>{barcodes.length} 件</strong></span>
+            </div>
+            <div className="v2-receipt-confirm-actions"><button className="v2-button primary v2-receipt-submit" type="submit" disabled={receiptLoading || scanChecking || mutationDisabled || !receiptReady}>{receiptLoading ? "正在原子入库…" : `确认入库 ${barcodes.length} 件`}</button></div>
+          </section>
         </form>
       </section>
     );
   }
 
   function renderQuality() {
+    const mutationDisabled = mode === "offline" && !offlineActivated;
     return (
       <section className="v2-page" aria-labelledby="v2-quality-title">
         <div className="v2-page-heading">
-          <div><span className="v2-eyebrow">质量管理</span><h2 id="v2-quality-title">单件质检</h2><p>未测试库存做初检，不合格隔离库存可做复检。</p></div>
-          <button className="v2-button" type="button" onClick={() => void refreshQualityItems()} disabled={qualityLoading}><RefreshCw size={16} className={qualityLoading ? "v2-spin" : ""} /> 刷新</button>
+          <div><span className="v2-eyebrow">质量作业</span><h2 id="v2-quality-title">扫码质检</h2><p>设置本批结果后，用扫码枪逐件采集待检 SN。</p></div>
+          <button className="v2-button" type="button" onClick={() => void refreshQualityItems()} disabled={qualityLoading || qualityScanChecking}><RefreshCw size={16} className={qualityLoading ? "v2-spin" : ""} /> 刷新</button>
         </div>
         <form className="v2-quality-layout" onSubmit={submitInspection}>
-          <div className="v2-panel v2-quality-list-panel">
-            <div className="v2-segmented" aria-label="质检类型">
-              <button type="button" className={inspectionKind === "initial" ? "active" : ""} onClick={() => setInspectionKind("initial")}>初检（未测试）</button>
-              <button type="button" className={inspectionKind === "retest" ? "active" : ""} onClick={() => setInspectionKind("retest")}>复检（不合格）</button>
+          <div className="v2-panel v2-quality-scanner-panel">
+            <div className="v2-workbench-toolbar">
+              <div>
+                <span>质检类型</span>
+                <div className="v2-segmented" aria-label="质检类型">
+                  <button type="button" className={inspectionKind === "initial" ? "active" : ""} onClick={() => void changeInspectionKind("initial")} disabled={qualityLoading || qualityScanChecking}>初检</button>
+                  <button type="button" className={inspectionKind === "retest" ? "active" : ""} onClick={() => void changeInspectionKind("retest")} disabled={qualityLoading || qualityScanChecking}>复检</button>
+                </div>
+              </div>
+              <strong>{selectedBarcodes.size}<small>件已扫描</small></strong>
             </div>
-            <div className="v2-selection-heading"><strong>选择库存单件</strong><span>已选 {selectedBarcodes.size} / {eligibleQualityItems.length}</span></div>
-            <div className="v2-select-list" aria-busy={qualityLoading}>
-              {!qualityLoading && eligibleQualityItems.length === 0 && <div className="v2-empty"><CheckCircle2 size={28} /> 当前没有符合条件的待检库存</div>}
-              {eligibleQualityItems.map((item) => (
-                <label className="v2-select-item" key={item.inventory_unit_id}>
-                  <input type="checkbox" checked={selectedBarcodes.has(item.barcode)} onChange={() => toggleQualityBarcode(item.barcode)} />
-                  <span className="v2-item-main"><strong>{item.barcode}</strong><small>{item.owner_name} · {item.sku_code} / {item.sku_name}</small></span>
-                  <span className={`v2-badge quality-${item.quality_status}`}>{qualityStatusLabels[item.quality_status]}</span>
-                </label>
+
+            <div className="v2-scan-context">
+              <span><strong>当前范围</strong>{inspectionKind === "initial" ? "待检入库 · 未测试" : "隔离区 · 待复检"}</span>
+              <span><strong>本批结果</strong>{inspectionOutcome === "passed" ? "合格" : "不合格"}</span>
+            </div>
+
+            <label className="v2-scan-field">
+              <span>扫码枪输入 *</span>
+              <div className="v2-scanner-control">
+                <Bell size={21} aria-hidden="true" />
+                <input ref={qualityScannerInputRef} value={qualityScannerInput} onChange={(event) => setQualityScannerInput(event.target.value)} onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void addQualityScannedBarcode();
+                  }
+                }} placeholder="请扫描待检 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={qualityScanChecking || qualityLoading || mutationDisabled} />
+                <button className="v2-button" type="button" onClick={() => void addQualityScannedBarcode()} disabled={!qualityScannerInput.trim() || qualityScanChecking || qualityLoading || mutationDisabled}>{qualityScanChecking ? "正在核对…" : "手动加入"}</button>
+              </div>
+              <small>系统会精确读取单件状态；扫到错误类型、重复 SN 或不存在的 SN 会立即报警。</small>
+            </label>
+
+            {qualityScanNotice && <div className={`v2-scanner-feedback ${qualityScanNotice.type}`} role={qualityScanNotice.type === "error" ? "alert" : "status"} aria-live={qualityScanNotice.type === "error" ? "assertive" : "polite"}>{qualityScanNotice.type === "error" ? <Bell size={19} /> : <CheckCircle2 size={19} />}<span>{qualityScanNotice.text}</span></div>}
+
+            <div className="v2-scanned-heading">
+              <div><strong>当前质检批次</strong><span>已采集 {selectedBarcodes.size} 个 SN</span></div>
+              <button className="v2-button" type="button" onClick={() => void clearQualityBatch()} disabled={qualityLoading || qualityScanChecking || selectedBarcodes.size === 0}>清空批次</button>
+            </div>
+            <div className="v2-scanned-list" aria-label="当前质检批次 SN">
+              {selectedBarcodes.size === 0 && <div className="v2-scanned-empty"><ClipboardCheck size={26} /><span>等待扫描待检 SN</span></div>}
+              {Array.from(selectedBarcodes).map((barcode, index) => (
+                <div className="v2-scanned-row" key={barcode}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <strong>{barcode}</strong>
+                  <button className="v2-icon-button danger" type="button" onClick={() => removeQualityBarcode(barcode)} disabled={qualityLoading || qualityScanChecking} aria-label={`移除质检 SN ${barcode}`} title="从当前批次移除"><X size={16} /></button>
+                </div>
               ))}
             </div>
+
+            <details className="v2-alternative-entry">
+              <summary><span>备用录入</span><small>批量粘贴或从待检列表勾选</small><ChevronDown size={16} /></summary>
+              <div className="v2-alternative-content v2-quality-alternatives">
+                <div className="v2-bulk-entry">
+                  <label><span>批量粘贴 SN（每行一个）</span><textarea value={qualityBulkInput} onChange={(event) => setQualityBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={qualityScanChecking || qualityLoading || mutationDisabled} /></label>
+                  <button className="v2-button" type="button" onClick={() => void importQualityBarcodes()} disabled={!qualityBulkInput.trim() || qualityScanChecking || qualityLoading || mutationDisabled}>校验并加入批次</button>
+                </div>
+                <div>
+                  <div className="v2-selection-heading"><strong>待检列表</strong><span>显示 {eligibleQualityItems.length} 件</span></div>
+                  <div className="v2-select-list" aria-busy={qualityLoading}>
+                    {!qualityLoading && eligibleQualityItems.length === 0 && <div className="v2-empty"><CheckCircle2 size={28} /> 当前没有符合条件的待检库存</div>}
+                    {eligibleQualityItems.map((item) => (
+                      <label className="v2-select-item" key={item.inventory_unit_id}>
+                        <input type="checkbox" checked={selectedBarcodes.has(item.barcode)} onChange={() => toggleQualityBarcode(item.barcode)} disabled={qualityLoading || qualityScanChecking || mutationDisabled} />
+                        <span className="v2-item-main"><strong>{item.barcode}</strong><small>{item.owner_name} · {item.sku_code} / {item.sku_name}</small></span>
+                        <span className={`v2-badge quality-${item.quality_status}`}>{qualityStatusLabels[item.quality_status]}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </details>
           </div>
           <aside className="v2-panel v2-inspection-form">
-            <h3>本次质检结果</h3>
-            <label><span>结果 *</span><select value={inspectionOutcome} onChange={(event) => setInspectionOutcome(event.target.value as QualityOutcome)}><option value="passed">合格</option><option value="failed">不合格</option></select></label>
-            <label><span>缺陷代码</span><input value={defectCode} onChange={(event) => setDefectCode(event.target.value)} placeholder="不合格时建议填写" /></label>
-            <label><span>质检备注</span><textarea value={inspectionNotes} onChange={(event) => setInspectionNotes(event.target.value)} placeholder="记录现象、测试方法或复检说明" /></label>
+            <div className="v2-section-heading compact"><div><h3>本批质检结果</h3><small>应用到本批所有 SN</small></div><ClipboardCheck size={20} /></div>
+            <label><span>结果 *</span><select value={inspectionOutcome} onChange={(event) => setInspectionOutcome(event.target.value as QualityOutcome)} disabled={qualityLoading || qualityScanChecking || mutationDisabled}><option value="passed">合格</option><option value="failed">不合格</option></select></label>
+            <label><span>缺陷代码</span><input value={defectCode} onChange={(event) => setDefectCode(event.target.value)} placeholder="不合格时建议填写" disabled={qualityLoading || qualityScanChecking || mutationDisabled} /></label>
+            <label><span>质检备注</span><textarea value={inspectionNotes} onChange={(event) => setInspectionNotes(event.target.value)} placeholder="记录现象、测试方法或复检说明" disabled={qualityLoading || qualityScanChecking || mutationDisabled} /></label>
             <div className="v2-rule-hint"><ShieldAlert size={17} /><span>不合格单件会进入隔离区；只有合格或经授权放行的单件可参与出库分配。</span></div>
-            <button className="v2-button primary wide" type="submit" disabled={qualityLoading || selectedBarcodes.size === 0}>{qualityLoading ? "正在提交…" : `提交 ${selectedBarcodes.size} 件质检结果`}</button>
+            <button className="v2-button primary wide" type="submit" disabled={qualityLoading || qualityScanChecking || selectedBarcodes.size === 0 || mutationDisabled}>{qualityLoading ? "正在提交…" : `确认质检 ${selectedBarcodes.size} 件`}</button>
           </aside>
         </form>
         {qualityNotice && <div className={`v2-notice ${qualityNotice.type}`}>{qualityNotice.text}</div>}
@@ -1460,43 +2515,126 @@ export default function InventoryWorkspace({
   }
 
   function renderOutbound() {
+    const mutationDisabled = mode === "offline" && !offlineActivated;
+    const orderStepState = outboundOrder ? "complete" : "active";
+    const allocationStepState = outboundAllocation ? "complete" : outboundOrder ? "active" : "pending";
+    const scanStepState = outboundShipment ? "complete" : outboundAllocation ? "active" : "pending";
+    const deliveryStepState = outboundResolved ? "complete" : outboundShipment ? "active" : "pending";
     return (
       <section className="v2-page" aria-labelledby="v2-outbound-title">
         <div className="v2-page-heading">
-          <div><span className="v2-eyebrow">出库管理</span><h2 id="v2-outbound-title">凑单交货</h2><p>多个货主的合格库存可以组成同一张上游订单，所有单件仍保留来源追踪。</p></div>
+          <div><span className="v2-eyebrow">出库作业</span><h2 id="v2-outbound-title">扫码出库</h2><p>系统先分配合格库存，作业员再用扫码枪逐件核对实物。</p></div>
         </div>
-        <div className="v2-outbound-layout">
-          <form className="v2-panel v2-form" onSubmit={createOutboundOrder}>
-            <h3>1. 建立上游需求</h3>
-            <div className="v2-form-grid">
-              <label><span>上游收货方 *</span><input value={outboundReceiver} onChange={(event) => setOutboundReceiver(event.target.value)} placeholder="例如：上游客户 A" /></label>
-              <label><span>订单号 *</span><input value={outboundOrderNo} onChange={(event) => setOutboundOrderNo(event.target.value)} placeholder="例如：SO-20260803-01" /></label>
-              <label><span>型号编码 *</span><input value={outboundSkuCode} onChange={(event) => setOutboundSkuCode(event.target.value)} placeholder="例如：DDR4-32G-3200" /></label>
-              <label><span>型号名称 *</span><input value={outboundSkuName} onChange={(event) => setOutboundSkuName(event.target.value)} placeholder="例如：32G 3200 内存" /></label>
-              <label><span>需求数量 *</span><input type="number" min="1" step="1" value={outboundQuantity} onChange={(event) => setOutboundQuantity(event.target.value)} /></label>
-            </div>
-            <div className="v2-form-actions"><button className="v2-button primary" type="submit" disabled={outboundLoading}>{outboundLoading ? "处理中…" : outboundOrder ? "重新建单" : "创建出库订单"}</button></div>
+        <div className="v2-panel v2-outbound-workbench">
+          <ol className="v2-workflow-progress v2-workflow-progress-four" aria-label="出库进度">
+            <li className={orderStepState}><span>1</span><div><strong>建立需求</strong><small>{outboundOrder?.order_no ?? "待建单"}</small></div></li>
+            <li className={allocationStepState}><span>2</span><div><strong>分配库存</strong><small>{outboundAllocation ? `${outboundAllocation.allocated_count} 件` : "待分配"}</small></div></li>
+            <li className={scanStepState}><span>3</span><div><strong>扫码核对</strong><small>{outboundAllocation ? `${outboundScannedBarcodes.length} / ${outboundAllocatedBarcodes.length}` : "待扫码"}</small></div></li>
+            <li className={deliveryStepState}><span>4</span><div><strong>交货处理</strong><small>{outboundShipment?.shipment_no ?? "待出库"}</small></div></li>
+          </ol>
+
+          <form className="v2-outbound-step" onSubmit={createOutboundOrder}>
+            <div className="v2-receipt-section-heading"><span>1</span><div><h3>建立上游需求</h3><small>填写本次订单条件</small></div></div>
+            {!outboundOrder ? <>
+              <div className="v2-form-grid">
+                <label><span>上游收货方 *</span><input value={outboundReceiver} onChange={(event) => setOutboundReceiver(event.target.value)} placeholder="例如：上游客户 A" disabled={outboundLoading || mutationDisabled} /></label>
+                <label><span>订单号 *</span><input value={outboundOrderNo} onChange={(event) => setOutboundOrderNo(event.target.value)} placeholder="例如：SO-20260803-01" disabled={outboundLoading || mutationDisabled} /></label>
+                <label><span>型号编码 *</span><input value={outboundSkuCode} onChange={(event) => setOutboundSkuCode(event.target.value)} placeholder="例如：DDR4-32G-3200" disabled={outboundLoading || mutationDisabled} /></label>
+                <label><span>型号名称 *</span><input value={outboundSkuName} onChange={(event) => setOutboundSkuName(event.target.value)} placeholder="例如：32G 3200 内存" disabled={outboundLoading || mutationDisabled} /></label>
+                <label><span>需求数量 *</span><input type="number" min="1" step="1" value={outboundQuantity} onChange={(event) => setOutboundQuantity(event.target.value)} disabled={outboundLoading || mutationDisabled} /></label>
+              </div>
+              <div className="v2-form-actions"><button className="v2-button primary" type="submit" disabled={outboundLoading || mutationDisabled}>{outboundLoading ? "处理中…" : "创建出库订单"}</button></div>
+            </> : <div className="v2-step-summary"><span><small>订单</small><strong>{outboundOrder.order_no}</strong></span><span><small>收货方</small><strong>{outboundReceiver}</strong></span><span><small>商品</small><strong>{outboundSkuCode}</strong></span><span><small>数量</small><strong>{outboundOrder.required_quantity} 件</strong></span></div>}
           </form>
-          <div className="v2-panel v2-outbound-workflow">
-            <h3>2. 分配合格库存</h3>
-            <p className="v2-outbound-meta">{outboundOrder ? `${outboundOrder.order_no} · 需求 ${outboundOrder.required_quantity} 件` : "请先创建订单"}</p>
-            <label><span>指定条码（可选）</span><textarea value={outboundBarcodes} onChange={(event) => setOutboundBarcodes(event.target.value)} placeholder="留空则按入库时间 FIFO；指定时每行一个条码" disabled={!outboundOrder || outboundLoading} /></label>
-            <button className="v2-button primary wide" type="button" onClick={() => void allocateOutboundOrder()} disabled={!outboundOrder || outboundLoading}>{outboundLoading ? "处理中…" : "分配库存"}</button>
-            {outboundAllocation && <div className="v2-code-list"><strong>已分配 {outboundAllocation.allocated_count} 件</strong>{outboundAllocation.allocations.map((item) => <span key={item.allocation_id}><b>{item.barcode}</b><small>货主 {item.owner_party_id}</small></span>)}</div>}
-          </div>
-          <div className="v2-panel v2-outbound-workflow">
-            <h3>3. 扫码出库</h3>
-            <label><span>出库批次号</span><input value={outboundShipmentNo} onChange={(event) => setOutboundShipmentNo(event.target.value)} placeholder="留空自动生成" disabled={!outboundAllocation || outboundLoading} /></label>
-            <button className="v2-button primary wide" type="button" onClick={() => void shipOutboundOrder()} disabled={!outboundAllocation || outboundLoading}>{outboundLoading ? "处理中…" : "确认出库"}</button>
-            {outboundShipment && <div className="v2-code-list"><strong>{outboundShipment.shipment_no} · 已出库 {outboundShipment.shipped_count} 件</strong>{outboundShipment.items.map((item) => <span key={item.shipment_line_id}><b>{item.barcode}</b><small>出库行已建立</small></span>)}</div>}
-          </div>
-          <div className="v2-panel v2-outbound-workflow">
-            <h3>4. 交货确认或退回</h3>
-            <label><span>上游确认码</span><input value={outboundConfirmationCode} onChange={(event) => setOutboundConfirmationCode(event.target.value)} placeholder="例如：签收单号 / 确认码" disabled={!outboundShipment || outboundLoading} /></label>
-            <button className="v2-button primary wide" type="button" onClick={() => void confirmOutboundDelivery()} disabled={!outboundShipment || outboundLoading}>确认已交货</button>
-            <label><span>退回原因</span><textarea value={outboundReturnReason} onChange={(event) => setOutboundReturnReason(event.target.value)} placeholder="退回后全部进入隔离区，复检通过前不可再次出库" disabled={!outboundShipment || outboundLoading} /></label>
-            <button className="v2-button wide" type="button" onClick={() => void returnOutboundShipment()} disabled={!outboundShipment || outboundLoading}>登记退回并隔离</button>
-          </div>
+
+          <section className={`v2-outbound-step ${!outboundOrder ? "locked" : ""}`} aria-disabled={!outboundOrder}>
+            <div className="v2-receipt-section-heading"><span>2</span><div><h3>分配合格库存</h3><small>{outboundOrder ? `${outboundOrder.order_no} · 需求 ${outboundOrder.required_quantity} 件` : "完成建单后可用"}</small></div></div>
+            {outboundOrder && !outboundAllocation && <>
+              <p className="v2-outbound-meta">默认按入库时间自动分配合格库存，减少人工选货。</p>
+              <button className="v2-button primary" type="button" onClick={() => void allocateOutboundOrder()} disabled={outboundLoading || mutationDisabled}>{outboundLoading ? "处理中…" : "按 FIFO 分配库存"}</button>
+              <details className="v2-alternative-entry">
+                <summary><span>备用分配</span><small>需要指定 SN 时使用</small><ChevronDown size={16} /></summary>
+                <div className="v2-alternative-content">
+                  <label><span>指定 SN（每行一个）</span><textarea value={outboundBarcodes} onChange={(event) => setOutboundBarcodes(event.target.value)} placeholder={"SN0001\nSN0002"} disabled={outboundLoading || mutationDisabled} /></label>
+                  <button className="v2-button" type="button" onClick={() => void allocateOutboundOrder()} disabled={!outboundBarcodes.trim() || outboundLoading || mutationDisabled}>按指定 SN 分配</button>
+                </div>
+              </details>
+            </>}
+            {outboundAllocation && <div className="v2-inline-success"><CheckCircle2 size={18} /><span>已锁定 {outboundAllocation.allocated_count} 件合格库存。</span></div>}
+          </section>
+
+          <section className={`v2-outbound-step v2-outbound-scan-step ${!outboundAllocation ? "locked" : ""}`} aria-disabled={!outboundAllocation}>
+            <div className="v2-scanner-heading">
+              <div className="v2-receipt-section-heading"><span>3</span><div><h3>扫码核对实物</h3><small>必须逐件扫齐</small></div></div>
+              <strong>{outboundScannedBarcodes.length}<small>/ {outboundAllocatedBarcodes.length} 件</small></strong>
+            </div>
+            {!outboundAllocation && <p className="v2-outbound-meta">完成上一步分配后，这里会打开扫码核对。</p>}
+            {outboundAllocation && !outboundShipment && <>
+            <label className="v2-scan-field">
+              <span>扫码枪输入 *</span>
+              <div className="v2-scanner-control">
+                <Bell size={21} aria-hidden="true" />
+                <input ref={outboundScannerInputRef} value={outboundScannerInput} onChange={(event) => setOutboundScannerInput(event.target.value)} onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void addOutboundScannedBarcode();
+                  }
+                }} placeholder="请扫描待出库 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={!outboundAllocation || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled} />
+                <button className="v2-button" type="button" onClick={() => void addOutboundScannedBarcode()} disabled={!outboundScannerInput.trim() || !outboundAllocation || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled}>{outboundScanChecking ? "正在核对…" : "手动加入"}</button>
+              </div>
+              <small>重复 SN、其他订单 SN 或未分配 SN 会立即报警，并且不会进入出库批次。</small>
+            </label>
+
+            {outboundScanNotice && <div className={`v2-scanner-feedback ${outboundScanNotice.type}`} role={outboundScanNotice.type === "error" ? "alert" : "status"} aria-live={outboundScanNotice.type === "error" ? "assertive" : "polite"}>{outboundScanNotice.type === "error" ? <Bell size={19} /> : <CheckCircle2 size={19} />}<span>{outboundScanNotice.text}</span></div>}
+
+            <div className="v2-scanned-heading">
+              <div><strong>分配核对清单</strong><span>{outboundScanComplete ? "已全部扫齐" : `还差 ${Math.max(0, outboundAllocatedBarcodes.length - outboundScannedBarcodes.length)} 件`}</span></div>
+              <button className="v2-button" type="button" onClick={() => void clearOutboundScanBatch()} disabled={outboundScanChecking || outboundLoading || Boolean(outboundShipment) || outboundScannedBarcodes.length === 0}>清空扫码</button>
+            </div>
+            <div className="v2-outbound-checklist" aria-label="出库分配核对清单">
+              {!outboundAllocation && <div className="v2-scanned-empty"><Truck size={26} /><span>等待分配库存</span></div>}
+              {outboundAllocation?.allocations.map((item, index) => {
+                const scanned = outboundScannedBarcodes.includes(item.barcode.toUpperCase());
+                return <div className={scanned ? "scanned" : ""} key={item.allocation_id}>
+                  <span>{scanned ? <CheckCircle2 size={17} /> : String(index + 1).padStart(2, "0")}</span>
+                  <strong>{item.barcode}</strong>
+                  <small>{scanned ? "已核对" : "待扫描"}</small>
+                  {scanned && !outboundShipment && <button className="v2-icon-button danger" type="button" onClick={() => removeOutboundScannedBarcode(item.barcode.toUpperCase())} disabled={outboundScanChecking || outboundLoading} aria-label={`移除出库 SN ${item.barcode}`} title="重新核对"><X size={16} /></button>}
+                </div>;
+              })}
+            </div>
+
+            <details className="v2-alternative-entry">
+              <summary><span>备用录入</span><small>批量粘贴已分配 SN</small><ChevronDown size={16} /></summary>
+              <div className="v2-alternative-content">
+                <label><span>每行一个 SN</span><textarea value={outboundBulkInput} onChange={(event) => setOutboundBulkInput(event.target.value)} placeholder={"SN0001\nSN0002"} disabled={!outboundAllocation || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled} /></label>
+                <button className="v2-button" type="button" onClick={() => void importOutboundBarcodes()} disabled={!outboundBulkInput.trim() || !outboundAllocation || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled}>核对并加入批次</button>
+              </div>
+            </details>
+
+            <div className="v2-outbound-submit-row">
+              <label><span>出库批次号</span><input value={outboundShipmentNo} onChange={(event) => setOutboundShipmentNo(event.target.value)} placeholder="留空自动生成" disabled={!outboundAllocation || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled} /></label>
+              <button className="v2-button primary" type="button" onClick={() => void shipOutboundOrder()} disabled={!outboundScanComplete || Boolean(outboundShipment) || outboundScanChecking || outboundLoading || mutationDisabled}>{outboundLoading ? "正在原子出库…" : `确认出库 ${outboundScannedBarcodes.length} 件`}</button>
+            </div>
+            </>}
+            {outboundShipment && <div className="v2-inline-success"><CheckCircle2 size={18} /><span>{outboundShipment.shipment_no} 已按扫码记录出库 {outboundShipment.shipped_count} 件。</span></div>}
+          </section>
+
+          <section className={`v2-outbound-step ${!outboundShipment ? "locked" : ""}`} aria-disabled={!outboundShipment}>
+            <div className="v2-receipt-section-heading"><span>4</span><div><h3>交货确认或退回</h3><small>{outboundShipment ? outboundShipment.shipment_no : "完成出库后可用"}</small></div></div>
+            {!outboundShipment && <p className="v2-outbound-meta">完成扫码出库后，这里会打开交货和退回处理。</p>}
+            {outboundShipment && <div className="v2-delivery-actions">
+              <div>
+                <label><span>上游确认码</span><input value={outboundConfirmationCode} onChange={(event) => setOutboundConfirmationCode(event.target.value)} placeholder="签收单号 / 确认码" disabled={!outboundShipment || outboundResolved || outboundLoading || mutationDisabled} /></label>
+                <button className="v2-button primary" type="button" onClick={() => void confirmOutboundDelivery()} disabled={!outboundShipment || outboundResolved || outboundLoading || mutationDisabled}>确认已交货</button>
+              </div>
+              <div>
+                <label><span>退回原因</span><textarea value={outboundReturnReason} onChange={(event) => setOutboundReturnReason(event.target.value)} placeholder="退回后进入隔离区，复检通过前不可再次出库" disabled={!outboundShipment || outboundResolved || outboundLoading || mutationDisabled} /></label>
+                <button className="v2-button" type="button" onClick={() => void returnOutboundShipment()} disabled={!outboundShipment || outboundResolved || outboundLoading || mutationDisabled}>登记退回并隔离</button>
+              </div>
+            </div>}
+            {outboundResolved && <button className="v2-button primary" type="button" onClick={startNextOutboundOrder}>开始下一单</button>}
+          </section>
         </div>
         {outboundNotice && <div className={`v2-notice ${outboundNotice.type}`}>{outboundNotice.text}</div>}
       </section>
@@ -1529,8 +2667,8 @@ export default function InventoryWorkspace({
               <div><span>2</span><strong>选择升级包</strong><button className="v2-button" type="button" onClick={() => void chooseUpgradePackage()} disabled={dataOperationLoading}>选择目录</button></div>
               <div><span>3</span><strong>导入空工作区</strong><button className="v2-button primary" type="button" onClick={() => void upgradeOfflineToNetwork()} disabled={dataOperationLoading || !networkStatus?.authenticated}>执行升级</button></div>
             </div>
-            <label className="v2-settings-field"><span>升级包路径</span><input value={upgradePackagePath} onChange={(event) => setUpgradePackagePath(event.target.value)} placeholder="选择 .invpack 目录" /></label>
-            <label className="v2-settings-field"><span>目标网络工作区 ID</span><input value={upgradeTargetWorkspaceId} onChange={(event) => setUpgradeTargetWorkspaceId(event.target.value)} placeholder="UUID" /></label>
+            <label className="v2-settings-field"><span>升级包路径</span><input value={upgradePackagePath} onChange={(event) => setUpgradePackagePath(event.target.value)} placeholder="选择 .invpack 目录" disabled={dataOperationLoading} /></label>
+            <label className="v2-settings-field"><span>目标网络工作区 ID</span><input value={upgradeTargetWorkspaceId} onChange={(event) => setUpgradeTargetWorkspaceId(event.target.value)} placeholder="UUID" disabled={dataOperationLoading} /></label>
             <div className="v2-rule-hint"><ShieldAlert size={17} /><span>服务端确认条码、关系、计数和 checksum 完全一致后，本地库才会冻结。冻结后不再允许新增或修改业务数据。</span></div>
             {!networkStatus?.authenticated && <div className="v2-notice error">执行导入前，请切换到网络版并登录具备升级权限的账号。</div>}
             {upgradeExport && <div className="v2-upgrade-result"><strong>已生成升级包</strong><span>export_id：{upgradeExport.export_id}</span><span>checksum：{upgradeExport.checksum}</span></div>}
@@ -1542,38 +2680,61 @@ export default function InventoryWorkspace({
     );
   }
 
+  const availableNavigationItems = navigationItems.filter((item) => !item.mode || item.mode === mode);
+  const overviewNavigationItem = availableNavigationItems.find((item) => item.id === "overview")!;
+  const OverviewIcon = overviewNavigationItem.icon;
+  const modeSwitchDisabled = workspaceOperationInProgress();
+
   return (
     <div className="v2-workspace">
       <aside className="v2-sidebar">
-        <div className="v2-brand"><span><Boxes size={22} /></span><div><strong>库存管理 V2</strong><small>{mode === "network" ? "网络多用户工作区" : "离线单用户工作区"}</small></div></div>
+        <div className="v2-brand"><span><Boxes size={22} /></span><div><strong>库存管理</strong><small>{mode === "network" ? "团队协作工作区" : "本机工作区"}</small></div></div>
         <div className="v2-mode-switch" aria-label="工作模式">
-          <button type="button" className={mode === "offline" ? "active" : ""} onClick={() => switchMode("offline")}>离线 SQLite</button>
-          <button type="button" className={mode === "network" ? "active" : ""} onClick={() => switchMode("network")}>网络 PostgreSQL</button>
+          <button type="button" className={mode === "offline" ? "active" : ""} onClick={() => void switchMode("offline")} disabled={modeSwitchDisabled}>本机版</button>
+          <button type="button" className={mode === "network" ? "active" : ""} onClick={() => void switchMode("network")} disabled={modeSwitchDisabled}>团队版</button>
         </div>
-        <nav aria-label="库存模块">
-          {navigationItems.filter((item) => !item.mode || item.mode === mode).map((item) => {
-            const Icon = item.icon;
-            return <button key={item.id} type="button" className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}><Icon size={19} /><span><strong>{item.label}</strong><small>{item.description}</small></span></button>;
-          })}
+        <nav className="v2-desktop-navigation" aria-label="库存模块">
+          <button type="button" className={`v2-nav-overview ${page === "overview" ? "active" : ""}`} onClick={() => navigateToPage("overview")} disabled={modeSwitchDisabled}><OverviewIcon size={19} /><span><strong>{overviewNavigationItem.label}</strong><small>{overviewNavigationItem.description}</small></span></button>
+          <div className="v2-nav-groups">
+            {navigationGroups.map((group) => {
+              const groupItems = availableNavigationItems.filter((item) => item.group === group.id);
+              if (groupItems.length === 0) return null;
+              const GroupIcon = group.icon;
+              const expanded = expandedNavGroups.has(group.id);
+              const active = groupItems.some((item) => item.id === page);
+              return <section className={`v2-nav-group ${active ? "active" : ""}`} key={group.id}>
+                <button className="v2-nav-group-toggle" type="button" onClick={() => toggleNavGroup(group.id)} aria-expanded={expanded}><GroupIcon size={16} /><strong>{group.label}</strong><ChevronDown size={15} className={expanded ? "expanded" : ""} /></button>
+                {expanded && <div className="v2-nav-group-items">{groupItems.map((item) => {
+                  const Icon = item.icon;
+                  return <button key={item.id} type="button" className={page === item.id ? "active" : ""} onClick={() => navigateToPage(item.id)} disabled={modeSwitchDisabled}><Icon size={17} /><span><strong>{item.label}</strong><small>{item.description}</small></span></button>;
+                })}</div>}
+              </section>;
+            })}
+          </div>
         </nav>
+        <label className="v2-mobile-navigation"><span>当前模块</span><select value={page} onChange={(event) => navigateToPage(event.target.value as WorkspacePage)} disabled={modeSwitchDisabled}><option value="overview">概览</option>{navigationGroups.map((group) => {
+          const groupItems = availableNavigationItems.filter((item) => item.group === group.id);
+          return groupItems.length > 0 ? <optgroup label={group.label} key={group.id}>{groupItems.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</optgroup> : null;
+        })}</select></label>
         <div className="v2-sidebar-footer">
-          <span>{mode === "network" ? "网络数据模式" : "本地数据模式"}</span>
-          <small>{mode === "network" ? (networkStatus?.authenticated ? `已登录 · ${networkStatus.user_id ?? ""}` : "PostgreSQL · 多用户 · 服务端授权") : (offlineActivated ? "SQLite · 单用户 · 原子事务" : "SQLite · 授权无效 · 只读和备份可用")}</small>
-          {mode === "network" && networkStatus?.authenticated && <button className="v2-back-button" type="button" onClick={() => void logoutNetwork()} disabled={networkAuthLoading}><LogOut size={15} /> 退出网络版</button>}
-          {mode === "offline" && !offlineActivated && onRequestActivation && <button className="v2-back-button" type="button" onClick={onRequestActivation}><ShieldAlert size={15} /> 离线激活</button>}
-          {onBackToLegacy && <button className="v2-back-button" type="button" onClick={onBackToLegacy}><ArrowLeft size={16} /> 返回旧版工具</button>}
+          <span>{mode === "network" ? "团队版" : "本机版"}</span>
+          <small>{mode === "network" ? (networkStatus?.authenticated ? `已登录 · ${networkStatus.user_id ?? ""}` : "多人协作 · 服务端授权") : (offlineActivated ? "单机使用 · 自动保存" : "授权无效 · 只读和备份可用")}</small>
+          {mode === "network" && networkStatus?.authenticated && <button className="v2-back-button" type="button" onClick={() => void logoutNetwork()} disabled={modeSwitchDisabled}><LogOut size={15} /> 退出团队版</button>}
+          {mode === "offline" && !offlineActivated && onRequestActivation && <button className="v2-back-button" type="button" onClick={onRequestActivation} disabled={modeSwitchDisabled}><ShieldAlert size={15} /> 离线激活</button>}
+          {onBackToLegacy && <button className="v2-back-button" type="button" onClick={onBackToLegacy} disabled={modeSwitchDisabled}><ArrowLeft size={16} /> 返回旧版工具</button>}
         </div>
       </aside>
       <main className="v2-content">
         {mode === "offline" && !offlineActivated && <div className="v2-readonly-banner"><ShieldAlert size={17} /><span>离线授权当前无效：查询、备份和恢复仍可使用，入库、质检、凑单、出库与退回已锁定。</span></div>}
         {mode === "network" && !networkStatus?.authenticated ? renderNetworkLogin() : <>
           {page === "overview" && renderOverview()}
+          {page === "catalog" && renderCatalog()}
           {page === "receipt" && renderReceipt()}
           {page === "quality" && renderQuality()}
           {page === "inventory" && renderInventory()}
           {page === "outbound" && renderOutbound()}
-          {page === "legacy-import" && <LegacyImportPanel actorId={resolvedActorId} activated={offlineActivated} onCommitted={() => void refreshDashboard()} />}
-          {page === "users" && <IdentityAdminPanel currentUserId={networkStatus?.user_id ?? null} />}
+          {page === "legacy-import" && <LegacyImportPanel actorId={resolvedActorId} activated={offlineActivated} onBusyChange={handleChildPanelBusyChange} onCommitted={() => void refreshDashboard()} />}
+          {page === "users" && <IdentityAdminPanel currentUserId={networkStatus?.user_id ?? null} onBusyChange={handleChildPanelBusyChange} />}
           {page === "settings" && renderSettings()}
         </>}
       </main>

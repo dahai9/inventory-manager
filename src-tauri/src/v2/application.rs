@@ -52,6 +52,7 @@ pub struct PostReceiptRequest {
     pub idempotency_key: String,
     pub receipt_no: String,
     pub owner_name: String,
+    pub supplier_name: String,
     pub sku_code: String,
     pub sku_name: String,
     pub source_reference: Option<String>,
@@ -73,10 +74,73 @@ pub struct PostReceiptResponse {
     pub receipt_line_id: String,
     pub receipt_no: String,
     pub owner_party_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplier_party_id: Option<String>,
     pub sku_id: String,
     pub received_count: u32,
     pub units: Vec<ReceiptUnit>,
     pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceCatalog {
+    pub products: Vec<CatalogProduct>,
+    pub goods_owners: Vec<CatalogParty>,
+    pub suppliers: Vec<CatalogParty>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProduct {
+    pub sku_id: String,
+    pub code: String,
+    pub name: String,
+    pub serial_prefix: Option<String>,
+    pub serial_forbidden_chars: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogParty {
+    pub party_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCatalogProductRequest {
+    pub code: String,
+    pub name: String,
+    #[serde(default)]
+    pub serial_prefix: Option<String>,
+    #[serde(default)]
+    pub serial_forbidden_chars: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogPartyRole {
+    GoodsOwner,
+    Supplier,
+}
+
+impl CatalogPartyRole {
+    pub(crate) fn database_value(self) -> &'static str {
+        match self {
+            Self::GoodsOwner => "goods_owner",
+            Self::Supplier => "supplier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCatalogPartyRequest {
+    pub display_name: String,
+    pub role: CatalogPartyRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkuScanRules {
+    id: String,
+    serial_prefix: Option<String>,
+    serial_forbidden_chars: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,17 +315,29 @@ impl OfflineDatabase {
             }
         }
 
-        let owner_party_id =
-            lookup_or_create_owner(&mut transaction, workspace_id, &request.owner_name, &now)
-                .await?;
-        let sku_id = lookup_or_create_sku(
+        let owner_party_id = lookup_catalog_party(
+            &mut transaction,
+            workspace_id,
+            &request.owner_name,
+            CatalogPartyRole::GoodsOwner,
+        )
+        .await?;
+        let supplier_party_id = lookup_catalog_party(
+            &mut transaction,
+            workspace_id,
+            &request.supplier_name,
+            CatalogPartyRole::Supplier,
+        )
+        .await?;
+        let sku = lookup_catalog_sku(
             &mut transaction,
             workspace_id,
             &request.sku_code,
             &request.sku_name,
-            &now,
         )
         .await?;
+        validate_barcodes_for_sku(&request.barcodes, &sku)?;
+        let sku_id = sku.id;
 
         let receipt_id = new_id();
         let receipt_line_id = new_id();
@@ -284,9 +360,9 @@ impl OfflineDatabase {
             r#"
             INSERT INTO inbound_receipts (
                 id, workspace_id, receipt_no, owner_party_id, warehouse_id,
-                source_reference, received_at, status, actor_id, idempotency_key,
-                request_id, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'posted', ?8, ?9, ?10, ?11)
+                supplier_party_id, source_reference, received_at, status, actor_id,
+                idempotency_key, request_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'posted', ?9, ?10, ?11, ?12)
             "#,
         )
         .bind(&receipt_id)
@@ -294,6 +370,7 @@ impl OfflineDatabase {
         .bind(&request.receipt_no)
         .bind(&owner_party_id)
         .bind(self.warehouse_id())
+        .bind(&supplier_party_id)
         .bind(&request.source_reference)
         .bind(&request.received_at)
         .bind(&request.actor_id)
@@ -392,6 +469,7 @@ impl OfflineDatabase {
             receipt_line_id,
             receipt_no: request.receipt_no.clone(),
             owner_party_id,
+            supplier_party_id: Some(supplier_party_id),
             sku_id,
             received_count: units.len() as u32,
             units,
@@ -400,6 +478,7 @@ impl OfflineDatabase {
         let details = json!({
             "receipt_no": request.receipt_no,
             "owner_party_id": response.owner_party_id,
+            "supplier_party_id": response.supplier_party_id,
             "sku_id": response.sku_id,
             "received_count": response.received_count,
         });
@@ -749,6 +828,169 @@ impl OfflineDatabase {
         })
     }
 
+    pub async fn list_reference_catalog(&self) -> ApplicationResult<ReferenceCatalog> {
+        let products = sqlx::query(
+            r#"
+            SELECT id, code, name, serial_prefix, serial_forbidden_chars
+              FROM skus
+             WHERE workspace_id = ?1 AND active = 1
+             ORDER BY code, id
+            "#,
+        )
+        .bind(self.workspace_id())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("list catalog products", error))?
+        .into_iter()
+        .map(|row| {
+            Ok(CatalogProduct {
+                sku_id: row
+                    .try_get("id")
+                    .map_err(|error| storage("read catalog SKU id", error))?,
+                code: row
+                    .try_get("code")
+                    .map_err(|error| storage("read catalog SKU code", error))?,
+                name: row
+                    .try_get("name")
+                    .map_err(|error| storage("read catalog SKU name", error))?,
+                serial_prefix: row
+                    .try_get("serial_prefix")
+                    .map_err(|error| storage("read catalog SKU serial prefix", error))?,
+                serial_forbidden_chars: row
+                    .try_get("serial_forbidden_chars")
+                    .map_err(|error| storage("read catalog SKU scan safeguard", error))?,
+            })
+        })
+        .collect::<ApplicationResult<Vec<_>>>()?;
+        let goods_owners = self
+            .list_catalog_parties(CatalogPartyRole::GoodsOwner)
+            .await?;
+        let suppliers = self
+            .list_catalog_parties(CatalogPartyRole::Supplier)
+            .await?;
+        Ok(ReferenceCatalog {
+            products,
+            goods_owners,
+            suppliers,
+        })
+    }
+
+    pub async fn create_catalog_product(
+        &self,
+        input: CreateCatalogProductRequest,
+    ) -> ApplicationResult<CatalogProduct> {
+        let input = normalize_catalog_product(input)?;
+        let workspace_id = self.workspace_id();
+        let now = application_now()?;
+        let mut transaction = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| storage("begin catalog product transaction", error))?;
+        ensure_workspace_writable(&mut transaction, workspace_id).await?;
+        let sku_id = new_id();
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO skus
+                (id, workspace_id, code, name, tracking_mode, active,
+                 serial_prefix, serial_forbidden_chars, created_at)
+            VALUES (?1, ?2, ?3, ?4, 'serial', 1, ?5, ?6, ?7)
+            ON CONFLICT (workspace_id, code) DO NOTHING
+            "#,
+        )
+        .bind(&sku_id)
+        .bind(workspace_id)
+        .bind(&input.code)
+        .bind(&input.name)
+        .bind(&input.serial_prefix)
+        .bind(&input.serial_forbidden_chars)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| storage("create catalog product", error))?;
+        if inserted.rows_affected() != 1 {
+            return Err(ApplicationError::Conflict {
+                entity: "sku".to_owned(),
+                key: input.code,
+                message: "product code already exists in this workspace".to_owned(),
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| storage("commit catalog product", error))?;
+        Ok(CatalogProduct {
+            sku_id,
+            code: input.code,
+            name: input.name,
+            serial_prefix: input.serial_prefix,
+            serial_forbidden_chars: input.serial_forbidden_chars,
+        })
+    }
+
+    pub async fn create_catalog_party(
+        &self,
+        input: CreateCatalogPartyRequest,
+    ) -> ApplicationResult<CatalogParty> {
+        let input = normalize_catalog_party(input)?;
+        let workspace_id = self.workspace_id();
+        let now = application_now()?;
+        let mut transaction = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| storage("begin catalog party transaction", error))?;
+        ensure_workspace_writable(&mut transaction, workspace_id).await?;
+        let party_id = lookup_or_create_party(
+            &mut transaction,
+            workspace_id,
+            &input.display_name,
+            input.role,
+            &now,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| storage("commit catalog party", error))?;
+        Ok(CatalogParty {
+            party_id,
+            display_name: input.display_name,
+        })
+    }
+
+    async fn list_catalog_parties(
+        &self,
+        role: CatalogPartyRole,
+    ) -> ApplicationResult<Vec<CatalogParty>> {
+        sqlx::query(
+            r#"
+            SELECT bp.id, bp.display_name
+              FROM business_parties bp
+              JOIN party_roles pr ON pr.party_id = bp.id AND pr.workspace_id = bp.workspace_id
+             WHERE bp.workspace_id = ?1 AND pr.role = ?2
+             ORDER BY bp.display_name COLLATE NOCASE, bp.id
+            "#,
+        )
+        .bind(self.workspace_id())
+        .bind(role.database_value())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("list catalog parties", error))?
+        .into_iter()
+        .map(|row| {
+            Ok(CatalogParty {
+                party_id: row
+                    .try_get("id")
+                    .map_err(|error| storage("read catalog party id", error))?,
+                display_name: row
+                    .try_get("display_name")
+                    .map_err(|error| storage("read catalog party name", error))?,
+            })
+        })
+        .collect()
+    }
+
     pub async fn inventory_summary(
         &self,
         query: InventorySummaryQuery,
@@ -821,6 +1063,80 @@ struct ValidatedInspectionResult {
     previous_version: u64,
 }
 
+fn normalize_catalog_product(
+    mut input: CreateCatalogProductRequest,
+) -> ApplicationResult<CreateCatalogProductRequest> {
+    input.code = required_text("product code", input.code)?.to_uppercase();
+    input.name = normalized_display_name("product name", input.name)?;
+    input.serial_prefix = clean_optional(input.serial_prefix)
+        .map(|value| required_text("SN prefix", value).map(|prefix| prefix.to_uppercase()))
+        .transpose()?;
+    if input.serial_forbidden_chars.len() > 128 {
+        return Err(validation(
+            "serial_forbidden_chars",
+            "must be at most 128 characters",
+        ));
+    }
+    let forbidden = parse_forbidden_serial_tokens(&input.serial_forbidden_chars);
+    if let Some((prefix, token)) = input.serial_prefix.as_ref().and_then(|prefix| {
+        forbidden
+            .iter()
+            .find(|token| prefix.contains(token.as_str()))
+            .map(|token| (prefix, token))
+    }) {
+        return Err(validation(
+            "serial_prefix",
+            &format!("prefix {prefix} contains forbidden character or token {token}"),
+        ));
+    }
+    Ok(input)
+}
+
+fn normalize_catalog_party(
+    mut input: CreateCatalogPartyRequest,
+) -> ApplicationResult<CreateCatalogPartyRequest> {
+    input.display_name = normalized_display_name("party name", input.display_name)?;
+    Ok(input)
+}
+
+fn validate_barcodes_for_sku(barcodes: &[String], rules: &SkuScanRules) -> ApplicationResult<()> {
+    let forbidden = parse_forbidden_serial_tokens(&rules.serial_forbidden_chars);
+    for barcode in barcodes {
+        if let Some(prefix) = &rules.serial_prefix {
+            if !barcode.starts_with(prefix) {
+                return Err(ApplicationError::Validation {
+                    field: "barcodes".to_owned(),
+                    message: format!("SN {barcode} does not match product prefix {prefix}"),
+                });
+            }
+        }
+        if let Some(token) = forbidden
+            .iter()
+            .find(|token| barcode.contains(token.as_str()))
+        {
+            return Err(ApplicationError::Validation {
+                field: "barcodes".to_owned(),
+                message: format!("SN {barcode} contains forbidden character or token {token}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_forbidden_serial_tokens(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|token| {
+            if token == " " {
+                Some(" ".to_owned())
+            } else {
+                let token = token.trim();
+                (!token.is_empty()).then(|| token.to_uppercase())
+            }
+        })
+        .collect()
+}
+
 fn normalize_receipt_request(
     mut request: PostReceiptRequest,
 ) -> ApplicationResult<PostReceiptRequest> {
@@ -828,6 +1144,7 @@ fn normalize_receipt_request(
     request.idempotency_key = required_text("idempotency_key", request.idempotency_key)?;
     request.receipt_no = required_text("receipt_no", request.receipt_no)?.to_uppercase();
     request.owner_name = normalized_display_name("owner_name", request.owner_name)?;
+    request.supplier_name = normalized_display_name("supplier_name", request.supplier_name)?;
     request.sku_code = required_text("sku_code", request.sku_code)?.to_uppercase();
     request.sku_name = normalized_display_name("sku_name", request.sku_name)?;
     request.received_at = required_text("received_at", request.received_at)?;
@@ -892,10 +1209,11 @@ fn normalize_inspection_request(
     Ok(request)
 }
 
-async fn lookup_or_create_owner(
+async fn lookup_or_create_party(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
     display_name: &str,
+    role: CatalogPartyRole,
     now: &str,
 ) -> ApplicationResult<String> {
     let normalized_name = display_name.to_lowercase();
@@ -914,7 +1232,7 @@ async fn lookup_or_create_owner(
     .bind(now)
     .execute(&mut **transaction)
     .await
-    .map_err(|error| storage("lookup or create goods owner", error))?;
+    .map_err(|error| storage("lookup or create business party", error))?;
 
     let party_id: String = sqlx::query_scalar(
         "SELECT id FROM business_parties WHERE workspace_id = ?1 AND normalized_name = ?2",
@@ -923,52 +1241,115 @@ async fn lookup_or_create_owner(
     .bind(&normalized_name)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(|error| storage("load goods owner", error))?;
+    .map_err(|error| storage("load business party", error))?;
     sqlx::query(
         r#"
         INSERT INTO party_roles (workspace_id, party_id, role, created_at)
-        VALUES (?1, ?2, 'goods_owner', ?3)
+        VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT (workspace_id, party_id, role) DO NOTHING
         "#,
     )
     .bind(workspace_id)
     .bind(&party_id)
+    .bind(role.database_value())
     .bind(now)
     .execute(&mut **transaction)
     .await
-    .map_err(|error| storage("ensure goods owner role", error))?;
+    .map_err(|error| storage("ensure business party role", error))?;
     Ok(party_id)
 }
 
-async fn lookup_or_create_sku(
+async fn lookup_catalog_party(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+    display_name: &str,
+    role: CatalogPartyRole,
+) -> ApplicationResult<String> {
+    let normalized_name = display_name.to_lowercase();
+    sqlx::query_scalar(
+        r#"
+        SELECT bp.id
+          FROM business_parties bp
+          JOIN party_roles pr
+            ON pr.workspace_id = bp.workspace_id AND pr.party_id = bp.id
+         WHERE bp.workspace_id = ?1
+           AND bp.normalized_name = ?2
+           AND pr.role = ?3
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&normalized_name)
+    .bind(role.database_value())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| storage("load catalog party", error))?
+    .ok_or_else(|| ApplicationError::NotFound {
+        entity: role.database_value().to_owned(),
+        key: display_name.to_owned(),
+    })
+}
+
+async fn lookup_catalog_sku(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
     code: &str,
     name: &str,
-    now: &str,
-) -> ApplicationResult<String> {
-    let candidate_id = new_id();
-    sqlx::query(
-        r#"
-        INSERT INTO skus (id, workspace_id, code, name, tracking_mode, active, created_at)
-        VALUES (?1, ?2, ?3, ?4, 'serial', 1, ?5)
-        ON CONFLICT (workspace_id, code) DO NOTHING
-        "#,
+) -> ApplicationResult<SkuScanRules> {
+    let row = sqlx::query(
+        "SELECT id, name, tracking_mode, active, serial_prefix, serial_forbidden_chars FROM skus WHERE workspace_id = ?1 AND code = ?2",
     )
-    .bind(&candidate_id)
     .bind(workspace_id)
     .bind(code)
-    .bind(name)
-    .bind(now)
-    .execute(&mut **transaction)
+    .fetch_optional(&mut **transaction)
     .await
-    .map_err(|error| storage("lookup or create SKU", error))?;
-    sqlx::query_scalar("SELECT id FROM skus WHERE workspace_id = ?1 AND code = ?2")
-        .bind(workspace_id)
-        .bind(code)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(|error| storage("load SKU", error))
+    .map_err(|error| storage("load catalog SKU", error))?
+    .ok_or_else(|| ApplicationError::NotFound {
+        entity: "sku".to_owned(),
+        key: code.to_owned(),
+    })?;
+    let catalog_name: String = row
+        .try_get("name")
+        .map_err(|error| storage("read SKU name", error))?;
+    if catalog_name != name {
+        return Err(ApplicationError::Conflict {
+            entity: "sku".to_owned(),
+            key: code.to_owned(),
+            message: format!(
+                "provided product name {name} does not match catalog name {catalog_name}"
+            ),
+        });
+    }
+    let active: i64 = row
+        .try_get("active")
+        .map_err(|error| storage("read SKU active status", error))?;
+    if active != 1 {
+        return Err(ApplicationError::Conflict {
+            entity: "sku".to_owned(),
+            key: code.to_owned(),
+            message: "product is inactive".to_owned(),
+        });
+    }
+    let tracking_mode: String = row
+        .try_get("tracking_mode")
+        .map_err(|error| storage("read SKU tracking mode", error))?;
+    if tracking_mode != "serial" {
+        return Err(ApplicationError::Conflict {
+            entity: "sku".to_owned(),
+            key: code.to_owned(),
+            message: "product is not serial-tracked".to_owned(),
+        });
+    }
+    Ok(SkuScanRules {
+        id: row
+            .try_get("id")
+            .map_err(|error| storage("read SKU id", error))?,
+        serial_prefix: row
+            .try_get("serial_prefix")
+            .map_err(|error| storage("read SKU serial prefix", error))?,
+        serial_forbidden_chars: row
+            .try_get("serial_forbidden_chars")
+            .map_err(|error| storage("read SKU scan safeguard", error))?,
+    })
 }
 
 async fn load_inventory_unit(
@@ -1350,6 +1731,7 @@ mod tests {
             idempotency_key: idempotency_key.to_owned(),
             receipt_no: receipt_no.to_owned(),
             owner_name: "客户 A".to_owned(),
+            supplier_name: "供应商 A".to_owned(),
             sku_code: "model-x".to_owned(),
             sku_name: "型号 X".to_owned(),
             source_reference: Some("采购单 1".to_owned()),
@@ -1395,6 +1777,40 @@ mod tests {
         (database, path)
     }
 
+    async fn create_test_party(
+        database: &OfflineDatabase,
+        display_name: &str,
+        role: CatalogPartyRole,
+    ) -> CatalogParty {
+        database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: display_name.to_owned(),
+                role,
+            })
+            .await
+            .expect("create test catalog party")
+    }
+
+    async fn seed_default_receipt_parties(database: &OfflineDatabase) {
+        create_test_party(database, "客户 A", CatalogPartyRole::GoodsOwner).await;
+        create_test_party(database, "供应商 A", CatalogPartyRole::Supplier).await;
+    }
+
+    async fn test_database_with_default_catalog() -> (OfflineDatabase, PathBuf) {
+        let (database, path) = test_database().await;
+        seed_default_receipt_parties(&database).await;
+        database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "MODEL-X".to_owned(),
+                name: "型号 X".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create default test product");
+        (database, path)
+    }
+
     async fn close_and_remove(database: OfflineDatabase, path: PathBuf) {
         database.pool().close().await;
         for candidate in [
@@ -1406,9 +1822,401 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_product_rejects_impossible_scan_rules_but_allows_empty_rules() {
+        let error = normalize_catalog_product(CreateCatalogProductRequest {
+            code: "rules-1".to_owned(),
+            name: "Rules 1".to_owned(),
+            serial_prefix: Some("sn-bad".to_owned()),
+            serial_forbidden_chars: "BAD".to_owned(),
+        })
+        .expect_err("a prefix containing a case-normalized forbidden token must fail");
+        assert!(matches!(
+            error,
+            ApplicationError::Validation { field, message }
+                if field == "serial_prefix" && message.contains("BAD")
+        ));
+
+        let allowed = normalize_catalog_product(CreateCatalogProductRequest {
+            code: "rules-2".to_owned(),
+            name: "Rules 2".to_owned(),
+            serial_prefix: Some("sn".to_owned()),
+            serial_forbidden_chars: String::new(),
+        })
+        .expect("an empty forbidden rule intentionally allows any prefix");
+        assert_eq!(allowed.serial_prefix.as_deref(), Some("SN"));
+    }
+
+    #[test]
+    fn receipt_response_deserializes_legacy_payload_without_supplier_identity() {
+        let response: PostReceiptResponse = serde_json::from_value(json!({
+            "receipt_id": "receipt-1",
+            "receipt_line_id": "line-1",
+            "receipt_no": "R-1",
+            "owner_party_id": "owner-1",
+            "sku_id": "sku-1",
+            "received_count": 0,
+            "units": [],
+            "idempotent_replay": false
+        }))
+        .expect("legacy idempotency response must remain readable");
+        assert_eq!(response.supplier_party_id, None);
+    }
+
     #[tokio::test]
-    async fn duplicate_barcode_rolls_back_the_entire_receipt() {
+    async fn receipts_require_role_qualified_active_serial_catalog_entries() {
         let (database, path) = test_database().await;
+        let unknown_owner = database
+            .post_receipt(receipt_request(
+                "catalog-guard-request-1",
+                "catalog-guard-key-1",
+                "catalog-guard-receipt-1",
+                &["GUARD001"],
+            ))
+            .await
+            .expect_err("receipt must not create an unknown owner");
+        assert!(matches!(
+            unknown_owner,
+            ApplicationError::NotFound { entity, .. } if entity == "goods_owner"
+        ));
+        let empty_catalog: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM business_parties), (SELECT COUNT(*) FROM skus)",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("count untouched catalog");
+        assert_eq!(empty_catalog, (0, 0));
+
+        create_test_party(&database, "客户 A", CatalogPartyRole::Supplier).await;
+        let wrong_owner_role = database
+            .post_receipt(receipt_request(
+                "catalog-guard-request-owner-role",
+                "catalog-guard-key-owner-role",
+                "catalog-guard-receipt-owner-role",
+                &["GUARD-OWNER-ROLE"],
+            ))
+            .await
+            .expect_err("a party without goods owner role must be rejected");
+        assert!(matches!(
+            wrong_owner_role,
+            ApplicationError::NotFound { entity, .. } if entity == "goods_owner"
+        ));
+
+        create_test_party(&database, "客户 A", CatalogPartyRole::GoodsOwner).await;
+        create_test_party(&database, "供应商 A", CatalogPartyRole::GoodsOwner).await;
+        let product = database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "MODEL-X".to_owned(),
+                name: "型号 X".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create guarded product");
+
+        let wrong_supplier_role = database
+            .post_receipt(receipt_request(
+                "catalog-guard-request-2",
+                "catalog-guard-key-2",
+                "catalog-guard-receipt-2",
+                &["GUARD002"],
+            ))
+            .await
+            .expect_err("a party without supplier role must be rejected");
+        assert!(matches!(
+            wrong_supplier_role,
+            ApplicationError::NotFound { entity, .. } if entity == "supplier"
+        ));
+
+        let supplier = create_test_party(&database, "供应商 A", CatalogPartyRole::Supplier).await;
+        let mut unknown_sku = receipt_request(
+            "catalog-guard-request-3",
+            "catalog-guard-key-3",
+            "catalog-guard-receipt-3",
+            &["GUARD003"],
+        );
+        unknown_sku.sku_code = "UNKNOWN".to_owned();
+        unknown_sku.sku_name = "Unknown".to_owned();
+        assert!(matches!(
+            database
+                .post_receipt(unknown_sku)
+                .await
+                .expect_err("receipt must not create an unknown product"),
+            ApplicationError::NotFound { entity, .. } if entity == "sku"
+        ));
+
+        let mut wrong_name = receipt_request(
+            "catalog-guard-request-4",
+            "catalog-guard-key-4",
+            "catalog-guard-receipt-4",
+            &["GUARD004"],
+        );
+        wrong_name.sku_name = "型号 X typo".to_owned();
+        assert!(matches!(
+            database
+                .post_receipt(wrong_name)
+                .await
+                .expect_err("payload product name must match catalog facts"),
+            ApplicationError::Conflict { entity, message, .. }
+                if entity == "sku" && message.contains("does not match")
+        ));
+
+        sqlx::query("UPDATE skus SET active = 0 WHERE id = ?1")
+            .bind(&product.sku_id)
+            .execute(database.pool())
+            .await
+            .expect("disable guarded product");
+        assert!(matches!(
+            database
+                .post_receipt(receipt_request(
+                    "catalog-guard-request-5",
+                    "catalog-guard-key-5",
+                    "catalog-guard-receipt-5",
+                    &["GUARD005"],
+                ))
+                .await
+                .expect_err("inactive products must be rejected"),
+            ApplicationError::Conflict { entity, message, .. }
+                if entity == "sku" && message.contains("inactive")
+        ));
+
+        sqlx::query("UPDATE skus SET active = 1, tracking_mode = 'quantity' WHERE id = ?1")
+            .bind(&product.sku_id)
+            .execute(database.pool())
+            .await
+            .expect("switch guarded product to quantity tracking");
+        assert!(matches!(
+            database
+                .post_receipt(receipt_request(
+                    "catalog-guard-request-6",
+                    "catalog-guard-key-6",
+                    "catalog-guard-receipt-6",
+                    &["GUARD006"],
+                ))
+                .await
+                .expect_err("quantity-tracked products must be rejected"),
+            ApplicationError::Conflict { entity, message, .. }
+                if entity == "sku" && message.contains("serial-tracked")
+        ));
+
+        let rejected_facts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM inbound_receipts), (SELECT COUNT(*) FROM inventory_units), (SELECT COUNT(*) FROM idempotency_records), (SELECT COUNT(*) FROM audit_logs)",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("count rejected receipt facts");
+        assert_eq!(rejected_facts, (0, 0, 0, 0));
+
+        sqlx::query("UPDATE skus SET tracking_mode = 'serial' WHERE id = ?1")
+            .bind(&product.sku_id)
+            .execute(database.pool())
+            .await
+            .expect("restore guarded product serial tracking");
+        let response = database
+            .post_receipt(receipt_request(
+                "catalog-guard-request-7",
+                "catalog-guard-key-7",
+                "catalog-guard-receipt-7",
+                &["GUARD007"],
+            ))
+            .await
+            .expect("valid catalog references should post");
+        assert_eq!(
+            response.supplier_party_id.as_deref(),
+            Some(supplier.party_id.as_str())
+        );
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn catalog_entries_persist_and_are_reused_by_inbound_receipts() {
+        let (database, path) = test_database().await;
+        let product = database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: " px-100 ".to_owned(),
+                name: "产品 PX".to_owned(),
+                serial_prefix: Some("px".to_owned()),
+                serial_forbidden_chars: "-, ".to_owned(),
+            })
+            .await
+            .expect("create reusable product");
+        let owner = database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: "客户 Catalog".to_owned(),
+                role: CatalogPartyRole::GoodsOwner,
+            })
+            .await
+            .expect("create reusable goods owner");
+        let supplier = database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: "供应商 Catalog".to_owned(),
+                role: CatalogPartyRole::Supplier,
+            })
+            .await
+            .expect("create reusable supplier");
+        assert_ne!(owner.party_id, supplier.party_id);
+
+        database.pool().close().await;
+        let database = OfflineDatabase::open(&path)
+            .await
+            .expect("reopen catalog database");
+        let catalog = database
+            .list_reference_catalog()
+            .await
+            .expect("list persisted catalog");
+        assert_eq!(catalog.products, vec![product.clone()]);
+        assert_eq!(catalog.goods_owners, vec![owner.clone()]);
+        assert_eq!(catalog.suppliers, vec![supplier.clone()]);
+
+        let mut request = receipt_request(
+            "catalog-request-1",
+            "catalog-receipt-key-1",
+            "catalog-receipt-1",
+            &["PX0001"],
+        );
+        request.owner_name = owner.display_name.clone();
+        request.supplier_name = supplier.display_name.clone();
+        request.sku_code = product.code.clone();
+        request.sku_name = product.name.clone();
+        let response = database
+            .post_receipt(request)
+            .await
+            .expect("post receipt from reusable catalog entries");
+        assert_eq!(response.owner_party_id, owner.party_id);
+        assert_eq!(
+            response.supplier_party_id.as_deref(),
+            Some(supplier.party_id.as_str())
+        );
+        assert_eq!(response.sku_id, product.sku_id);
+
+        let audit_details: String = sqlx::query_scalar(
+            "SELECT details_json FROM audit_logs WHERE entity_id = ?1 AND action = 'inbound_receipt.posted'",
+        )
+        .bind(&response.receipt_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("load receipt audit details");
+        let audit_details: Value =
+            serde_json::from_str(&audit_details).expect("decode receipt audit details");
+        assert_eq!(
+            audit_details["supplier_party_id"],
+            Value::String(supplier.party_id.clone())
+        );
+
+        let (receipt_owner_id, receipt_supplier_id, receipt_sku_id): (
+            String,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT ir.owner_party_id, ir.supplier_party_id, irl.sku_id
+              FROM inbound_receipts ir
+              JOIN inbound_receipt_lines irl ON irl.receipt_id = ir.id
+             WHERE ir.id = ?1
+            "#,
+        )
+        .bind(&response.receipt_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("load receipt catalog associations");
+        assert_eq!(receipt_owner_id, owner.party_id);
+        assert_eq!(
+            receipt_supplier_id.as_deref(),
+            Some(supplier.party_id.as_str())
+        );
+        assert_eq!(receipt_sku_id, product.sku_id);
+
+        let catalog_after_receipt = database
+            .list_reference_catalog()
+            .await
+            .expect("list reused catalog");
+        assert_eq!(catalog_after_receipt.products.len(), 1);
+        assert_eq!(catalog_after_receipt.goods_owners.len(), 1);
+        assert_eq!(catalog_after_receipt.suppliers.len(), 1);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn sku_scan_rules_reject_wrong_prefix_and_forbidden_characters() {
+        let (database, path) = test_database().await;
+        seed_default_receipt_parties(&database).await;
+        let product = database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "RULED-SKU".to_owned(),
+                name: "受控扫码产品".to_owned(),
+                serial_prefix: Some("snx".to_owned()),
+                serial_forbidden_chars: "-, ".to_owned(),
+            })
+            .await
+            .expect("create product with scan safeguards");
+
+        let mut wrong_prefix = receipt_request(
+            "rules-request-1",
+            "rules-receipt-key-1",
+            "rules-receipt-1",
+            &["OTHER001"],
+        );
+        wrong_prefix.sku_code = product.code.clone();
+        wrong_prefix.sku_name = product.name.clone();
+        let prefix_error = database
+            .post_receipt(wrong_prefix)
+            .await
+            .expect_err("wrong product prefix must be rejected");
+        assert!(matches!(
+            &prefix_error,
+            ApplicationError::Validation { field, message }
+                if field == "barcodes" && message.contains("prefix SNX")
+        ));
+
+        let mut forbidden_character = receipt_request(
+            "rules-request-2",
+            "rules-receipt-key-2",
+            "rules-receipt-2",
+            &["SNX-001"],
+        );
+        forbidden_character.sku_code = product.code.clone();
+        forbidden_character.sku_name = product.name.clone();
+        let forbidden_error = database
+            .post_receipt(forbidden_character)
+            .await
+            .expect_err("forbidden SN character must be rejected");
+        assert!(matches!(
+            &forbidden_error,
+            ApplicationError::Validation { field, message }
+                if field == "barcodes" && message.contains("forbidden") && message.contains('-')
+        ));
+
+        let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_receipts")
+            .fetch_one(database.pool())
+            .await
+            .expect("count rejected receipts");
+        let unit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inventory_units")
+            .fetch_one(database.pool())
+            .await
+            .expect("count rejected receipt units");
+        assert_eq!(receipt_count, 0);
+        assert_eq!(unit_count, 0);
+
+        let mut valid = receipt_request(
+            "rules-request-3",
+            "rules-receipt-key-3",
+            "rules-receipt-3",
+            &["SNX001"],
+        );
+        valid.sku_code = product.code.clone();
+        valid.sku_name = product.name.clone();
+        let response = database
+            .post_receipt(valid)
+            .await
+            .expect("valid product SN should be accepted");
+        assert_eq!(response.sku_id, product.sku_id);
+        assert_eq!(response.units[0].barcode, "SNX001");
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_wide_duplicate_barcode_rolls_back_the_entire_receipt() {
+        let (database, path) = test_database_with_default_catalog().await;
         database
             .post_receipt(receipt_request(
                 "request-1",
@@ -1418,6 +2226,17 @@ mod tests {
             ))
             .await
             .expect("seed existing barcode");
+        create_test_party(&database, "客户 B", CatalogPartyRole::GoodsOwner).await;
+        create_test_party(&database, "供应商 B", CatalogPartyRole::Supplier).await;
+        database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "MODEL-Y".to_owned(),
+                name: "型号 Y".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create conflicting receipt product");
 
         let mut conflicting = receipt_request(
             "request-2",
@@ -1426,6 +2245,7 @@ mod tests {
             &["NEW-BARCODE", "dup-1"],
         );
         conflicting.owner_name = "客户 B".to_owned();
+        conflicting.supplier_name = "供应商 B".to_owned();
         conflicting.sku_code = "MODEL-Y".to_owned();
         conflicting.sku_name = "型号 Y".to_owned();
         let error = database
@@ -1434,7 +2254,11 @@ mod tests {
             .expect_err("the entire batch must be rejected");
         assert!(matches!(
             error,
-            ApplicationError::Conflict { ref key, .. } if key == "DUP-1"
+            ApplicationError::Conflict {
+                ref entity,
+                ref key,
+                ..
+            } if entity == "inventory_barcode" && key == "DUP-1"
         ));
 
         let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_receipts")
@@ -1451,28 +2275,35 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .expect("check rolled back unit");
-        let rolled_back_owner: i64 = sqlx::query_scalar(
+        let catalog_owner_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM business_parties WHERE normalized_name = '客户 b'",
         )
         .fetch_one(database.pool())
         .await
-        .expect("check rolled back owner");
-        let rolled_back_sku: i64 =
+        .expect("check catalog owner");
+        let catalog_supplier_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM business_parties WHERE normalized_name = '供应商 b'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("check catalog supplier");
+        let catalog_sku_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM skus WHERE code = 'MODEL-Y'")
                 .fetch_one(database.pool())
                 .await
-                .expect("check rolled back SKU");
+                .expect("check catalog SKU");
         assert_eq!(receipt_count, 1);
         assert_eq!(unit_count, 1);
         assert_eq!(rolled_back_unit, 0);
-        assert_eq!(rolled_back_owner, 0);
-        assert_eq!(rolled_back_sku, 0);
+        assert_eq!(catalog_owner_count, 1);
+        assert_eq!(catalog_supplier_count, 1);
+        assert_eq!(catalog_sku_count, 1);
         close_and_remove(database, path).await;
     }
 
     #[tokio::test]
     async fn receipt_replay_is_idempotent_and_units_default_to_received_untested() {
-        let (database, path) = test_database().await;
+        let (database, path) = test_database_with_default_catalog().await;
         let request = receipt_request(
             "request-1",
             "receipt-key-1",
@@ -1530,7 +2361,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_batch_is_atomic_when_any_unit_has_an_invalid_transition() {
-        let (database, path) = test_database().await;
+        let (database, path) = test_database_with_default_catalog().await;
         database
             .post_receipt(receipt_request(
                 "request-1",
@@ -1596,7 +2427,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_updates_projections_and_replay_does_not_duplicate_facts() {
-        let (database, path) = test_database().await;
+        let (database, path) = test_database_with_default_catalog().await;
         database
             .post_receipt(receipt_request(
                 "request-1",
@@ -1690,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn archived_offline_workspace_rejects_new_writes() {
-        let (database, path) = test_database().await;
+        let (database, path) = test_database_with_default_catalog().await;
         database
             .post_receipt(receipt_request(
                 "request-1",

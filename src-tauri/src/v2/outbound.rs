@@ -1391,7 +1391,8 @@ fn normalize_return(
 mod tests {
     use super::*;
     use crate::v2::application::{
-        CompleteInspectionRequest, InspectionResultInput, PostReceiptRequest,
+        CatalogPartyRole, CompleteInspectionRequest, CreateCatalogPartyRequest,
+        CreateCatalogProductRequest, InspectionResultInput, PostReceiptRequest,
     };
     use crate::v2::domain::{InspectionKind, QualityOutcome};
     use serde_json::json;
@@ -1402,6 +1403,7 @@ mod tests {
             idempotency_key: key.to_owned(),
             receipt_no: format!("R-{request_id}"),
             owner_name: owner.to_owned(),
+            supplier_name: "Supplier X".to_owned(),
             sku_code: "SKU-X".to_owned(),
             sku_name: "Model X".to_owned(),
             source_reference: None,
@@ -1417,6 +1419,31 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("inventory-outbound-test-{}.sqlite", Uuid::now_v7()));
         let database = OfflineDatabase::open(&path).await.expect("open database");
+        for owner in ["Owner A", "Owner B"] {
+            database
+                .create_catalog_party(CreateCatalogPartyRequest {
+                    display_name: owner.to_owned(),
+                    role: CatalogPartyRole::GoodsOwner,
+                })
+                .await
+                .expect("create outbound test owner");
+        }
+        database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: "Supplier X".to_owned(),
+                role: CatalogPartyRole::Supplier,
+            })
+            .await
+            .expect("create outbound test supplier");
+        database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "SKU-X".to_owned(),
+                name: "Model X".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create outbound test product");
         database
             .post_receipt(receipt("one", "receipt-one", "Owner A", "A-1"))
             .await

@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
@@ -56,6 +56,7 @@ interface MembershipPermissions {
 
 interface IdentityAdminPanelProps {
   currentUserId: string | null;
+  onBusyChange?: (busy: boolean) => void;
 }
 
 function displayError(error: unknown): string {
@@ -80,7 +81,7 @@ function roleIdsForUser(user: TenantUser, roles: TenantRole[]): Set<string> {
   return new Set(roles.filter((role) => codes.has(role.code)).map((role) => role.role_id));
 }
 
-export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanelProps) {
+export default function IdentityAdminPanel({ currentUserId, onBusyChange }: IdentityAdminPanelProps) {
   const [users, setUsers] = useState<TenantUser[]>([]);
   const [roles, setRoles] = useState<TenantRole[]>([]);
   const [search, setSearch] = useState("");
@@ -92,6 +93,30 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
   const [nextAfterUserId, setNextAfterUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const busyCountRef = useRef(0);
+  const busyGenerationRef = useRef(0);
+  const onBusyChangeRef = useRef(onBusyChange);
+  onBusyChangeRef.current = onBusyChange;
+
+  const beginBusy = useCallback(() => {
+    const generation = busyGenerationRef.current;
+    busyCountRef.current += 1;
+    if (busyCountRef.current === 1) onBusyChangeRef.current?.(true);
+
+    let ended = false;
+    return () => {
+      if (ended || generation !== busyGenerationRef.current) return;
+      ended = true;
+      busyCountRef.current = Math.max(0, busyCountRef.current - 1);
+      if (busyCountRef.current === 0) onBusyChangeRef.current?.(false);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    busyGenerationRef.current += 1;
+    busyCountRef.current = 0;
+    onBusyChangeRef.current?.(false);
+  }, []);
 
   const [login, setLogin] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -109,6 +134,7 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
   );
 
   const refresh = useCallback(async (): Promise<boolean> => {
+    const endBusy = beginBusy();
     setLoading(true);
     setNotice(null);
     try {
@@ -133,8 +159,9 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
       return false;
     } finally {
       setLoading(false);
+      endBusy();
     }
-  }, [afterUserId, appliedIncludeDisabled, appliedSearch]);
+  }, [afterUserId, appliedIncludeDisabled, appliedSearch, beginBusy]);
 
   useEffect(() => {
     void refresh();
@@ -169,12 +196,15 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
     setEditRoleIds(roleIdsForUser(user, roles));
     setEffectivePermissions(null);
     setNotice(null);
+    const endBusy = beginBusy();
     try {
       setEffectivePermissions(await invoke<MembershipPermissions>("v2_network_membership_permissions", {
         input: { membership_id: user.membership_id },
       }));
     } catch (error) {
       setNotice({ type: "error", text: `读取有效权限失败：${displayError(error)}` });
+    } finally {
+      endBusy();
     }
   }
 
@@ -194,6 +224,7 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
       setNotice({ type: "error", text: "请填写账号、姓名、至少 12 字节的初始密码，并选择至少一个角色。" });
       return;
     }
+    const endBusy = beginBusy();
     setLoading(true);
     try {
       await invoke("v2_network_create_tenant_user", {
@@ -218,11 +249,13 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
       setNotice({ type: "error", text: `创建用户失败：${displayError(error)}` });
     } finally {
       setLoading(false);
+      endBusy();
     }
   }
 
   async function saveRoles() {
     if (!selectedUser) return;
+    const endBusy = beginBusy();
     setLoading(true);
     setNotice(null);
     try {
@@ -241,31 +274,37 @@ export default function IdentityAdminPanel({ currentUserId }: IdentityAdminPanel
       setNotice({ type: "error", text: `更新角色失败：${displayError(error)}` });
     } finally {
       setLoading(false);
+      endBusy();
     }
   }
 
   async function disableUser(user: TenantUser) {
     if (user.user_id === currentUserId) return;
-    const approved = await confirm(
-      `禁用 ${user.display_name} 后，其现有访问会话和刷新令牌会立即失效。`,
-      { title: "确认禁用用户", kind: "warning" },
-    );
-    if (!approved) return;
-    setLoading(true);
-    setNotice(null);
+    const endBusy = beginBusy();
     try {
-      const response = await invoke<{ revoked_session_count: number }>("v2_network_disable_tenant_user", {
-        input: { request_id: createId(), user_id: user.user_id },
-      });
-      setSelectedUserId(null);
-      setEffectivePermissions(null);
-      if (await refresh()) {
-        setNotice({ type: "success", text: `用户已禁用，撤销 ${response.revoked_session_count} 个访问会话。` });
+      const approved = await confirm(
+        `禁用 ${user.display_name} 后，其现有访问会话和刷新令牌会立即失效。`,
+        { title: "确认禁用用户", kind: "warning" },
+      );
+      if (!approved) return;
+      setLoading(true);
+      setNotice(null);
+      try {
+        const response = await invoke<{ revoked_session_count: number }>("v2_network_disable_tenant_user", {
+          input: { request_id: createId(), user_id: user.user_id },
+        });
+        setSelectedUserId(null);
+        setEffectivePermissions(null);
+        if (await refresh()) {
+          setNotice({ type: "success", text: `用户已禁用，撤销 ${response.revoked_session_count} 个访问会话。` });
+        }
+      } catch (error) {
+        setNotice({ type: "error", text: `禁用用户失败：${displayError(error)}` });
+      } finally {
+        setLoading(false);
       }
-    } catch (error) {
-      setNotice({ type: "error", text: `禁用用户失败：${displayError(error)}` });
     } finally {
-      setLoading(false);
+      endBusy();
     }
   }
 

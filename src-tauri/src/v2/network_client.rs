@@ -5,8 +5,9 @@
 //! tenant authorization and actor identity stay on the server side.
 
 use super::application::{
-    CompleteInspectionResponse, InventoryListResponse, InventorySummaryResponse,
-    PostReceiptResponse,
+    CatalogParty, CatalogProduct, CompleteInspectionResponse, CreateCatalogPartyRequest,
+    CreateCatalogProductRequest, InventoryListResponse, InventorySummaryResponse,
+    PostReceiptResponse, ReferenceCatalog,
 };
 use super::identity_admin::{
     CreateTenantUserRequest, CreateTenantUserResponse, DisableTenantUserRequest,
@@ -23,7 +24,7 @@ use super::network_ops::{
     NetworkConfirmOutboundDeliveryRequest, NetworkCreateOutboundOrderRequest,
     NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
 };
-use super::traceability::InventoryTrace;
+use super::traceability::{InventoryBarcodeExistsResponse, InventoryTrace};
 use super::upgrade::{NetworkUpgradeImportRequest, NetworkUpgradeImportResponse};
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -260,6 +261,27 @@ impl NetworkClient {
             .await
     }
 
+    pub async fn list_reference_catalog(&self) -> Result<ReferenceCatalog, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/reference/catalog/query", &Value::Null)
+            .await
+    }
+
+    pub async fn create_catalog_product(
+        &self,
+        request: &CreateCatalogProductRequest,
+    ) -> Result<CatalogProduct, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/reference/products", request)
+            .await
+    }
+
+    pub async fn create_catalog_party(
+        &self,
+        request: &CreateCatalogPartyRequest,
+    ) -> Result<CatalogParty, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/reference/parties", request)
+            .await
+    }
+
     pub async fn list_warehouses(&self) -> Result<Vec<NetworkWarehouse>, NetworkClientError> {
         self.authorized_json(Method::POST, "/v1/reference/warehouses/query", &Value::Null)
             .await
@@ -272,6 +294,18 @@ impl NetworkClient {
         self.authorized_json(
             Method::POST,
             "/v1/inventory/trace",
+            &serde_json::json!({ "barcode": barcode }),
+        )
+        .await
+    }
+
+    pub async fn inventory_barcode_exists(
+        &self,
+        barcode: &str,
+    ) -> Result<InventoryBarcodeExistsResponse, NetworkClientError> {
+        self.authorized_json(
+            Method::POST,
+            "/v1/inventory/barcodes/exists",
             &serde_json::json!({ "barcode": barcode }),
         )
         .await
@@ -517,6 +551,10 @@ fn parse_error_body(payload: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Json;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::Router;
 
     #[test]
     fn configure_keeps_path_prefix_and_removes_only_trailing_slashes() {
@@ -555,5 +593,72 @@ mod tests {
                 "accepted unsafe endpoint {address}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn inventory_barcode_exists_uses_dedicated_authorized_endpoint() {
+        async fn lookup(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-session-token")
+            );
+            assert_eq!(
+                headers
+                    .get("x-tenant-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("00000000-0000-0000-0000-000000000000")
+            );
+            assert_eq!(body, serde_json::json!({ "barcode": "  sn-001\r\n" }));
+            Json(serde_json::json!({
+                "barcode": "SN-001",
+                "exists": true
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test API");
+        let address = listener.local_addr().expect("test API address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/inventory/barcodes/exists", post(lookup)),
+            )
+            .await
+            .expect("serve test API");
+        });
+
+        let client = NetworkClient::default();
+        client
+            .configure(format!("http://{address}"))
+            .expect("configure local test API");
+        client
+            .store_session(NetworkSession {
+                tenant_id: Uuid::nil(),
+                user_id: Uuid::now_v7(),
+                membership_id: Uuid::now_v7(),
+                session_id: Uuid::now_v7(),
+                session_token: "test-session-token".to_owned(),
+                refresh_token: "test-refresh-token".to_owned(),
+                session_ttl_seconds: 300,
+                refresh_ttl_seconds: 3_600,
+            })
+            .expect("store test session");
+
+        assert_eq!(
+            client
+                .inventory_barcode_exists("  sn-001\r\n")
+                .await
+                .expect("lookup barcode through network client"),
+            InventoryBarcodeExistsResponse {
+                barcode: "SN-001".to_owned(),
+                exists: true,
+            }
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }

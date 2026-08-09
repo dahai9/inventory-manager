@@ -4,6 +4,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use inventory_manager_lib::v2::application::{
+    CreateCatalogPartyRequest, CreateCatalogProductRequest,
+};
 use inventory_manager_lib::v2::auth::{AuthError, AuthorizationDenial};
 use inventory_manager_lib::v2::identity_admin::{
     CreateTenantUserRequest, DisableTenantUserRequest, ListTenantUsersRequest,
@@ -133,8 +136,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(membership_effective_permissions),
         )
         .route("/v1/inventory/query", post(list_inventory))
+        .route(
+            "/v1/inventory/barcodes/exists",
+            post(inventory_barcode_exists),
+        )
         .route("/v1/inventory/summary", post(inventory_summary))
         .route("/v1/inventory/trace", post(inventory_trace))
+        .route("/v1/reference/catalog/query", post(list_reference_catalog))
+        .route("/v1/reference/products", post(create_catalog_product))
+        .route("/v1/reference/parties", post(create_catalog_party))
         .route("/v1/reference/warehouses/query", post(list_warehouses))
         .route("/v1/inbound/receipts", post(post_receipt))
         .route(
@@ -388,6 +398,21 @@ struct InventoryTraceRequest {
     barcode: String,
 }
 
+async fn inventory_barcode_exists(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<InventoryTraceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .inventory_barcode_exists(tenant_id, bearer, &request.barcode)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn inventory_trace(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -412,6 +437,50 @@ async fn list_warehouses(
     state
         .service
         .list_warehouses(tenant_id, bearer)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_reference_catalog(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_reference_catalog(tenant_id, bearer)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_catalog_product(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCatalogProductRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .create_catalog_product(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_catalog_party(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCatalogPartyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .create_catalog_party(tenant_id, bearer, request)
         .await
         .map(Json)
         .map_err(Into::into)

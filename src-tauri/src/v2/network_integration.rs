@@ -1,4 +1,7 @@
-use super::application::{InventoryListQuery, InventorySummaryQuery};
+use super::application::{
+    CatalogPartyRole, CreateCatalogPartyRequest, CreateCatalogProductRequest, InventoryListQuery,
+    InventorySummaryQuery,
+};
 use super::auth::{hash_token, AuthError, AuthorizationDenial, PasswordService, TokenKind};
 use super::network::{
     LoginRequest, NetworkPostReceiptRequest, NetworkService, NetworkServiceError, RefreshRequest,
@@ -142,12 +145,48 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
         })
         .await
         .expect("login");
+    let owner = service
+        .create_catalog_party(
+            tenant_id,
+            &login.session_token,
+            CreateCatalogPartyRequest {
+                display_name: "Owner A".to_owned(),
+                role: CatalogPartyRole::GoodsOwner,
+            },
+        )
+        .await
+        .expect("create receipt owner");
+    let supplier = service
+        .create_catalog_party(
+            tenant_id,
+            &login.session_token,
+            CreateCatalogPartyRequest {
+                display_name: "Supplier A".to_owned(),
+                role: CatalogPartyRole::Supplier,
+            },
+        )
+        .await
+        .expect("create receipt supplier");
+    let product = service
+        .create_catalog_product(
+            tenant_id,
+            &login.session_token,
+            CreateCatalogProductRequest {
+                code: "SKU-X".to_owned(),
+                name: "Model X".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            },
+        )
+        .await
+        .expect("create receipt product");
     let request_id = Uuid::now_v7().to_string();
     let request = NetworkPostReceiptRequest {
         request_id: request_id.clone(),
         idempotency_key: format!("receipt:{request_id}"),
         receipt_no: format!("RK-{request_id}"),
         owner_name: "Owner A".to_owned(),
+        supplier_name: "Supplier A".to_owned(),
         sku_code: "SKU-X".to_owned(),
         sku_name: "Model X".to_owned(),
         warehouse_id,
@@ -156,6 +195,21 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
         barcodes: vec![format!("SN-{request_id}")],
         notes: None,
     };
+    let receipt_barcode = request.barcodes[0].clone();
+    let mut mismatched_name = request.clone();
+    mismatched_name.request_id = Uuid::now_v7().to_string();
+    mismatched_name.idempotency_key = format!("receipt:{}", mismatched_name.request_id);
+    mismatched_name.receipt_no = format!("RK-{}", mismatched_name.request_id);
+    mismatched_name.sku_name = "Model X typo".to_owned();
+    mismatched_name.barcodes = vec![format!("SN-{}", mismatched_name.request_id)];
+    let mismatch = service
+        .post_receipt(tenant_id, &login.session_token, mismatched_name)
+        .await
+        .expect_err("receipt product name must match the catalog");
+    assert!(matches!(
+        mismatch,
+        NetworkServiceError::Invalid(message) if message.contains("does not match catalog")
+    ));
     let first = service
         .post_receipt(tenant_id, &login.session_token, request.clone())
         .await
@@ -165,8 +219,34 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
         .await
         .expect("replay receipt");
     assert_eq!(first.received_count, 1);
+    assert_eq!(first.owner_party_id, owner.party_id);
+    assert_eq!(
+        first.supplier_party_id.as_deref(),
+        Some(supplier.party_id.as_str())
+    );
+    assert_eq!(first.sku_id, product.sku_id);
     assert!(replay.idempotent_replay);
     assert_eq!(first.receipt_id, replay.receipt_id);
+
+    let existing_barcode = service
+        .inventory_barcode_exists(
+            tenant_id,
+            &login.session_token,
+            &format!("  {}\r\n", receipt_barcode.to_lowercase()),
+        )
+        .await
+        .expect("find exact network inventory barcode");
+    assert_eq!(existing_barcode.barcode, receipt_barcode.to_uppercase());
+    assert!(existing_barcode.exists);
+    let similar_missing_barcode = service
+        .inventory_barcode_exists(
+            tenant_id,
+            &login.session_token,
+            &format!("{receipt_barcode}-EXTRA"),
+        )
+        .await
+        .expect("reject fuzzy network inventory barcode match");
+    assert!(!similar_missing_barcode.exists);
 
     let inventory = service
         .list_inventory(
@@ -240,6 +320,7 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
                 idempotency_key: format!("after-logout:{}", Uuid::now_v7()),
                 receipt_no: format!("AFTER-LOGOUT-{}", Uuid::now_v7()),
                 owner_name: "Owner A".to_owned(),
+                supplier_name: "Supplier A".to_owned(),
                 sku_code: "SKU-X".to_owned(),
                 sku_name: "Model X".to_owned(),
                 warehouse_id,

@@ -24,6 +24,12 @@ pub struct InventoryTrace {
     pub outbound: Vec<OutboundTrace>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct InventoryBarcodeExistsResponse {
+    pub barcode: String,
+    pub exists: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InspectionTrace {
     pub inspection_no: String,
@@ -55,6 +61,22 @@ pub struct OutboundTrace {
 }
 
 impl OfflineDatabase {
+    pub async fn inventory_barcode_exists(
+        &self,
+        barcode: &str,
+    ) -> Result<InventoryBarcodeExistsResponse, String> {
+        let barcode = normalized_barcode(barcode)?;
+        let exists = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2)",
+        )
+        .bind(self.workspace_id())
+        .bind(&barcode)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|error| format!("检查库存条码失败: {error}"))?;
+        Ok(InventoryBarcodeExistsResponse { barcode, exists })
+    }
+
     pub async fn inventory_trace(&self, barcode: &str) -> Result<InventoryTrace, String> {
         let barcode = normalized_barcode(barcode)?;
         let row = sqlx::query(
@@ -192,6 +214,29 @@ impl OfflineDatabase {
 }
 
 impl NetworkService {
+    pub async fn inventory_barcode_exists(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        barcode: &str,
+    ) -> NetworkResult<InventoryBarcodeExistsResponse> {
+        let barcode =
+            normalized_barcode(barcode).map_err(super::network::NetworkServiceError::Invalid)?;
+        let mut authorized = self
+            .database()
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let exists = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE tenant_id = $1 AND barcode = $2)",
+        )
+        .bind(tenant_id)
+        .bind(&barcode)
+        .fetch_one(&mut **authorized.sqlx_transaction())
+        .await?;
+        authorized.commit().await?;
+        Ok(InventoryBarcodeExistsResponse { barcode, exists })
+    }
+
     pub async fn inventory_trace(
         &self,
         tenant_id: Uuid,
@@ -392,4 +437,109 @@ fn outbound_from_postgres_row(row: sqlx::postgres::PgRow) -> Result<OutboundTrac
         return_reason: row.try_get("return_reason")?,
         return_disposition: row.try_get("return_disposition")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2::application::{
+        CatalogPartyRole, CreateCatalogPartyRequest, CreateCatalogProductRequest,
+        PostReceiptRequest,
+    };
+    use std::path::{Path, PathBuf};
+
+    async fn remove_test_database(database: OfflineDatabase, path: &Path) {
+        database.pool().close().await;
+        for candidate in [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn barcode_normalization_matches_scanner_storage_rules() {
+        assert_eq!(
+            normalized_barcode("  sn-exact-001\r\n").expect("normalized barcode"),
+            "SN-EXACT-001"
+        );
+        assert_eq!(
+            normalized_barcode(" \t ").expect_err("blank barcode must fail"),
+            "barcode must not be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_barcode_exists_is_normalized_exact_and_workspace_scoped() {
+        let path = std::env::temp_dir().join(format!(
+            "inventory-barcode-exists-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        let database = OfflineDatabase::open(&path)
+            .await
+            .expect("open isolated offline database");
+        for (display_name, role) in [
+            ("Owner A", CatalogPartyRole::GoodsOwner),
+            ("Supplier A", CatalogPartyRole::Supplier),
+        ] {
+            database
+                .create_catalog_party(CreateCatalogPartyRequest {
+                    display_name: display_name.to_owned(),
+                    role,
+                })
+                .await
+                .expect("create catalog party");
+        }
+        database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "SKU-EXACT".to_owned(),
+                name: "Exact Lookup Product".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create catalog product");
+        database
+            .post_receipt(PostReceiptRequest {
+                request_id: "barcode-exists-request".to_owned(),
+                idempotency_key: "barcode-exists-key".to_owned(),
+                receipt_no: "RK-BARCODE-EXISTS".to_owned(),
+                owner_name: "Owner A".to_owned(),
+                supplier_name: "Supplier A".to_owned(),
+                sku_code: "SKU-EXACT".to_owned(),
+                sku_name: "Exact Lookup Product".to_owned(),
+                source_reference: None,
+                received_at: "2026-08-08T01:00:00Z".to_owned(),
+                actor_id: "operator-1".to_owned(),
+                barcodes: vec!["sn-exact-001".to_owned()],
+                notes: None,
+            })
+            .await
+            .expect("post receipt");
+
+        assert_eq!(
+            database
+                .inventory_barcode_exists("  sn-exact-001\r\n")
+                .await
+                .expect("lookup existing barcode"),
+            InventoryBarcodeExistsResponse {
+                barcode: "SN-EXACT-001".to_owned(),
+                exists: true,
+            }
+        );
+        assert_eq!(
+            database
+                .inventory_barcode_exists("SN-EXACT-001-EXTRA")
+                .await
+                .expect("lookup similar missing barcode"),
+            InventoryBarcodeExistsResponse {
+                barcode: "SN-EXACT-001-EXTRA".to_owned(),
+                exists: false,
+            }
+        );
+
+        remove_test_database(database, &path).await;
+    }
 }

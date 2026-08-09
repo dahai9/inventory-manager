@@ -2283,6 +2283,9 @@ impl UtcNow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::application::{
+        CatalogPartyRole, CreateCatalogPartyRequest, CreateCatalogProductRequest,
+    };
     use crate::v2::auth::PasswordService;
     use crate::v2::network::{
         LoginRequest, NetworkPostReceiptRequest, PERMISSION_NETWORK_ACCESS,
@@ -2536,6 +2539,41 @@ mod tests {
             .expect("login");
         let suffix = Uuid::now_v7().simple().to_string();
         let barcode = format!("OPS-SN-{suffix}");
+        service
+            .create_catalog_party(
+                tenant_id,
+                &login.session_token,
+                CreateCatalogPartyRequest {
+                    display_name: "Owner OPS".to_owned(),
+                    role: CatalogPartyRole::GoodsOwner,
+                },
+            )
+            .await
+            .expect("create operations receipt owner");
+        service
+            .create_catalog_party(
+                tenant_id,
+                &login.session_token,
+                CreateCatalogPartyRequest {
+                    display_name: "Supplier OPS".to_owned(),
+                    role: CatalogPartyRole::Supplier,
+                },
+            )
+            .await
+            .expect("create operations receipt supplier");
+        service
+            .create_catalog_product(
+                tenant_id,
+                &login.session_token,
+                CreateCatalogProductRequest {
+                    code: format!("OPS-SKU-{suffix}"),
+                    name: "Ops Model".to_owned(),
+                    serial_prefix: None,
+                    serial_forbidden_chars: String::new(),
+                },
+            )
+            .await
+            .expect("create operations receipt product");
         let receipt = service
             .post_receipt(
                 tenant_id,
@@ -2545,6 +2583,7 @@ mod tests {
                     idempotency_key: format!("receipt-idem-{suffix}"),
                     receipt_no: format!("OPS-R-{suffix}"),
                     owner_name: "Owner OPS".to_owned(),
+                    supplier_name: "Supplier OPS".to_owned(),
                     sku_code: format!("OPS-SKU-{suffix}"),
                     sku_name: "Ops Model".to_owned(),
                     warehouse_id,

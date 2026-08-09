@@ -5,8 +5,10 @@
 //! sessions, so clients cannot forge authorization context in business DTOs.
 
 use super::application::{
-    InventoryListItem, InventoryListQuery, InventoryListResponse, InventorySummaryQuery,
-    InventorySummaryResponse, PostReceiptResponse, ReceiptUnit,
+    CatalogParty, CatalogPartyRole, CatalogProduct, CreateCatalogPartyRequest,
+    CreateCatalogProductRequest, InventoryListItem, InventoryListQuery, InventoryListResponse,
+    InventorySummaryQuery, InventorySummaryResponse, PostReceiptResponse, ReceiptUnit,
+    ReferenceCatalog,
 };
 use super::auth::{
     authenticate_password, issue_session, revoke_session, rotate_refresh_token, AuthError,
@@ -142,20 +144,34 @@ impl NetworkService {
         .bind(request.warehouse_id)
         .fetch_one(&mut **transaction)
         .await?;
-        let owner_id =
-            upsert_party(transaction, tenant_id, &request.owner_name, "goods_owner").await?;
-        let sku_id =
-            upsert_sku(transaction, tenant_id, &request.sku_code, &request.sku_name).await?;
+        let owner_id = lookup_catalog_party(
+            transaction,
+            tenant_id,
+            &request.owner_name,
+            CatalogPartyRole::GoodsOwner,
+        )
+        .await?;
+        let supplier_id = lookup_catalog_party(
+            transaction,
+            tenant_id,
+            &request.supplier_name,
+            CatalogPartyRole::Supplier,
+        )
+        .await?;
+        let sku = lookup_catalog_sku(transaction, tenant_id, &request.sku_code, &request.sku_name)
+            .await?;
+        validate_barcodes_for_sku(&request.barcodes, &sku)?;
+        let sku_id = sku.id;
         let receipt_id = Uuid::now_v7();
         let receipt_line_id = Uuid::now_v7();
         sqlx::query(
             r#"
             INSERT INTO inbound_receipts
                 (tenant_id, id, receipt_no, owner_party_id, warehouse_id,
-                 source_reference, received_at, status, actor_id,
-                 idempotency_key, request_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, 'posted',
-                    $8, $9, $10)
+                 supplier_party_id, source_reference, received_at, status,
+                 actor_id, idempotency_key, request_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, 'posted',
+                    $9, $10, $11)
             "#,
         )
         .bind(tenant_id)
@@ -163,6 +179,7 @@ impl NetworkService {
         .bind(&request.receipt_no)
         .bind(owner_id)
         .bind(request.warehouse_id)
+        .bind(supplier_id)
         .bind(&request.source_reference)
         .bind(&request.received_at)
         .bind(actor_id)
@@ -244,6 +261,7 @@ impl NetworkService {
             receipt_line_id: receipt_line_id.to_string(),
             receipt_no: request.receipt_no.clone(),
             owner_party_id: owner_id.to_string(),
+            supplier_party_id: Some(supplier_id.to_string()),
             sku_id: sku_id.to_string(),
             received_count: units.len() as u32,
             units,
@@ -253,6 +271,7 @@ impl NetworkService {
             "receipt_no": request.receipt_no,
             "received_count": response.received_count,
             "owner_party_id": owner_id,
+            "supplier_party_id": supplier_id,
             "sku_id": sku_id,
         });
         sqlx::query(
@@ -397,6 +416,121 @@ impl NetworkService {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn list_reference_catalog(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+    ) -> NetworkResult<ReferenceCatalog> {
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let products = sqlx::query(
+            r#"
+            SELECT id, code, name, serial_prefix, serial_forbidden_chars
+              FROM skus
+             WHERE tenant_id = $1 AND active
+             ORDER BY code, id
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(CatalogProduct {
+                sku_id: row.try_get::<Uuid, _>("id")?.to_string(),
+                code: row.try_get("code")?,
+                name: row.try_get("name")?,
+                serial_prefix: row.try_get("serial_prefix")?,
+                serial_forbidden_chars: row.try_get("serial_forbidden_chars")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let goods_owners =
+            list_catalog_parties(transaction, tenant_id, CatalogPartyRole::GoodsOwner).await?;
+        let suppliers =
+            list_catalog_parties(transaction, tenant_id, CatalogPartyRole::Supplier).await?;
+        authorized.commit().await?;
+        Ok(ReferenceCatalog {
+            products,
+            goods_owners,
+            suppliers,
+        })
+    }
+
+    pub async fn create_catalog_product(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        input: CreateCatalogProductRequest,
+    ) -> NetworkResult<CatalogProduct> {
+        let input = normalize_catalog_product(input)?;
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_RECEIPT_WRITE)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO skus
+                (tenant_id, id, code, name, tracking_mode, active,
+                 serial_prefix, serial_forbidden_chars)
+            VALUES ($1, $2, $3, $4, 'serial', true, $5, $6)
+            ON CONFLICT (tenant_id, code) DO NOTHING
+            RETURNING id, code, name, serial_prefix, serial_forbidden_chars
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(&input.code)
+        .bind(&input.name)
+        .bind(&input.serial_prefix)
+        .bind(&input.serial_forbidden_chars)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| NetworkServiceError::Conflict {
+            entity: "sku".to_owned(),
+            key: input.code.clone(),
+        })?;
+        let product = CatalogProduct {
+            sku_id: row.try_get::<Uuid, _>("id")?.to_string(),
+            code: row.try_get("code")?,
+            name: row.try_get("name")?,
+            serial_prefix: row.try_get("serial_prefix")?,
+            serial_forbidden_chars: row.try_get("serial_forbidden_chars")?,
+        };
+        authorized.commit().await?;
+        Ok(product)
+    }
+
+    pub async fn create_catalog_party(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        input: CreateCatalogPartyRequest,
+    ) -> NetworkResult<CatalogParty> {
+        let display_name = normalized_display_name("party name", input.display_name)?;
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_RECEIPT_WRITE)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let party_id = upsert_party(
+            transaction,
+            tenant_id,
+            &display_name,
+            input.role.database_value(),
+        )
+        .await?;
+        authorized.commit().await?;
+        Ok(CatalogParty {
+            party_id: party_id.to_string(),
+            display_name,
+        })
     }
 
     pub async fn list_warehouses(
@@ -673,6 +807,7 @@ pub struct NetworkPostReceiptRequest {
     pub idempotency_key: String,
     pub receipt_no: String,
     pub owner_name: String,
+    pub supplier_name: String,
     pub sku_code: String,
     pub sku_name: String,
     pub warehouse_id: Uuid,
@@ -765,9 +900,10 @@ fn normalize_receipt(
     request.request_id = required("request_id", request.request_id)?;
     request.idempotency_key = required("idempotency_key", request.idempotency_key)?;
     request.receipt_no = required("receipt_no", request.receipt_no)?;
-    request.owner_name = required("owner_name", request.owner_name)?;
+    request.owner_name = normalized_display_name("owner_name", request.owner_name)?;
+    request.supplier_name = normalized_display_name("supplier_name", request.supplier_name)?;
     request.sku_code = required("sku_code", request.sku_code)?.to_uppercase();
-    request.sku_name = required("sku_name", request.sku_name)?;
+    request.sku_name = normalized_display_name("sku_name", request.sku_name)?;
     request.received_at = required("received_at", request.received_at)?;
     if request.barcodes.is_empty() {
         return Err(NetworkServiceError::Invalid(
@@ -792,6 +928,17 @@ fn normalize_receipt(
 
 fn required(field: &str, value: String) -> NetworkResult<String> {
     let value = value.trim().to_owned();
+    if value.is_empty() {
+        Err(NetworkServiceError::Invalid(format!(
+            "{field} must not be empty"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
+fn normalized_display_name(field: &str, value: String) -> NetworkResult<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if value.is_empty() {
         Err(NetworkServiceError::Invalid(format!(
             "{field} must not be empty"
@@ -869,27 +1016,174 @@ async fn upsert_party(
     Ok(party_id)
 }
 
-async fn upsert_sku(
+async fn lookup_catalog_party(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    display_name: &str,
+    role: CatalogPartyRole,
+) -> NetworkResult<Uuid> {
+    let normalized_name = display_name.to_lowercase();
+    sqlx::query_scalar(
+        r#"
+        SELECT bp.id
+          FROM business_parties bp
+          JOIN party_roles pr
+            ON pr.tenant_id = bp.tenant_id AND pr.party_id = bp.id
+         WHERE bp.tenant_id = $1
+           AND bp.normalized_name = $2
+           AND pr.role = $3
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(normalized_name)
+    .bind(role.database_value())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| NetworkServiceError::Conflict {
+        entity: role.database_value().to_owned(),
+        key: display_name.to_owned(),
+    })
+}
+
+async fn lookup_catalog_sku(
     transaction: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     code: &str,
     name: &str,
-) -> NetworkResult<Uuid> {
-    sqlx::query_scalar(
+) -> NetworkResult<NetworkSku> {
+    let row = sqlx::query(
+        "SELECT id, name, tracking_mode, active, serial_prefix, serial_forbidden_chars FROM skus WHERE tenant_id = $1 AND code = $2",
+    )
+    .bind(tenant_id)
+    .bind(code)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| NetworkServiceError::Conflict {
+        entity: "sku".to_owned(),
+        key: code.to_owned(),
+    })?;
+    let catalog_name: String = row.try_get("name")?;
+    if catalog_name != name {
+        return Err(NetworkServiceError::Invalid(format!(
+            "provided product name {name} does not match catalog name {catalog_name} for SKU {code}"
+        )));
+    }
+    if !row.try_get::<bool, _>("active")? {
+        return Err(NetworkServiceError::Invalid(format!(
+            "catalog SKU {code} is inactive"
+        )));
+    }
+    if row.try_get::<String, _>("tracking_mode")? != "serial" {
+        return Err(NetworkServiceError::Invalid(format!(
+            "catalog SKU {code} is not serial-tracked"
+        )));
+    }
+    Ok(NetworkSku {
+        id: row.try_get("id")?,
+        serial_prefix: row.try_get("serial_prefix")?,
+        serial_forbidden_chars: row.try_get("serial_forbidden_chars")?,
+    })
+}
+
+#[derive(Debug)]
+struct NetworkSku {
+    id: Uuid,
+    serial_prefix: Option<String>,
+    serial_forbidden_chars: String,
+}
+
+fn normalize_catalog_product(
+    mut input: CreateCatalogProductRequest,
+) -> NetworkResult<CreateCatalogProductRequest> {
+    input.code = required("product code", input.code)?.to_uppercase();
+    input.name = normalized_display_name("product name", input.name)?;
+    input.serial_prefix = input
+        .serial_prefix
+        .map(|prefix| required("SN prefix", prefix).map(|prefix| prefix.to_uppercase()))
+        .transpose()?;
+    if input.serial_forbidden_chars.len() > 128 {
+        return Err(NetworkServiceError::Invalid(
+            "serial_forbidden_chars must be at most 128 characters".to_owned(),
+        ));
+    }
+    let forbidden = parse_forbidden_serial_tokens(&input.serial_forbidden_chars);
+    if let Some((prefix, token)) = input.serial_prefix.as_ref().and_then(|prefix| {
+        forbidden
+            .iter()
+            .find(|token| prefix.contains(token.as_str()))
+            .map(|token| (prefix, token))
+    }) {
+        return Err(NetworkServiceError::Invalid(format!(
+            "SN prefix {prefix} contains forbidden character or token {token}"
+        )));
+    }
+    Ok(input)
+}
+
+fn validate_barcodes_for_sku(barcodes: &[String], sku: &NetworkSku) -> NetworkResult<()> {
+    let forbidden = parse_forbidden_serial_tokens(&sku.serial_forbidden_chars);
+    for barcode in barcodes {
+        if let Some(prefix) = &sku.serial_prefix {
+            if !barcode.starts_with(prefix) {
+                return Err(NetworkServiceError::Invalid(format!(
+                    "SN {barcode} does not match product prefix {prefix}"
+                )));
+            }
+        }
+        if let Some(token) = forbidden
+            .iter()
+            .find(|token| barcode.contains(token.as_str()))
+        {
+            return Err(NetworkServiceError::Invalid(format!(
+                "SN {barcode} contains forbidden character or token {token}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_forbidden_serial_tokens(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|token| {
+            if token == " " {
+                Some(" ".to_owned())
+            } else {
+                let token = token.trim();
+                (!token.is_empty()).then(|| token.to_uppercase())
+            }
+        })
+        .collect()
+}
+
+async fn list_catalog_parties(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    role: CatalogPartyRole,
+) -> NetworkResult<Vec<CatalogParty>> {
+    let rows = sqlx::query(
         r#"
-        INSERT INTO skus (tenant_id, id, code, name, tracking_mode, active)
-        VALUES ($1, $2, $3, $4, 'serial', true)
-        ON CONFLICT (tenant_id, code) DO UPDATE SET name = EXCLUDED.name
-        RETURNING id
+        SELECT bp.id, bp.display_name
+          FROM business_parties bp
+          JOIN party_roles pr
+            ON pr.tenant_id = bp.tenant_id AND pr.party_id = bp.id
+         WHERE bp.tenant_id = $1 AND pr.role = $2
+         ORDER BY lower(bp.display_name), bp.id
         "#,
     )
     .bind(tenant_id)
-    .bind(Uuid::now_v7())
-    .bind(code)
-    .bind(name)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(Into::into)
+    .bind(role.database_value())
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(CatalogParty {
+                party_id: row.try_get::<Uuid, _>("id")?.to_string(),
+                display_name: row.try_get("display_name")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(Into::into)
 }
 
 async fn claim_idempotency(
@@ -998,6 +1292,7 @@ mod tests {
             idempotency_key: "key".to_owned(),
             receipt_no: "RK-1".to_owned(),
             owner_name: "Owner".to_owned(),
+            supplier_name: "Supplier".to_owned(),
             sku_code: "SKU".to_owned(),
             sku_name: "Model".to_owned(),
             warehouse_id: Uuid::now_v7(),
@@ -1010,5 +1305,30 @@ mod tests {
         assert!(
             matches!(error, NetworkServiceError::Invalid(message) if message.contains("duplicate"))
         );
+    }
+
+    #[test]
+    fn network_catalog_product_rejects_impossible_scan_rules_but_allows_empty_rules() {
+        let error = normalize_catalog_product(CreateCatalogProductRequest {
+            code: "rules-1".to_owned(),
+            name: "Rules 1".to_owned(),
+            serial_prefix: Some("sn-bad".to_owned()),
+            serial_forbidden_chars: "BAD".to_owned(),
+        })
+        .expect_err("a prefix containing a case-normalized forbidden token must fail");
+        assert!(matches!(
+            error,
+            NetworkServiceError::Invalid(message)
+                if message.contains("prefix SN-BAD") && message.contains("BAD")
+        ));
+
+        let allowed = normalize_catalog_product(CreateCatalogProductRequest {
+            code: "rules-2".to_owned(),
+            name: "Rules 2".to_owned(),
+            serial_prefix: Some("sn".to_owned()),
+            serial_forbidden_chars: String::new(),
+        })
+        .expect("an empty forbidden rule intentionally allows any prefix");
+        assert_eq!(allowed.serial_prefix.as_deref(), Some("SN"));
     }
 }

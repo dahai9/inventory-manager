@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -93,6 +93,7 @@ interface LegacyImportPanelProps {
   actorId: string;
   activated: boolean;
   onCommitted?: () => void;
+  onBusyChange?: (busy: boolean) => void;
 }
 
 const emptyMapping: LegacyColumnMapping = {
@@ -139,7 +140,7 @@ function autoMapping(headers: string[]): LegacyColumnMapping {
   };
 }
 
-export default function LegacyImportPanel({ actorId, activated, onCommitted }: LegacyImportPanelProps) {
+export default function LegacyImportPanel({ actorId, activated, onCommitted, onBusyChange }: LegacyImportPanelProps) {
   const [sourcePath, setSourcePath] = useState("");
   const [workbook, setWorkbook] = useState<LegacyWorkbookInfo | null>(null);
   const [sheetName, setSheetName] = useState("");
@@ -149,6 +150,30 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
   const [report, setReport] = useState<LegacyImportCommitReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const busyCountRef = useRef(0);
+  const busyGenerationRef = useRef(0);
+  const onBusyChangeRef = useRef(onBusyChange);
+  onBusyChangeRef.current = onBusyChange;
+
+  const beginBusy = useCallback(() => {
+    const generation = busyGenerationRef.current;
+    busyCountRef.current += 1;
+    if (busyCountRef.current === 1) onBusyChangeRef.current?.(true);
+
+    let ended = false;
+    return () => {
+      if (ended || generation !== busyGenerationRef.current) return;
+      ended = true;
+      busyCountRef.current = Math.max(0, busyCountRef.current - 1);
+      if (busyCountRef.current === 0) onBusyChangeRef.current?.(false);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    busyGenerationRef.current += 1;
+    busyCountRef.current = 0;
+    onBusyChangeRef.current?.(false);
+  }, []);
 
   const sheet = useMemo(
     () => workbook?.sheets.find((candidate) => candidate.name === sheetName) ?? null,
@@ -166,31 +191,36 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
   }
 
   async function chooseWorkbook() {
-    const selected = await open({
-      title: "选择历史 Excel 文件",
-      directory: false,
-      multiple: false,
-      filters: [{ name: "电子表格", extensions: ["xlsx", "xls", "xlsb", "xlsm", "ods"] }],
-    });
-    if (!selected || Array.isArray(selected)) return;
-    setLoading(true);
-    setNotice(null);
-    resetPreview();
+    const endBusy = beginBusy();
     try {
-      const info = await invoke<LegacyWorkbookInfo>("v2_inspect_legacy_workbook", { path: selected });
-      const firstSheet = info.sheets[0];
-      if (!firstSheet) throw new Error("工作簿中没有可导入的工作表");
-      setSourcePath(selected);
-      setWorkbook(info);
-      setSheetName(firstSheet.name);
-      setMapping(autoMapping(firstSheet.headers));
-    } catch (error) {
-      setSourcePath("");
-      setWorkbook(null);
-      setSheetName("");
-      setNotice({ type: "error", text: `读取工作簿失败：${displayError(error)}` });
+      const selected = await open({
+        title: "选择历史 Excel 文件",
+        directory: false,
+        multiple: false,
+        filters: [{ name: "电子表格", extensions: ["xlsx", "xls", "xlsb", "xlsm", "ods"] }],
+      });
+      if (!selected || Array.isArray(selected)) return;
+      setLoading(true);
+      setNotice(null);
+      resetPreview();
+      try {
+        const info = await invoke<LegacyWorkbookInfo>("v2_inspect_legacy_workbook", { path: selected });
+        const firstSheet = info.sheets[0];
+        if (!firstSheet) throw new Error("工作簿中没有可导入的工作表");
+        setSourcePath(selected);
+        setWorkbook(info);
+        setSheetName(firstSheet.name);
+        setMapping(autoMapping(firstSheet.headers));
+      } catch (error) {
+        setSourcePath("");
+        setWorkbook(null);
+        setSheetName("");
+        setNotice({ type: "error", text: `读取工作簿失败：${displayError(error)}` });
+      } finally {
+        setLoading(false);
+      }
     } finally {
-      setLoading(false);
+      endBusy();
     }
   }
 
@@ -210,6 +240,7 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
 
   async function buildPreview() {
     if (!sourcePath || !sheetName) return;
+    const endBusy = beginBusy();
     setLoading(true);
     setNotice(null);
     setReport(null);
@@ -228,6 +259,7 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
       setNotice({ type: "error", text: `生成预览失败：${displayError(error)}` });
     } finally {
       setLoading(false);
+      endBusy();
     }
   }
 
@@ -253,6 +285,7 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
       setNotice({ type: "error", text: "离线授权无效，当前仅允许查询、备份和升级导出。" });
       return;
     }
+    const endBusy = beginBusy();
     setLoading(true);
     setNotice(null);
     try {
@@ -279,6 +312,7 @@ export default function LegacyImportPanel({ actorId, activated, onCommitted }: L
       setNotice({ type: "error", text: `提交导入失败：${displayError(error)}` });
     } finally {
       setLoading(false);
+      endBusy();
     }
   }
 

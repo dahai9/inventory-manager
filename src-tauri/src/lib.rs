@@ -1495,6 +1495,42 @@ async fn v2_post_receipt(
 }
 
 #[tauri::command]
+async fn v2_list_reference_catalog(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+) -> Result<v2::application::ReferenceCatalog, String> {
+    database
+        .list_reference_catalog()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_create_catalog_product(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::CreateCatalogProductRequest,
+) -> Result<v2::application::CatalogProduct, String> {
+    activation::require_activated(&app)?;
+    database
+        .create_catalog_product(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_create_catalog_party(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::CreateCatalogPartyRequest,
+) -> Result<v2::application::CatalogParty, String> {
+    activation::require_activated(&app)?;
+    database
+        .create_catalog_party(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn v2_inspect_legacy_workbook(
     path: String,
 ) -> Result<v2::legacy_import::LegacyWorkbookInfo, String> {
@@ -1911,6 +1947,38 @@ async fn v2_network_post_receipt(
 }
 
 #[tauri::command]
+async fn v2_network_list_reference_catalog(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<v2::application::ReferenceCatalog, String> {
+    client
+        .list_reference_catalog()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_create_catalog_product(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::application::CreateCatalogProductRequest,
+) -> Result<v2::application::CatalogProduct, String> {
+    client
+        .create_catalog_product(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_create_catalog_party(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::application::CreateCatalogPartyRequest,
+) -> Result<v2::application::CatalogParty, String> {
+    client
+        .create_catalog_party(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn v2_network_list_warehouses(
     client: tauri::State<'_, v2::network_client::NetworkClient>,
 ) -> Result<Vec<v2::network::NetworkWarehouse>, String> {
@@ -1949,6 +2017,17 @@ async fn v2_network_inventory_trace(
 ) -> Result<v2::traceability::InventoryTrace, String> {
     client
         .inventory_trace(&barcode)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_inventory_barcode_exists(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    barcode: String,
+) -> Result<v2::traceability::InventoryBarcodeExistsResponse, String> {
+    client
+        .inventory_barcode_exists(&barcode)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2060,6 +2139,14 @@ async fn v2_inventory_trace(
     barcode: String,
 ) -> Result<v2::traceability::InventoryTrace, String> {
     database.inventory_trace(&barcode).await
+}
+
+#[tauri::command]
+async fn v2_inventory_barcode_exists(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    barcode: String,
+) -> Result<v2::traceability::InventoryBarcodeExistsResponse, String> {
+    database.inventory_barcode_exists(&barcode).await
 }
 
 #[tauri::command]
@@ -2295,11 +2382,15 @@ pub fn run() {
             export_customer_statement,
             export_customer_statements_to_dir,
             v2_post_receipt,
+            v2_list_reference_catalog,
+            v2_create_catalog_product,
+            v2_create_catalog_party,
             v2_inspect_legacy_workbook,
             v2_preview_legacy_excel,
             v2_commit_legacy_excel,
             v2_complete_inspection,
             v2_list_inventory,
+            v2_inventory_barcode_exists,
             v2_inventory_trace,
             v2_get_dashboard,
             v2_create_outbound_order,
@@ -2326,9 +2417,13 @@ pub fn run() {
             v2_network_replace_membership_roles,
             v2_network_membership_permissions,
             v2_network_post_receipt,
+            v2_network_list_reference_catalog,
+            v2_network_create_catalog_product,
+            v2_network_create_catalog_party,
             v2_network_list_warehouses,
             v2_network_complete_inspection,
             v2_network_list_inventory,
+            v2_network_inventory_barcode_exists,
             v2_network_inventory_trace,
             v2_network_get_dashboard,
             v2_network_create_outbound_order,

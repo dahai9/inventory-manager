@@ -4,6 +4,7 @@ version = "0.2.6"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+default-run = "inventory-manager"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

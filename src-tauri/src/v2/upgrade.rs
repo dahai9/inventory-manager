@@ -1,6 +1,10 @@
 //! One-time, offline SQLite to network PostgreSQL upgrade packages.
 //!
-//! Version 1 uses an uncompressed directory whose name ends in `.invpack`.
+//! Version 2 uses an uncompressed directory whose name ends in `.invpack` and
+//! preserves inbound supplier identity plus product scanner rules. Version 1
+//! remains readable so packages exported by the previous offline release can
+//! still be upgraded, while older network services reject new version 2 data
+//! instead of silently discarding the added fields.
 //! Keeping the package inspectable avoids adding an archive dependency and makes
 //! every file independently verifiable. A later archive representation must
 //! increment `PACKAGE_FORMAT_VERSION` and retain the same safety properties.
@@ -25,8 +29,10 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub const PRODUCT_ID: &str = "inventory-manager";
-pub const PACKAGE_FORMAT_VERSION: u32 = 1;
+pub const PACKAGE_FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_PACKAGE_FORMAT_VERSION: u32 = 1;
 pub const LOGICAL_SCHEMA_VERSION: i64 = 1;
+const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 5;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const CHECKSUMS_FILE: &str = "checksums.json";
@@ -486,13 +492,13 @@ impl<'a> OfflineUpgradeExporter<'a> {
         let logical_schema_available: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = ?1 AND success = 1)",
         )
-        .bind(LOGICAL_SCHEMA_VERSION)
+        .bind(REQUIRED_SQLITE_MIGRATION_VERSION)
         .fetch_one(&mut *transaction)
         .await?;
         if !logical_schema_available {
             return Err(UpgradeError::Incompatible(format!(
-                "SQLite does not contain required logical schema version {}",
-                LOGICAL_SCHEMA_VERSION
+                "SQLite does not contain required migration version {}",
+                REQUIRED_SQLITE_MIGRATION_VERSION
             )));
         }
 
@@ -1186,11 +1192,19 @@ fn validate_metadata(
             manifest.product
         )));
     }
-    if manifest.package_format_version != PACKAGE_FORMAT_VERSION
-        || checksums.package_format_version != PACKAGE_FORMAT_VERSION
+    if manifest.package_format_version != checksums.package_format_version {
+        return Err(UpgradeError::Integrity(
+            "manifest and checksums package format versions differ".to_owned(),
+        ));
+    }
+    if !(MIN_SUPPORTED_PACKAGE_FORMAT_VERSION..=PACKAGE_FORMAT_VERSION)
+        .contains(&manifest.package_format_version)
     {
         return Err(UpgradeError::Incompatible(format!(
-            "package format must be version {PACKAGE_FORMAT_VERSION}"
+            "package format {} is not supported; expected {} through {}",
+            manifest.package_format_version,
+            MIN_SUPPORTED_PACKAGE_FORMAT_VERSION,
+            PACKAGE_FORMAT_VERSION,
         )));
     }
     if manifest.logical_schema_version != LOGICAL_SCHEMA_VERSION {
@@ -1221,7 +1235,7 @@ fn validate_metadata(
         || !manifest.workspace_mapping.requires_empty_target
     {
         return Err(UpgradeError::Data(
-            "version 1 requires the source workspace and an empty, unassigned target workspace"
+            "this package format requires the source workspace and an empty, unassigned target workspace"
                 .to_owned(),
         ));
     }
@@ -1433,6 +1447,7 @@ fn validate_relational_data(
         ("locations", "warehouse_id", "warehouses"),
         ("inbound_receipts", "owner_party_id", "business_parties"),
         ("inbound_receipts", "warehouse_id", "warehouses"),
+        ("inbound_receipts", "supplier_party_id", "business_parties"),
         ("inbound_receipt_lines", "receipt_id", "inbound_receipts"),
         ("inbound_receipt_lines", "sku_id", "skus"),
         (
@@ -1523,7 +1538,14 @@ fn validate_relational_data(
         ),
         ("stock_movements", "inventory_unit_id", "inventory_units"),
     ] {
-        validate_foreign_key(records, &ids, table, field, target, false)?;
+        validate_foreign_key(
+            records,
+            &ids,
+            table,
+            field,
+            target,
+            table == "inbound_receipts" && field == "supplier_party_id",
+        )?;
     }
     for field in ["from_location_id", "to_location_id"] {
         validate_foreign_key(records, &ids, "stock_movements", field, "locations", true)?;
@@ -1656,6 +1678,9 @@ fn validate_foreign_key(
         .expect("foreign-key target table is indexed");
     for record in table_records(records, table) {
         let Some(value) = record.get(field) else {
+            if nullable {
+                continue;
+            }
             return Err(UpgradeError::Data(format!("{table}.{field} is missing")));
         };
         if nullable && value.is_null() {
@@ -2557,8 +2582,9 @@ impl<'a> PgUpgradeTransaction<'a> {
         for record in records_for(records, "skus") {
             sqlx::query(
                 r#"INSERT INTO skus
-                    (tenant_id, id, code, name, tracking_mode, active, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)"#,
+                    (tenant_id, id, code, name, tracking_mode, active,
+                     serial_prefix, serial_forbidden_chars, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz)"#,
             )
             .bind(tenant_id)
             .bind(uuid_field(record, "skus", "id")?)
@@ -2566,6 +2592,11 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "skus", "name")?)
             .bind(string_field(record, "skus", "tracking_mode")?)
             .bind(bool_field(record, "skus", "active")?)
+            .bind(optional_string_field(record, "skus", "serial_prefix")?)
+            .bind(
+                optional_string_field(record, "skus", "serial_forbidden_chars")?
+                    .unwrap_or_default(),
+            )
             .bind(string_field(record, "skus", "created_at")?)
             .execute(&mut *self.transaction)
             .await?;
@@ -2614,10 +2645,11 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO inbound_receipts
                     (tenant_id, id, receipt_no, owner_party_id, warehouse_id,
-                     source_reference, received_at, status, actor_id,
-                     source_actor_id, idempotency_key, request_id, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9,
-                        $10, $11, $12, $13::timestamptz)
+                     supplier_party_id, source_reference, received_at, status,
+                     actor_id, source_actor_id, idempotency_key, request_id,
+                     created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10,
+                        $11, $12, $13, $14::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2625,6 +2657,11 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "inbound_receipts", "receipt_no")?)
             .bind(uuid_field(record, "inbound_receipts", "owner_party_id")?)
             .bind(uuid_field(record, "inbound_receipts", "warehouse_id")?)
+            .bind(optional_uuid_field(
+                record,
+                "inbound_receipts",
+                "supplier_party_id",
+            )?)
             .bind(optional_string_field(
                 record,
                 "inbound_receipts",
@@ -3600,7 +3637,8 @@ fn json_field(
 mod tests {
     use super::*;
     use crate::v2::application::{
-        CompleteInspectionRequest, InspectionResultInput, PostReceiptRequest,
+        CatalogPartyRole, CompleteInspectionRequest, CreateCatalogPartyRequest,
+        CreateCatalogProductRequest, InspectionResultInput, PostReceiptRequest,
     };
     use crate::v2::auth::{hash_token, TokenKind};
     use crate::v2::domain::{InspectionKind, QualityOutcome};
@@ -3648,15 +3686,38 @@ mod tests {
         ))
         .await
         .expect("create V2 schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0002_upgrade_result_reports.sql"
+        ))
+        .await
+        .expect("create upgrade reports schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0003_repeat_outbound_after_return.sql"
+        ))
+        .await
+        .expect("migrate repeat outbound schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0004_legacy_excel_import.sql"
+        ))
+        .await
+        .expect("create legacy import schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0005_inbound_supplier_and_sku_scan_rules.sql"
+        ))
+        .await
+        .expect("create supplier and scanner schema");
         pool.execute(
             "CREATE TABLE _sqlx_migrations (version BIGINT NOT NULL, success BOOLEAN NOT NULL)",
         )
         .await
         .expect("create migration metadata");
-        sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .expect("record migration");
+        for version in 1..=REQUIRED_SQLITE_MIGRATION_VERSION {
+            sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (?1, 1)")
+                .bind(version)
+                .execute(&pool)
+                .await
+                .expect("record migration");
+        }
 
         let workspace_id = Uuid::now_v7().to_string();
         let source_instance_id = Uuid::now_v7().to_string();
@@ -3771,7 +3832,7 @@ mod tests {
     #[tokio::test]
     async fn network_upload_round_trips_only_canonical_members_and_cleans_staging() {
         let (pool, workspace_id, _) = test_pool().await;
-        sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (2, 1)")
+        sqlx::query("INSERT INTO _sqlx_migrations (version, success) VALUES (6, 1)")
             .execute(&pool)
             .await
             .expect("record newer physical migration");
@@ -4222,6 +4283,33 @@ mod tests {
             .execute(source.pool())
             .await
             .expect("set source instance");
+        for owner in ["Upgrade Owner A", "Upgrade Owner B"] {
+            source
+                .create_catalog_party(CreateCatalogPartyRequest {
+                    display_name: owner.to_owned(),
+                    role: CatalogPartyRole::GoodsOwner,
+                })
+                .await
+                .expect("create upgrade source owner");
+        }
+        for supplier in ["Upgrade Supplier A", "Upgrade Supplier B"] {
+            source
+                .create_catalog_party(CreateCatalogPartyRequest {
+                    display_name: supplier.to_owned(),
+                    role: CatalogPartyRole::Supplier,
+                })
+                .await
+                .expect("create upgrade source supplier");
+        }
+        source
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "UPGRADE-SKU".to_owned(),
+                name: "Upgrade Model".to_owned(),
+                serial_prefix: Some("UPGRADE-".to_owned()),
+                serial_forbidden_chars: "#, ".to_owned(),
+            })
+            .await
+            .expect("create upgrade source product");
 
         let source_barcode_a = format!("UPGRADE-A-{tenant_id}");
         let source_barcode_b = format!("UPGRADE-B-{tenant_id}");
@@ -4231,6 +4319,7 @@ mod tests {
                 idempotency_key: "source-receipt-a-key".to_owned(),
                 receipt_no: format!("UPGRADE-RA-{}", tenant_id.simple()),
                 owner_name: "Upgrade Owner A".to_owned(),
+                supplier_name: "Upgrade Supplier A".to_owned(),
                 sku_code: "UPGRADE-SKU".to_owned(),
                 sku_name: "Upgrade Model".to_owned(),
                 source_reference: Some("offline-batch-a".to_owned()),
@@ -4247,6 +4336,7 @@ mod tests {
                 idempotency_key: "source-receipt-b-key".to_owned(),
                 receipt_no: format!("UPGRADE-RB-{}", tenant_id.simple()),
                 owner_name: "Upgrade Owner B".to_owned(),
+                supplier_name: "Upgrade Supplier B".to_owned(),
                 sku_code: "UPGRADE-SKU".to_owned(),
                 sku_name: "Upgrade Model".to_owned(),
                 source_reference: Some("offline-batch-b".to_owned()),
@@ -4515,6 +4605,41 @@ mod tests {
                 "unexpected imported row count for {column}"
             );
         }
+
+        let imported_scanner_rules: (Option<String>, String) = sqlx::query_as(
+            "SELECT serial_prefix, serial_forbidden_chars FROM skus WHERE tenant_id = $1 AND code = 'UPGRADE-SKU'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *verification)
+        .await
+        .expect("load imported scanner rules");
+        assert_eq!(imported_scanner_rules.0.as_deref(), Some("UPGRADE-"));
+        assert_eq!(imported_scanner_rules.1, "#, ");
+
+        let imported_suppliers: BTreeMap<String, String> = sqlx::query_as(
+            r#"
+            SELECT ir.receipt_no, supplier.display_name
+              FROM inbound_receipts ir
+              JOIN business_parties supplier
+                ON supplier.tenant_id = ir.tenant_id
+               AND supplier.id = ir.supplier_party_id
+             WHERE ir.tenant_id = $1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *verification)
+        .await
+        .expect("load imported supplier provenance")
+        .into_iter()
+        .collect();
+        assert_eq!(
+            imported_suppliers.get(&receipt_a.receipt_no),
+            Some(&"Upgrade Supplier A".to_owned())
+        );
+        assert_eq!(
+            imported_suppliers.get(&receipt_b.receipt_no),
+            Some(&"Upgrade Supplier B".to_owned())
+        );
 
         let imported_identities: BTreeSet<(String, String)> = sqlx::query_as::<_, (String, String)>(
             r#"
