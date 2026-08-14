@@ -2,6 +2,7 @@
 
 use super::network::{NetworkResult, NetworkService, PERMISSION_INVENTORY_READ};
 use super::sqlite::OfflineDatabase;
+use super::warranty::WarrantyTerms;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -17,11 +18,16 @@ pub struct InventoryTrace {
     pub sku_name: String,
     pub receipt_id: String,
     pub receipt_no: String,
+    pub supplier_name: Option<String>,
+    pub source_reference: Option<String>,
     pub received_at: String,
+    pub inbound_warranty: Option<WarrantyTerms>,
     pub inventory_status: String,
     pub quality_status: String,
     pub inspections: Vec<InspectionTrace>,
+    pub movements: Vec<MovementTrace>,
     pub outbound: Vec<OutboundTrace>,
+    pub latest_related_order: Option<OutboundTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -35,6 +41,8 @@ pub struct InspectionTrace {
     pub inspection_no: String,
     pub inspection_type: String,
     pub result: String,
+    pub quality_label_id: Option<String>,
+    pub quality_label_snapshot: Option<String>,
     pub inspected_at: String,
     pub defect_code: Option<String>,
     pub notes: Option<String>,
@@ -47,10 +55,13 @@ pub struct OutboundTrace {
     pub allocated_at: String,
     pub order_id: String,
     pub order_no: String,
+    pub order_status: String,
     pub upstream_receiver_name: String,
+    pub shipment_line_id: Option<String>,
     pub shipment_id: Option<String>,
     pub shipment_no: Option<String>,
     pub shipped_at: Option<String>,
+    pub warranty: Option<WarrantyTerms>,
     pub confirmation_code: Option<String>,
     pub confirmed_at: Option<String>,
     pub delivery_result: Option<String>,
@@ -58,6 +69,15 @@ pub struct OutboundTrace {
     pub returned_at: Option<String>,
     pub return_reason: Option<String>,
     pub return_disposition: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MovementTrace {
+    pub movement_id: String,
+    pub movement_type: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub occurred_at: String,
 }
 
 impl OfflineDatabase {
@@ -84,13 +104,20 @@ impl OfflineDatabase {
             SELECT iu.id AS inventory_unit_id, iu.barcode,
                    iu.owner_party_id, owner.display_name AS owner_name,
                    iu.sku_id, sku.code AS sku_code, sku.name AS sku_name,
-                   receipt.id AS receipt_id, receipt.receipt_no, iu.received_at,
+                   receipt.id AS receipt_id, receipt.receipt_no,
+                   supplier.display_name AS supplier_name, receipt.source_reference,
+                   receipt.warranty_duration_days AS inbound_warranty_duration_days,
+                   receipt.warranty_label_snapshot AS inbound_warranty_label_snapshot,
+                   receipt.warranty_started_at AS inbound_warranty_started_at,
+                   receipt.warranty_expires_at AS inbound_warranty_expires_at,
+                   iu.received_at,
                    iu.inventory_status, iu.quality_status
               FROM inventory_units iu
               JOIN business_parties owner ON owner.id = iu.owner_party_id
               JOIN skus sku ON sku.id = iu.sku_id
               JOIN inbound_receipt_lines line ON line.id = iu.inbound_receipt_line_id
               JOIN inbound_receipts receipt ON receipt.id = line.receipt_id
+              LEFT JOIN business_parties supplier ON supplier.id = receipt.supplier_party_id
              WHERE iu.workspace_id = ?1 AND iu.barcode = ?2
             "#,
         )
@@ -107,7 +134,8 @@ impl OfflineDatabase {
         let inspections = sqlx::query(
             r#"
             SELECT inspection.inspection_no, inspection.inspection_type,
-                   result.result, inspection.inspected_at,
+                   result.result, result.quality_label_id,
+                   result.quality_label_snapshot, inspection.inspected_at,
                    result.defect_code, result.notes
               FROM quality_inspection_results result
               JOIN quality_inspections inspection ON inspection.id = result.inspection_id
@@ -126,6 +154,8 @@ impl OfflineDatabase {
                 inspection_no: row.try_get("inspection_no")?,
                 inspection_type: row.try_get("inspection_type")?,
                 result: row.try_get("result")?,
+                quality_label_id: row.try_get("quality_label_id")?,
+                quality_label_snapshot: row.try_get("quality_label_snapshot")?,
                 inspected_at: row.try_get("inspected_at")?,
                 defect_code: row.try_get("defect_code")?,
                 notes: row.try_get("notes")?,
@@ -139,10 +169,13 @@ impl OfflineDatabase {
             SELECT allocation.id AS allocation_id,
                    allocation.status AS allocation_status,
                    allocation.allocated_at,
-                   orders.id AS order_id, orders.order_no,
+                   orders.id AS order_id, orders.order_no, orders.status AS order_status,
                    receiver.display_name AS upstream_receiver_name,
+                   shipment_line.id AS shipment_line_id,
                    shipment.id AS shipment_id, shipment.shipment_no,
                    shipment.shipped_at,
+                   shipment.warranty_duration_days, shipment.warranty_label_snapshot,
+                   shipment.warranty_started_at, shipment.warranty_expires_at,
                    confirmation.confirmation_code, confirmation.confirmed_at,
                    confirmation_line.result AS delivery_result,
                    return_batch.return_no, return_batch.returned_at,
@@ -180,6 +213,28 @@ impl OfflineDatabase {
         .collect::<Result<Vec<_>, sqlx::Error>>()
         .map_err(|error| error.to_string())?;
 
+        let movements = sqlx::query(
+            "SELECT id, movement_type, source_type, source_id, occurred_at FROM stock_movements WHERE workspace_id = ?1 AND inventory_unit_id = ?2 ORDER BY occurred_at, id",
+        )
+        .bind(self.workspace_id())
+        .bind(&inventory_unit_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| format!("读取库存流水失败: {error}"))?
+        .into_iter()
+        .map(|row| {
+            Ok(MovementTrace {
+                movement_id: row.try_get("id")?,
+                movement_type: row.try_get("movement_type")?,
+                source_type: row.try_get("source_type")?,
+                source_id: row.try_get("source_id")?,
+                occurred_at: row.try_get("occurred_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|error| error.to_string())?;
+        let latest_related_order = outbound.last().cloned();
+
         Ok(InventoryTrace {
             inventory_unit_id,
             barcode: row.try_get("barcode").map_err(|error| error.to_string())?,
@@ -198,8 +253,16 @@ impl OfflineDatabase {
             receipt_no: row
                 .try_get("receipt_no")
                 .map_err(|error| error.to_string())?,
+            supplier_name: row
+                .try_get("supplier_name")
+                .map_err(|error| error.to_string())?,
+            source_reference: row
+                .try_get("source_reference")
+                .map_err(|error| error.to_string())?,
             received_at: row
                 .try_get("received_at")
+                .map_err(|error| error.to_string())?,
+            inbound_warranty: warranty_from_sqlite_row(&row, "inbound_warranty")
                 .map_err(|error| error.to_string())?,
             inventory_status: row
                 .try_get("inventory_status")
@@ -208,7 +271,9 @@ impl OfflineDatabase {
                 .try_get("quality_status")
                 .map_err(|error| error.to_string())?,
             inspections,
+            movements,
             outbound,
+            latest_related_order,
         })
     }
 }
@@ -256,6 +321,11 @@ impl NetworkService {
                    iu.owner_party_id, owner.display_name AS owner_name,
                    iu.sku_id, sku.code AS sku_code, sku.name AS sku_name,
                    receipt.id AS receipt_id, receipt.receipt_no,
+                   supplier.display_name AS supplier_name, receipt.source_reference,
+                   receipt.warranty_duration_days AS inbound_warranty_duration_days,
+                   receipt.warranty_label_snapshot AS inbound_warranty_label_snapshot,
+                   receipt.warranty_started_at::text AS inbound_warranty_started_at,
+                   receipt.warranty_expires_at::text AS inbound_warranty_expires_at,
                    iu.received_at::text AS received_at,
                    iu.inventory_status, iu.quality_status
               FROM inventory_units iu
@@ -266,6 +336,8 @@ impl NetworkService {
                 ON line.tenant_id = iu.tenant_id AND line.id = iu.inbound_receipt_line_id
               JOIN inbound_receipts receipt
                 ON receipt.tenant_id = line.tenant_id AND receipt.id = line.receipt_id
+              LEFT JOIN business_parties supplier
+                ON supplier.tenant_id = receipt.tenant_id AND supplier.id = receipt.supplier_party_id
              WHERE iu.tenant_id = $1 AND iu.barcode = $2
             "#,
         )
@@ -281,7 +353,9 @@ impl NetworkService {
         let inspections = sqlx::query(
             r#"
             SELECT inspection.inspection_no, inspection.inspection_type,
-                   result.result, inspection.inspected_at::text AS inspected_at,
+                   result.result, result.quality_label_id::text AS quality_label_id,
+                   result.quality_label_snapshot,
+                   inspection.inspected_at::text AS inspected_at,
                    result.defect_code, result.notes
               FROM quality_inspection_results result
               JOIN quality_inspections inspection
@@ -301,6 +375,8 @@ impl NetworkService {
                 inspection_no: row.try_get("inspection_no")?,
                 inspection_type: row.try_get("inspection_type")?,
                 result: row.try_get("result")?,
+                quality_label_id: row.try_get("quality_label_id")?,
+                quality_label_snapshot: row.try_get("quality_label_snapshot")?,
                 inspected_at: row.try_get("inspected_at")?,
                 defect_code: row.try_get("defect_code")?,
                 notes: row.try_get("notes")?,
@@ -313,10 +389,14 @@ impl NetworkService {
             SELECT allocation.id AS allocation_id,
                    allocation.status AS allocation_status,
                    allocation.allocated_at::text AS allocated_at,
-                   orders.id AS order_id, orders.order_no,
+                   orders.id AS order_id, orders.order_no, orders.status AS order_status,
                    receiver.display_name AS upstream_receiver_name,
+                   shipment_line.id AS shipment_line_id,
                    shipment.id AS shipment_id, shipment.shipment_no,
                    shipment.shipped_at::text AS shipped_at,
+                   shipment.warranty_duration_days, shipment.warranty_label_snapshot,
+                   shipment.warranty_started_at::text AS warranty_started_at,
+                   shipment.warranty_expires_at::text AS warranty_expires_at,
                    confirmation.confirmation_code,
                    confirmation.confirmed_at::text AS confirmed_at,
                    confirmation_line.result AS delivery_result,
@@ -365,6 +445,26 @@ impl NetworkService {
         .map(outbound_from_postgres_row)
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
+        let movements = sqlx::query(
+            "SELECT id, movement_type, source_type, source_id, occurred_at::text AS occurred_at FROM stock_movements WHERE tenant_id = $1 AND inventory_unit_id = $2 ORDER BY occurred_at, id",
+        )
+        .bind(tenant_id)
+        .bind(inventory_unit_id)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(MovementTrace {
+                movement_id: row.try_get::<Uuid, _>("id")?.to_string(),
+                movement_type: row.try_get("movement_type")?,
+                source_type: row.try_get("source_type")?,
+                source_id: row.try_get::<Uuid, _>("source_id")?.to_string(),
+                occurred_at: row.try_get("occurred_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let latest_related_order = outbound.last().cloned();
+
         let trace = InventoryTrace {
             inventory_unit_id: inventory_unit_id.to_string(),
             barcode: row.try_get("barcode")?,
@@ -375,11 +475,16 @@ impl NetworkService {
             sku_name: row.try_get("sku_name")?,
             receipt_id: row.try_get::<Uuid, _>("receipt_id")?.to_string(),
             receipt_no: row.try_get("receipt_no")?,
+            supplier_name: row.try_get("supplier_name")?,
+            source_reference: row.try_get("source_reference")?,
             received_at: row.try_get("received_at")?,
+            inbound_warranty: warranty_from_postgres_row(&row, "inbound_warranty")?,
             inventory_status: row.try_get("inventory_status")?,
             quality_status: row.try_get("quality_status")?,
             inspections,
+            movements,
             outbound,
+            latest_related_order,
         };
         authorized.commit().await?;
         Ok(trace)
@@ -402,10 +507,13 @@ fn outbound_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> Result<OutboundTrac
         allocated_at: row.try_get("allocated_at")?,
         order_id: row.try_get("order_id")?,
         order_no: row.try_get("order_no")?,
+        order_status: row.try_get("order_status")?,
         upstream_receiver_name: row.try_get("upstream_receiver_name")?,
+        shipment_line_id: row.try_get("shipment_line_id")?,
         shipment_id: row.try_get("shipment_id")?,
         shipment_no: row.try_get("shipment_no")?,
         shipped_at: row.try_get("shipped_at")?,
+        warranty: warranty_from_sqlite_row(&row, "warranty")?,
         confirmation_code: row.try_get("confirmation_code")?,
         confirmed_at: row.try_get("confirmed_at")?,
         delivery_result: row.try_get("delivery_result")?,
@@ -423,12 +531,17 @@ fn outbound_from_postgres_row(row: sqlx::postgres::PgRow) -> Result<OutboundTrac
         allocated_at: row.try_get("allocated_at")?,
         order_id: row.try_get::<Uuid, _>("order_id")?.to_string(),
         order_no: row.try_get("order_no")?,
+        order_status: row.try_get("order_status")?,
         upstream_receiver_name: row.try_get("upstream_receiver_name")?,
+        shipment_line_id: row
+            .try_get::<Option<Uuid>, _>("shipment_line_id")?
+            .map(|value| value.to_string()),
         shipment_id: row
             .try_get::<Option<Uuid>, _>("shipment_id")?
             .map(|value| value.to_string()),
         shipment_no: row.try_get("shipment_no")?,
         shipped_at: row.try_get("shipped_at")?,
+        warranty: warranty_from_postgres_row(&row, "warranty")?,
         confirmation_code: row.try_get("confirmation_code")?,
         confirmed_at: row.try_get("confirmed_at")?,
         delivery_result: row.try_get("delivery_result")?,
@@ -437,6 +550,46 @@ fn outbound_from_postgres_row(row: sqlx::postgres::PgRow) -> Result<OutboundTrac
         return_reason: row.try_get("return_reason")?,
         return_disposition: row.try_get("return_disposition")?,
     })
+}
+
+fn warranty_column(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_owned()
+    } else {
+        format!("{prefix}_{field}")
+    }
+}
+
+fn warranty_from_sqlite_row(
+    row: &sqlx::sqlite::SqliteRow,
+    prefix: &str,
+) -> Result<Option<WarrantyTerms>, sqlx::Error> {
+    let duration_column = warranty_column(prefix, "duration_days");
+    let Some(duration) = row.try_get::<Option<i64>, _>(duration_column.as_str())? else {
+        return Ok(None);
+    };
+    Ok(Some(WarrantyTerms {
+        duration_days: u32::try_from(duration).unwrap_or_default(),
+        label_snapshot: row.try_get(warranty_column(prefix, "label_snapshot").as_str())?,
+        starts_at: row.try_get(warranty_column(prefix, "started_at").as_str())?,
+        expires_at: row.try_get(warranty_column(prefix, "expires_at").as_str())?,
+    }))
+}
+
+fn warranty_from_postgres_row(
+    row: &sqlx::postgres::PgRow,
+    prefix: &str,
+) -> Result<Option<WarrantyTerms>, sqlx::Error> {
+    let duration_column = warranty_column(prefix, "duration_days");
+    let Some(duration) = row.try_get::<Option<i32>, _>(duration_column.as_str())? else {
+        return Ok(None);
+    };
+    Ok(Some(WarrantyTerms {
+        duration_days: u32::try_from(duration).unwrap_or_default(),
+        label_snapshot: row.try_get(warranty_column(prefix, "label_snapshot").as_str())?,
+        starts_at: row.try_get(warranty_column(prefix, "started_at").as_str())?,
+        expires_at: row.try_get(warranty_column(prefix, "expires_at").as_str())?,
+    }))
 }
 
 #[cfg(test)]
@@ -515,6 +668,7 @@ mod tests {
                 actor_id: "operator-1".to_owned(),
                 barcodes: vec!["sn-exact-001".to_owned()],
                 notes: None,
+                warranty: None,
             })
             .await
             .expect("post receipt");

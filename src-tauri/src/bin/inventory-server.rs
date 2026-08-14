@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use inventory_manager_lib::v2::application::{
     CreateCatalogPartyRequest, CreateCatalogProductRequest, SaveCatalogPartyRequest,
+    SaveQualityLabelRequest,
 };
 use inventory_manager_lib::v2::auth::{AuthError, AuthorizationDenial};
 use inventory_manager_lib::v2::identity_admin::{
@@ -21,6 +22,7 @@ use inventory_manager_lib::v2::network_ops::{
     NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
 };
 use inventory_manager_lib::v2::postgres::{NetworkDatabase, NetworkDatabaseConfig};
+use inventory_manager_lib::v2::records::RecordSearchQuery;
 use inventory_manager_lib::v2::upgrade::{NetworkUpgradeImportRequest, MAX_NETWORK_REQUEST_BYTES};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -142,12 +144,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/inventory/summary", post(inventory_summary))
         .route("/v1/inventory/trace", post(inventory_trace))
+        .route("/v1/records/receipts/query", post(list_receipt_records))
+        .route("/v1/records/receipts/detail", post(receipt_document))
+        .route(
+            "/v1/records/outbound/query",
+            post(list_outbound_order_records),
+        )
+        .route("/v1/records/outbound/detail", post(outbound_order_document))
+        .route(
+            "/v1/records/returns/candidate",
+            post(lookup_return_candidate),
+        )
         .route("/v1/reference/catalog/query", post(list_reference_catalog))
         .route("/v1/reference/products", post(create_catalog_product))
         .route("/v1/reference/parties", post(create_catalog_party))
         .route("/v1/reference/parties/save", post(save_catalog_party))
         .route("/v1/reference/warehouses/query", post(list_warehouses))
         .route("/v1/inbound/receipts", post(post_receipt))
+        .route("/v1/quality/labels/query", post(list_quality_labels))
+        .route("/v1/quality/labels/save", post(save_quality_label))
         .route(
             "/v1/upgrades/offline-imports",
             post(import_upgrade_package).layer(DefaultBodyLimit::max(MAX_NETWORK_REQUEST_BYTES)),
@@ -429,6 +444,86 @@ async fn inventory_trace(
         .map_err(Into::into)
 }
 
+async fn list_receipt_records(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(query): Json<RecordSearchQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_receipt_records_network(tenant_id, bearer, query)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_outbound_order_records(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(query): Json<RecordSearchQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_outbound_order_records_network(tenant_id, bearer, query)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+struct RecordIdRequest {
+    id: Uuid,
+}
+
+async fn receipt_document(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<RecordIdRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .receipt_document_network(tenant_id, bearer, request.id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn outbound_order_document(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<RecordIdRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .outbound_order_document_network(tenant_id, bearer, request.id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn lookup_return_candidate(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<InventoryTraceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .lookup_return_candidate_network(tenant_id, bearer, &request.barcode)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn list_warehouses(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -512,6 +607,35 @@ async fn complete_quality_inspection(
     state
         .service
         .complete_quality_inspection(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn list_quality_labels(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .list_quality_labels(tenant_id, bearer)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn save_quality_label(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<SaveQualityLabelRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .save_quality_label(tenant_id, bearer, request)
         .await
         .map(Json)
         .map_err(Into::into)

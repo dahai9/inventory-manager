@@ -7,6 +7,7 @@
 
 use super::domain::{InventoryStatus, InventoryUnit, OutboundOrderLine, QualityStatus};
 use super::sqlite::{now_utc, OfflineDatabase};
+use super::warranty::{resolve_warranty, WarrantyInput};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -55,6 +56,10 @@ pub struct AllocateOutboundRequest {
     /// Empty means automatic FIFO allocation. Non-empty means explicit SNs.
     #[serde(default)]
     pub barcodes: Vec<String>,
+    /// A scan-first order may contain several SKUs. The selected units are
+    /// grouped into order lines by their actual inventory SKU in this mode.
+    #[serde(default)]
+    pub allow_mixed_skus: bool,
     pub actor_id: String,
 }
 
@@ -88,6 +93,8 @@ pub struct ShipOutboundRequest {
     pub barcodes: Vec<String>,
     pub shipped_at: String,
     pub actor_id: String,
+    #[serde(default)]
+    pub warranty: Option<WarrantyInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +370,18 @@ impl OfflineDatabase {
             ));
         }
 
+        if request.allow_mixed_skus && request.barcodes.is_empty() {
+            return Err(OutboundError::Invalid(
+                "mixed SKU allocation requires scanned barcodes".to_owned(),
+            ));
+        }
+        if request.allow_mixed_skus && allocated != 0 {
+            return Err(OutboundError::Conflict(
+                "mixed SKU allocation can only be performed once before any units are allocated"
+                    .to_owned(),
+            ));
+        }
+
         let candidates = if request.barcodes.is_empty() {
             sqlx::query(
                 "SELECT id, barcode, owner_party_id, sku_id, inbound_receipt_line_id, location_id, version, received_at, quality_status FROM inventory_units WHERE workspace_id = ?1 AND sku_id = ?2 AND inventory_status = 'available' AND quality_status IN ('passed', 'waived') ORDER BY received_at, id LIMIT ?3",
@@ -401,10 +420,85 @@ impl OfflineDatabase {
                 remaining
             )));
         }
+        if request.allow_mixed_skus && candidates.len() as i64 != required {
+            return Err(OutboundError::Conflict(format!(
+                "scanned {} units but the order requires {}",
+                candidates.len(),
+                required
+            )));
+        }
 
         let mut seen = HashSet::new();
-        let mut allocation_items = Vec::with_capacity(candidates.len());
-        for row in candidates {
+        let mut candidate_plans: Vec<(sqlx::sqlite::SqliteRow, String, String, i64)> =
+            Vec::with_capacity(candidates.len());
+        let mut line_requirements: HashMap<String, i64> = HashMap::new();
+        let mut line_allocated: HashMap<String, i64> = HashMap::new();
+        if request.allow_mixed_skus {
+            let mut groups: Vec<(String, Vec<sqlx::sqlite::SqliteRow>)> = Vec::new();
+            for row in candidates {
+                let candidate_sku: String = row.try_get("sku_id").map_err(row_error)?;
+                if let Some((_, group_rows)) = groups
+                    .iter_mut()
+                    .find(|(group_sku, _)| group_sku == &candidate_sku)
+                {
+                    group_rows.push(row);
+                } else {
+                    groups.push((candidate_sku, vec![row]));
+                }
+            }
+            for (index, (group_sku, group_rows)) in groups.into_iter().enumerate() {
+                let line_id = if index == 0 {
+                    request.order_line_id.clone()
+                } else {
+                    new_id()
+                };
+                let group_required = group_rows.len() as i64;
+                if index == 0 {
+                    sqlx::query(
+                        "UPDATE outbound_order_lines SET sku_id = ?1, required_quantity = ?2, allocated_quantity = 0, shipped_quantity = 0, delivered_quantity = 0 WHERE workspace_id = ?3 AND id = ?4 AND allocated_quantity = 0",
+                    )
+                    .bind(&group_sku)
+                    .bind(group_required)
+                    .bind(&workspace_id)
+                    .bind(&line_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| storage("convert scanned SKU order line", error))?;
+                } else {
+                    sqlx::query(
+                        "INSERT INTO outbound_order_lines (id, workspace_id, outbound_order_id, sku_id, required_quantity, allocated_quantity, shipped_quantity, delivered_quantity, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6)",
+                    )
+                    .bind(&line_id)
+                    .bind(&workspace_id)
+                    .bind(&request.order_id)
+                    .bind(&group_sku)
+                    .bind(group_required)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| storage("insert scanned SKU order line", error))?;
+                }
+                line_requirements.insert(line_id.clone(), group_required);
+                line_allocated.insert(line_id.clone(), 0);
+                for row in group_rows {
+                    candidate_plans.push((row, line_id.clone(), group_sku.clone(), group_required));
+                }
+            }
+        } else {
+            line_requirements.insert(request.order_line_id.clone(), required);
+            line_allocated.insert(request.order_line_id.clone(), allocated);
+            for row in candidates {
+                candidate_plans.push((
+                    row,
+                    request.order_line_id.clone(),
+                    sku_id.clone(),
+                    required,
+                ));
+            }
+        }
+
+        let mut allocation_items = Vec::with_capacity(candidate_plans.len());
+        for (row, line_id, line_sku_id, line_required) in candidate_plans {
             let unit_id: String = row.try_get("id").map_err(row_error)?;
             let barcode: String = row.try_get("barcode").map_err(row_error)?;
             if !seen.insert(barcode.clone()) {
@@ -439,18 +533,20 @@ impl OfflineDatabase {
                 version: u64::try_from(version)
                     .map_err(|_| OutboundError::Storage("invalid inventory version".to_owned()))?,
             };
-            unit.ensure_allocation_eligible(&sku_id)?;
+            unit.ensure_allocation_eligible(&candidate_sku)?;
             let allocation_id = new_id();
             let mut order_line = OutboundOrderLine::new(
-                request.order_line_id.clone(),
+                line_id.clone(),
                 request.order_id.clone(),
-                sku_id.clone(),
-                u32::try_from(required)
+                line_sku_id.clone(),
+                u32::try_from(line_required)
                     .map_err(|_| OutboundError::Storage("invalid required quantity".to_owned()))?,
             )?;
-            order_line.allocated_quantity =
-                u32::try_from(allocated + allocation_items.len() as i64)
-                    .map_err(|_| OutboundError::Storage("invalid allocated quantity".to_owned()))?;
+            let current_line_allocated = *line_allocated.get(&line_id).ok_or_else(|| {
+                OutboundError::Storage("missing outbound line allocation state".to_owned())
+            })?;
+            order_line.allocated_quantity = u32::try_from(current_line_allocated)
+                .map_err(|_| OutboundError::Storage("invalid allocated quantity".to_owned()))?;
             let mut unit_for_domain = unit.clone();
             let _allocation = order_line.allocate_unit(
                 &mut unit_for_domain,
@@ -478,7 +574,7 @@ impl OfflineDatabase {
             )
             .bind(&allocation_id)
             .bind(&workspace_id)
-            .bind(&request.order_line_id)
+            .bind(&line_id)
             .bind(&unit_id)
             .bind(&request.actor_id)
             .bind(&now)
@@ -493,7 +589,7 @@ impl OfflineDatabase {
             .bind(&unit_id)
             .bind(&unit.location_id)
             .bind(self.shipping_location_id())
-            .bind(&request.order_line_id)
+            .bind(&line_id)
             .bind(&request.actor_id)
             .bind(&now)
             .bind(&now)
@@ -506,16 +602,33 @@ impl OfflineDatabase {
                 owner_party_id,
                 sku_id: candidate_sku,
             });
+            line_allocated.insert(line_id, current_line_allocated + 1);
         }
-        let new_allocated = allocated + allocation_items.len() as i64;
-        sqlx::query("UPDATE outbound_order_lines SET allocated_quantity = ?1 WHERE workspace_id = ?2 AND id = ?3")
-            .bind(new_allocated)
-            .bind(&workspace_id)
-            .bind(&request.order_line_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| storage("update allocated quantity", error))?;
-        let order_status = if new_allocated >= required {
+        for (line_id, allocated_quantity) in &line_allocated {
+            let required_quantity = line_requirements.get(line_id).copied().ok_or_else(|| {
+                OutboundError::Storage("missing outbound line requirement".to_owned())
+            })?;
+            sqlx::query("UPDATE outbound_order_lines SET allocated_quantity = ?1 WHERE workspace_id = ?2 AND id = ?3 AND ?1 <= required_quantity")
+                .bind(*allocated_quantity)
+                .bind(&workspace_id)
+                .bind(line_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| storage("update allocated quantity", error))?;
+            if *allocated_quantity > required_quantity {
+                return Err(OutboundError::Conflict(
+                    "allocation exceeds order line quantity".to_owned(),
+                ));
+            }
+        }
+        let order_status = if request.allow_mixed_skus {
+            "allocated"
+        } else if line_allocated
+            .get(&request.order_line_id)
+            .copied()
+            .unwrap_or_default()
+            >= required
+        {
             "allocated"
         } else {
             "partially_allocated"
@@ -543,7 +656,7 @@ impl OfflineDatabase {
             "outbound_order",
             &request.order_id,
             &request.request_id,
-            json!({"order_line_id": request.order_line_id, "allocated_count": response.allocated_count}),
+            json!({"order_line_id": request.order_line_id, "allocated_count": response.allocated_count, "allow_mixed_skus": request.allow_mixed_skus}),
             &now,
         )
         .await?;
@@ -567,6 +680,8 @@ impl OfflineDatabase {
     ) -> OutboundResult<ShipOutboundResponse> {
         let request = normalize_ship(request)?;
         let digest = request_digest(&request)?;
+        let warranty = resolve_warranty(request.warranty.clone(), &request.shipped_at)
+            .map_err(OutboundError::Invalid)?;
         let workspace_id = self.workspace_id().to_owned();
         let now = now_utc().map_err(OutboundError::Storage)?;
         let mut tx = begin_write(self, &workspace_id).await?;
@@ -590,9 +705,13 @@ impl OfflineDatabase {
             ));
         }
         let shipment_id = new_id();
-        sqlx::query("INSERT INTO outbound_shipments (id, workspace_id, shipment_no, outbound_order_id, status, shipped_at, actor_id, idempotency_key, request_id, created_at) VALUES (?1, ?2, ?3, ?4, 'posted', ?5, ?6, ?7, ?8, ?9)")
+        sqlx::query("INSERT INTO outbound_shipments (id, workspace_id, shipment_no, outbound_order_id, status, shipped_at, actor_id, idempotency_key, request_id, created_at, warranty_duration_days, warranty_label_snapshot, warranty_started_at, warranty_expires_at) VALUES (?1, ?2, ?3, ?4, 'posted', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)")
             .bind(&shipment_id).bind(&workspace_id).bind(&request.shipment_no).bind(&request.order_id)
             .bind(&request.shipped_at).bind(&request.actor_id).bind(&request.idempotency_key).bind(&request.request_id).bind(&now)
+            .bind(warranty.as_ref().map(|terms| i64::from(terms.duration_days)))
+            .bind(warranty.as_ref().map(|terms| terms.label_snapshot.as_str()))
+            .bind(warranty.as_ref().map(|terms| terms.starts_at.as_str()))
+            .bind(warranty.as_ref().map(|terms| terms.expires_at.as_str()))
             .execute(&mut *tx).await.map_err(|error| unique_or_storage("insert outbound shipment", error))?;
         let mut items = Vec::with_capacity(allocation_rows.len());
         let mut shipped_by_line: HashMap<String, i64> = HashMap::new();
@@ -1397,21 +1516,160 @@ mod tests {
     use crate::v2::domain::{InspectionKind, QualityOutcome};
     use serde_json::json;
 
-    fn receipt(request_id: &str, key: &str, owner: &str, barcode: &str) -> PostReceiptRequest {
+    fn receipt_with_sku(
+        request_id: &str,
+        key: &str,
+        owner: &str,
+        barcode: &str,
+        sku_code: &str,
+        sku_name: &str,
+    ) -> PostReceiptRequest {
         PostReceiptRequest {
             request_id: request_id.to_owned(),
             idempotency_key: key.to_owned(),
             receipt_no: format!("R-{request_id}"),
             owner_name: owner.to_owned(),
             supplier_name: "Supplier X".to_owned(),
-            sku_code: "SKU-X".to_owned(),
-            sku_name: "Model X".to_owned(),
+            sku_code: sku_code.to_owned(),
+            sku_name: sku_name.to_owned(),
             source_reference: None,
             received_at: "2026-08-01T01:00:00Z".to_owned(),
             actor_id: "actor".to_owned(),
             barcodes: vec![barcode.to_owned()],
             notes: None,
+            warranty: None,
         }
+    }
+
+    fn receipt(request_id: &str, key: &str, owner: &str, barcode: &str) -> PostReceiptRequest {
+        receipt_with_sku(request_id, key, owner, barcode, "SKU-X", "Model X")
+    }
+
+    #[tokio::test]
+    async fn scan_first_allocation_groups_mixed_skus_into_one_order() {
+        let path = std::env::temp_dir().join(format!(
+            "inventory-mixed-outbound-test-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        let database = OfflineDatabase::open(&path).await.expect("open database");
+        for (code, name) in [("SKU-X", "Model X"), ("SKU-Y", "Model Y")] {
+            database
+                .create_catalog_product(CreateCatalogProductRequest {
+                    code: code.to_owned(),
+                    name: name.to_owned(),
+                    serial_prefix: None,
+                    serial_forbidden_chars: String::new(),
+                })
+                .await
+                .expect("create mixed outbound product");
+        }
+        database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: "Owner".to_owned(),
+                role: CatalogPartyRole::GoodsOwner,
+            })
+            .await
+            .expect("create mixed outbound owner");
+        database
+            .create_catalog_party(CreateCatalogPartyRequest {
+                display_name: "Supplier X".to_owned(),
+                role: CatalogPartyRole::Supplier,
+            })
+            .await
+            .expect("create mixed outbound supplier");
+        for (request_id, key, barcode, sku_code, sku_name) in [
+            ("x", "receipt-x", "X-1", "SKU-X", "Model X"),
+            ("y", "receipt-y", "Y-1", "SKU-Y", "Model Y"),
+        ] {
+            database
+                .post_receipt(receipt_with_sku(
+                    request_id, key, "Owner", barcode, sku_code, sku_name,
+                ))
+                .await
+                .expect("mixed outbound receipt");
+            database
+                .complete_inspection(CompleteInspectionRequest {
+                    request_id: format!("inspection-{request_id}"),
+                    idempotency_key: format!("inspection-key-{request_id}"),
+                    inspection_no: format!("Q-{request_id}"),
+                    inspection_kind: InspectionKind::Initial,
+                    inspector_id: "qc".to_owned(),
+                    inspected_at: "2026-08-01T01:01:00Z".to_owned(),
+                    results: vec![InspectionResultInput {
+                        barcode: barcode.to_owned(),
+                        outcome: QualityOutcome::Passed,
+                        quality_label_id: None,
+                        defect_code: None,
+                        measurements: json!({}),
+                        notes: None,
+                    }],
+                })
+                .await
+                .expect("mixed outbound inspection");
+        }
+        let order = database
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "mixed-order".to_owned(),
+                idempotency_key: "mixed-order-key".to_owned(),
+                order_no: "MIXED-1".to_owned(),
+                upstream_receiver_name: "Upstream Mixed".to_owned(),
+                sku_code: "SKU-X".to_owned(),
+                sku_name: "Model X".to_owned(),
+                required_quantity: 2,
+                required_at: None,
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("create mixed order");
+        let catalog = database
+            .list_reference_catalog()
+            .await
+            .expect("load catalog after creating upstream receiver");
+        assert!(catalog.parties.iter().any(|party| {
+            party.display_name == "Upstream Mixed"
+                && party.roles.contains(&CatalogPartyRole::UpstreamReceiver)
+        }));
+        let allocation = database
+            .allocate_outbound_order(AllocateOutboundRequest {
+                request_id: "mixed-allocation".to_owned(),
+                idempotency_key: "mixed-allocation-key".to_owned(),
+                order_id: order.order_id.clone(),
+                order_line_id: order.order_line_id.clone(),
+                barcodes: vec!["X-1".to_owned(), "Y-1".to_owned()],
+                allow_mixed_skus: true,
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("allocate mixed order");
+        assert_eq!(allocation.allocated_count, 2);
+        let details = database
+            .outbound_order_details(&order.order_id)
+            .await
+            .expect("load mixed order details");
+        assert_eq!(details.lines.len(), 2);
+        assert!(details
+            .lines
+            .iter()
+            .all(|line| line.required_quantity == 1 && line.allocated_quantity == 1));
+        assert!(details.lines.iter().any(|line| line.sku_code == "SKU-X"));
+        assert!(details.lines.iter().any(|line| line.sku_code == "SKU-Y"));
+
+        let shipment = database
+            .ship_outbound_order(ShipOutboundRequest {
+                request_id: "mixed-shipment".to_owned(),
+                idempotency_key: "mixed-shipment-key".to_owned(),
+                order_id: order.order_id,
+                shipment_no: "MIXED-S-1".to_owned(),
+                allocation_ids: Vec::new(),
+                barcodes: vec!["X-1".to_owned(), "Y-1".to_owned()],
+                shipped_at: "2026-08-01T01:02:00Z".to_owned(),
+                actor_id: "operator".to_owned(),
+                warranty: None,
+            })
+            .await
+            .expect("ship mixed order");
+        assert_eq!(shipment.shipped_count, 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1466,6 +1724,7 @@ mod tests {
                     results: vec![InspectionResultInput {
                         barcode: barcode.to_owned(),
                         outcome: QualityOutcome::Passed,
+                        quality_label_id: None,
                         defect_code: None,
                         measurements: json!({}),
                         notes: None,
@@ -1495,6 +1754,7 @@ mod tests {
                 order_id: order.order_id.clone(),
                 order_line_id: order.order_line_id.clone(),
                 barcodes: Vec::new(),
+                allow_mixed_skus: false,
                 actor_id: "operator".to_owned(),
             })
             .await
@@ -1523,6 +1783,7 @@ mod tests {
                 barcodes: Vec::new(),
                 shipped_at: "2026-08-01T01:02:00Z".to_owned(),
                 actor_id: "operator".to_owned(),
+                warranty: None,
             })
             .await
             .expect("ship");
@@ -1597,6 +1858,7 @@ mod tests {
                 results: vec![InspectionResultInput {
                     barcode: shipment.items[0].barcode.clone(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: json!({}),
                     notes: Some("return retest passed".to_owned()),
@@ -1625,6 +1887,7 @@ mod tests {
                 order_id: second_order.order_id.clone(),
                 order_line_id: second_order.order_line_id.clone(),
                 barcodes: vec![shipment.items[0].barcode.clone()],
+                allow_mixed_skus: false,
                 actor_id: "operator".to_owned(),
             })
             .await
@@ -1639,6 +1902,7 @@ mod tests {
                 barcodes: Vec::new(),
                 shipped_at: "2026-08-01T01:06:00Z".to_owned(),
                 actor_id: "operator".to_owned(),
+                warranty: None,
             })
             .await
             .expect("ship returned unit again");

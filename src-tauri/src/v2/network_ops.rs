@@ -20,6 +20,7 @@ use super::outbound::{
     AllocationItem, ConfirmOutboundDeliveryResponse, CreateOutboundOrderResponse,
     ReturnOutboundShipmentResponse, ShipOutboundResponse, ShipmentItem,
 };
+use super::warranty::{resolve_warranty, WarrantyInput};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -59,6 +60,8 @@ pub struct NetworkInspectionResultInput {
     pub barcode: String,
     pub outcome: QualityOutcome,
     #[serde(default)]
+    pub quality_label_id: Option<String>,
+    #[serde(default)]
     pub defect_code: Option<String>,
     #[serde(default = "empty_json_object")]
     pub measurements: Value,
@@ -87,6 +90,10 @@ pub struct NetworkAllocateOutboundRequest {
     /// Empty means FIFO. A non-empty list requests explicit barcodes.
     #[serde(default)]
     pub barcodes: Vec<String>,
+    /// A scan-first order may contain several SKUs. The selected units are
+    /// grouped into order lines by their actual inventory SKU in this mode.
+    #[serde(default)]
+    pub allow_mixed_skus: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +107,8 @@ pub struct NetworkShipOutboundRequest {
     #[serde(default)]
     pub barcodes: Vec<String>,
     pub shipped_at: String,
+    #[serde(default)]
+    pub warranty: Option<WarrantyInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +199,55 @@ impl NetworkService {
                     key: result.barcode.clone(),
                 });
             }
+            let (quality_label_id, quality_label_snapshot) =
+                if let Some(quality_label_id) = &result.quality_label_id {
+                    let quality_label_id = Uuid::parse_str(quality_label_id).map_err(|_| {
+                        NetworkServiceError::Invalid("quality_label_id must be a UUID".to_owned())
+                    })?;
+                    let label = sqlx::query(
+                        r#"
+                        SELECT name, disposition, active
+                          FROM quality_labels
+                         WHERE tenant_id = $1 AND id = $2
+                         FOR SHARE
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(quality_label_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                    .ok_or_else(|| NetworkServiceError::Conflict {
+                        entity: "quality_label".to_owned(),
+                        key: quality_label_id.to_string(),
+                    })?;
+                    let name: String = label.try_get("name")?;
+                    let disposition: String = label.try_get("disposition")?;
+                    let active: bool = label.try_get("active")?;
+                    if !active {
+                        return Err(NetworkServiceError::Conflict {
+                            entity: "quality_label_inactive".to_owned(),
+                            key: name,
+                        });
+                    }
+                    let expected_outcome = match disposition.as_str() {
+                        "available" => QualityOutcome::Passed,
+                        "quarantine" => QualityOutcome::Failed,
+                        other => {
+                            return Err(NetworkServiceError::Invalid(format!(
+                                "unknown quality label disposition {other}"
+                            )))
+                        }
+                    };
+                    if expected_outcome != result.outcome {
+                        return Err(NetworkServiceError::Conflict {
+                            entity: "quality_label_disposition".to_owned(),
+                            key: name,
+                        });
+                    }
+                    (Some(quality_label_id), Some(name))
+                } else {
+                    (None, None)
+                };
             let row = sqlx::query(
                 r#"
                 SELECT id, barcode, location_id, inventory_status, quality_status, version
@@ -224,6 +282,8 @@ impl NetworkService {
                 old_location: row.try_get("location_id")?,
                 old_version: row.try_get("version")?,
                 result: result.clone(),
+                quality_label_id,
+                quality_label_snapshot,
             });
         }
 
@@ -262,8 +322,9 @@ impl NetworkService {
                 r#"
                 INSERT INTO quality_inspection_results
                     (tenant_id, id, inspection_id, inventory_unit_id, result,
-                     defect_code, measurements_json, notes)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+                     quality_label_id, quality_label_snapshot, defect_code,
+                     measurements_json, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
                 "#,
             )
             .bind(tenant_id)
@@ -271,6 +332,8 @@ impl NetworkService {
             .bind(inspection_id)
             .bind(row.id)
             .bind(outcome_name)
+            .bind(row.quality_label_id)
+            .bind(&row.quality_label_snapshot)
             .bind(&result.defect_code)
             .bind(measurements_json)
             .bind(&result.notes)
@@ -576,6 +639,17 @@ impl NetworkService {
                 key: "fully_allocated".to_owned(),
             });
         }
+        if request.allow_mixed_skus && request.barcodes.is_empty() {
+            return Err(NetworkServiceError::Invalid(
+                "mixed SKU allocation requires scanned barcodes".to_owned(),
+            ));
+        }
+        if request.allow_mixed_skus && allocated != 0 {
+            return Err(NetworkServiceError::Conflict {
+                entity: "outbound_order_line".to_owned(),
+                key: "mixed_allocation_already_started".to_owned(),
+            });
+        }
         let shipping_location = location_for_kind(transaction, tenant_id, "shipping").await?;
         let candidates = load_allocation_candidates(
             transaction,
@@ -597,16 +671,108 @@ impl NetworkService {
                 key: "allocation_exceeds_requirement".to_owned(),
             });
         }
+        if request.allow_mixed_skus && candidates.len() as i64 != required {
+            return Err(NetworkServiceError::Conflict {
+                entity: "outbound_order_line".to_owned(),
+                key: format!("scanned_{}_required_{}", candidates.len(), required),
+            });
+        }
+
+        let mut candidate_plans: Vec<(AllocationCandidate, Uuid, Uuid, i64)> =
+            Vec::with_capacity(candidates.len());
+        let mut line_requirements: HashMap<Uuid, i64> = HashMap::new();
+        let mut line_allocated: HashMap<Uuid, i64> = HashMap::new();
+        if request.allow_mixed_skus {
+            let mut groups: Vec<(Uuid, Vec<AllocationCandidate>)> = Vec::new();
+            for candidate in candidates {
+                if let Some((_, group_candidates)) = groups
+                    .iter_mut()
+                    .find(|(group_sku, _)| *group_sku == candidate.sku_id)
+                {
+                    group_candidates.push(candidate);
+                } else {
+                    groups.push((candidate.sku_id, vec![candidate]));
+                }
+            }
+            for (index, (group_sku, group_candidates)) in groups.into_iter().enumerate() {
+                let line_id = if index == 0 {
+                    request.order_line_id
+                } else {
+                    Uuid::now_v7()
+                };
+                let group_required = i64::try_from(group_candidates.len()).map_err(|_| {
+                    NetworkServiceError::Invalid(
+                        "mixed SKU group exceeds supported quantity".to_owned(),
+                    )
+                })?;
+                if index == 0 {
+                    sqlx::query(
+                        r#"
+                        UPDATE outbound_order_lines
+                           SET sku_id = $1, required_quantity = $2,
+                               allocated_quantity = 0, shipped_quantity = 0,
+                               delivered_quantity = 0
+                         WHERE tenant_id = $3 AND id = $4
+                           AND allocated_quantity = 0
+                        "#,
+                    )
+                    .bind(group_sku)
+                    .bind(group_required as i32)
+                    .bind(tenant_id)
+                    .bind(line_id)
+                    .execute(&mut **transaction)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO outbound_order_lines
+                            (tenant_id, id, outbound_order_id, sku_id,
+                             required_quantity, allocated_quantity,
+                             shipped_quantity, delivered_quantity)
+                        VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(line_id)
+                    .bind(request.order_id)
+                    .bind(group_sku)
+                    .bind(group_required as i32)
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+                line_requirements.insert(line_id, group_required);
+                line_allocated.insert(line_id, 0);
+                for candidate in group_candidates {
+                    candidate_plans.push((candidate, line_id, group_sku, group_required));
+                }
+            }
+        } else {
+            line_requirements.insert(request.order_line_id, required);
+            line_allocated.insert(request.order_line_id, allocated);
+            for candidate in candidates {
+                candidate_plans.push((candidate, request.order_line_id, sku_id, required));
+            }
+        }
+
         let now = UtcNow::value();
-        let mut allocations = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            if candidate.sku_id != sku_id
+        let mut allocations = Vec::with_capacity(candidate_plans.len());
+        for (candidate, line_id, line_sku_id, line_required) in candidate_plans {
+            if (!request.allow_mixed_skus && candidate.sku_id != sku_id)
                 || candidate.inventory_status != "available"
                 || !matches!(candidate.quality_status.as_str(), "passed" | "waived")
             {
                 return Err(NetworkServiceError::Conflict {
                     entity: "inventory_barcode".to_owned(),
                     key: candidate.barcode,
+                });
+            }
+            let current_line_allocated = *line_allocated.get(&line_id).ok_or_else(|| {
+                NetworkServiceError::Invalid("missing outbound line allocation state".to_owned())
+            })?;
+            if current_line_allocated + 1 > line_required {
+                return Err(NetworkServiceError::Conflict {
+                    entity: "outbound_order_line".to_owned(),
+                    key: "allocation_exceeds_requirement".to_owned(),
                 });
             }
             let allocation_id = Uuid::now_v7();
@@ -642,9 +808,9 @@ impl NetworkService {
             )
             .bind(tenant_id)
             .bind(allocation_id)
-            .bind(request.order_line_id)
+            .bind(line_id)
             .bind(candidate.id)
-            .bind(sku_id)
+            .bind(line_sku_id)
             .bind(actor_id)
             .bind(&now)
             .execute(&mut **transaction)
@@ -658,7 +824,7 @@ impl NetworkService {
                 Some(candidate.location_id),
                 Some(shipping_location),
                 "outbound_order_line",
-                request.order_line_id,
+                line_id,
                 actor_id,
                 &now,
             )
@@ -669,17 +835,35 @@ impl NetworkService {
                 owner_party_id: candidate.owner_party_id.to_string(),
                 sku_id: candidate.sku_id.to_string(),
             });
+            line_allocated.insert(line_id, current_line_allocated + 1);
         }
-        let new_allocated = allocated + allocations.len() as i64;
-        sqlx::query(
-            "UPDATE outbound_order_lines SET allocated_quantity = $1 WHERE tenant_id = $2 AND id = $3",
-        )
-        .bind(new_allocated as i32)
-        .bind(tenant_id)
-        .bind(request.order_line_id)
-        .execute(&mut **transaction)
-        .await?;
-        let status = if new_allocated >= required {
+        for (line_id, allocated_quantity) in &line_allocated {
+            let required_quantity = line_requirements.get(line_id).copied().ok_or_else(|| {
+                NetworkServiceError::Invalid("missing outbound line requirement".to_owned())
+            })?;
+            sqlx::query(
+                "UPDATE outbound_order_lines SET allocated_quantity = $1 WHERE tenant_id = $2 AND id = $3 AND $1 <= required_quantity",
+            )
+            .bind(*allocated_quantity as i32)
+            .bind(tenant_id)
+            .bind(*line_id)
+            .execute(&mut **transaction)
+            .await?;
+            if *allocated_quantity > required_quantity {
+                return Err(NetworkServiceError::Conflict {
+                    entity: "outbound_order_line".to_owned(),
+                    key: "allocation_exceeds_requirement".to_owned(),
+                });
+            }
+        }
+        let status = if request.allow_mixed_skus {
+            "allocated"
+        } else if line_allocated
+            .get(&request.order_line_id)
+            .copied()
+            .unwrap_or_default()
+            >= required
+        {
             "allocated"
         } else {
             "partially_allocated"
@@ -708,7 +892,7 @@ impl NetworkService {
             "outbound_order.allocated",
             request.order_id,
             &request.request_id,
-            json!({"order_line_id": request.order_line_id, "allocated_count": response.allocated_count}),
+            json!({"order_line_id": request.order_line_id, "allocated_count": response.allocated_count, "allow_mixed_skus": request.allow_mixed_skus}),
             &now,
         )
         .await?;
@@ -732,6 +916,8 @@ impl NetworkService {
     ) -> NetworkResult<ShipOutboundResponse> {
         let request = normalize_ship(request)?;
         let digest = request_digest(&request)?;
+        let warranty = resolve_warranty(request.warranty.clone(), &request.shipped_at)
+            .map_err(NetworkServiceError::Invalid)?;
         let mut authorized = self
             .database()
             .begin_authorized_request(tenant_id, session_token, PERMISSION_SHIPMENT_WRITE)
@@ -768,8 +954,11 @@ impl NetworkService {
             r#"
             INSERT INTO outbound_shipments
                 (tenant_id, id, shipment_no, outbound_order_id, status,
-                 shipped_at, actor_id, idempotency_key, request_id)
-            VALUES ($1, $2, $3, $4, 'posted', $5::timestamptz, $6, $7, $8)
+                 shipped_at, actor_id, idempotency_key, request_id,
+                 warranty_duration_days, warranty_label_snapshot,
+                 warranty_started_at, warranty_expires_at)
+            VALUES ($1, $2, $3, $4, 'posted', $5::timestamptz, $6, $7, $8,
+                    $9, $10, $11::timestamptz, $12::timestamptz)
             "#,
         )
         .bind(tenant_id)
@@ -780,6 +969,10 @@ impl NetworkService {
         .bind(actor_id)
         .bind(&request.idempotency_key)
         .bind(&request.request_id)
+        .bind(warranty.as_ref().map(|terms| terms.duration_days as i32))
+        .bind(warranty.as_ref().map(|terms| terms.label_snapshot.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.starts_at.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.expires_at.as_str()))
         .execute(&mut **transaction)
         .await
         .map_err(|error| conflict_or_sqlx("outbound_shipment", &request.shipment_no, error))?;
@@ -1316,6 +1509,8 @@ struct InspectionRow {
     old_location: Uuid,
     old_version: i64,
     result: NetworkInspectionResultInput,
+    quality_label_id: Option<Uuid>,
+    quality_label_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1448,6 +1643,12 @@ fn normalize_inspection(
     let mut seen = HashSet::with_capacity(request.results.len());
     for result in &mut request.results {
         result.barcode = required("barcode", std::mem::take(&mut result.barcode))?.to_uppercase();
+        result.quality_label_id = optional(result.quality_label_id.take());
+        if let Some(quality_label_id) = &result.quality_label_id {
+            Uuid::parse_str(quality_label_id).map_err(|_| {
+                NetworkServiceError::Invalid("quality_label_id must be a UUID".to_owned())
+            })?;
+        }
         result.defect_code = optional(result.defect_code.take());
         result.notes = optional(result.notes.take());
         if !result.measurements.is_object() {
@@ -2335,6 +2536,7 @@ mod tests {
                 NetworkInspectionResultInput {
                     barcode: "sn-1".to_owned(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: json!({}),
                     notes: None,
@@ -2342,6 +2544,7 @@ mod tests {
                 NetworkInspectionResultInput {
                     barcode: "SN-1".to_owned(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: json!({}),
                     notes: None,
@@ -2364,6 +2567,7 @@ mod tests {
             allocation_ids: Vec::new(),
             barcodes: Vec::new(),
             shipped_at: "2026-08-03T01:00:00Z".to_owned(),
+            warranty: None,
         })
         .expect_err("shipment must select allocations or serials");
         assert!(
@@ -2591,6 +2795,7 @@ mod tests {
                     received_at: "2026-08-03T01:00:00Z".to_owned(),
                     barcodes: vec![barcode.clone()],
                     notes: None,
+                    warranty: None,
                 },
             )
             .await
@@ -2604,6 +2809,7 @@ mod tests {
             results: vec![NetworkInspectionResultInput {
                 barcode: barcode.clone(),
                 outcome: QualityOutcome::Passed,
+                quality_label_id: None,
                 defect_code: None,
                 measurements: json!({"voltage": 1.2}),
                 notes: None,
@@ -2652,6 +2858,7 @@ mod tests {
                     order_id: order.order_id.parse().expect("order uuid"),
                     order_line_id: order.order_line_id.parse().expect("line uuid"),
                     barcodes: Vec::new(),
+                    allow_mixed_skus: false,
                 },
             )
             .await
@@ -2673,6 +2880,7 @@ mod tests {
                     allocation_ids: vec![allocation_id],
                     barcodes: Vec::new(),
                     shipped_at: "2026-08-03T03:00:00Z".to_owned(),
+                    warranty: None,
                 },
             )
             .await
@@ -2729,6 +2937,7 @@ mod tests {
                     results: vec![NetworkInspectionResultInput {
                         barcode: barcode.clone(),
                         outcome: QualityOutcome::Failed,
+                        quality_label_id: None,
                         defect_code: Some("returned-damaged".to_owned()),
                         measurements: json!({}),
                         notes: None,
@@ -2751,6 +2960,7 @@ mod tests {
                     results: vec![NetworkInspectionResultInput {
                         barcode: barcode.clone(),
                         outcome: QualityOutcome::Passed,
+                        quality_label_id: None,
                         defect_code: None,
                         measurements: json!({}),
                         notes: Some("retest passed".to_owned()),
@@ -2790,6 +3000,7 @@ mod tests {
                         .parse()
                         .expect("second line uuid"),
                     barcodes: vec![barcode.clone()],
+                    allow_mixed_skus: false,
                 },
             )
             .await
@@ -2810,6 +3021,7 @@ mod tests {
                         .expect("second allocation uuid")],
                     barcodes: Vec::new(),
                     shipped_at: "2026-08-03T08:00:00Z".to_owned(),
+                    warranty: None,
                 },
             )
             .await

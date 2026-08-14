@@ -3,6 +3,7 @@ use super::domain::{
     QualityStatus,
 };
 use super::sqlite::{now_utc, OfflineDatabase};
+use super::warranty::{resolve_warranty, WarrantyInput};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -60,6 +61,8 @@ pub struct PostReceiptRequest {
     pub actor_id: String,
     pub barcodes: Vec<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub warranty: Option<WarrantyInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +189,71 @@ pub struct SaveCatalogPartyRequest {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityLabelDisposition {
+    Available,
+    Quarantine,
+}
+
+impl QualityLabelDisposition {
+    pub(crate) fn database_value(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Quarantine => "quarantine",
+        }
+    }
+
+    pub(crate) fn outcome(self) -> QualityOutcome {
+        match self {
+            Self::Available => QualityOutcome::Passed,
+            Self::Quarantine => QualityOutcome::Failed,
+        }
+    }
+
+    pub(crate) fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "available" => Some(Self::Available),
+            "quarantine" => Some(Self::Quarantine),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityLabelNameHistory {
+    pub history_id: String,
+    pub old_name: String,
+    pub new_name: String,
+    pub changed_by: String,
+    pub change_note: Option<String>,
+    pub changed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityLabel {
+    pub quality_label_id: String,
+    pub name: String,
+    pub disposition: QualityLabelDisposition,
+    pub active: bool,
+    pub usage_count: u64,
+    pub name_history: Vec<QualityLabelNameHistory>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveQualityLabelRequest {
+    #[serde(default)]
+    pub quality_label_id: Option<String>,
+    pub name: String,
+    pub disposition: QualityLabelDisposition,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub rename_note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkuScanRules {
     id: String,
@@ -208,6 +276,8 @@ pub struct CompleteInspectionRequest {
 pub struct InspectionResultInput {
     pub barcode: String,
     pub outcome: QualityOutcome,
+    #[serde(default)]
+    pub quality_label_id: Option<String>,
     #[serde(default)]
     pub defect_code: Option<String>,
     #[serde(default = "empty_json_object")]
@@ -320,6 +390,8 @@ impl OfflineDatabase {
     ) -> ApplicationResult<PostReceiptResponse> {
         let request = normalize_receipt_request(request)?;
         let request_hash = request_hash(&request)?;
+        let warranty = resolve_warranty(request.warranty.clone(), &request.received_at)
+            .map_err(|message| validation("warranty", &message))?;
         let workspace_id = self.workspace_id();
         let now = application_now()?;
         let mut transaction = self
@@ -421,8 +493,10 @@ impl OfflineDatabase {
             INSERT INTO inbound_receipts (
                 id, workspace_id, receipt_no, owner_party_id, warehouse_id,
                 supplier_party_id, source_reference, received_at, status, actor_id,
-                idempotency_key, request_id, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'posted', ?9, ?10, ?11, ?12)
+                idempotency_key, request_id, created_at, warranty_duration_days,
+                warranty_label_snapshot, warranty_started_at, warranty_expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'posted', ?9, ?10, ?11, ?12,
+                      ?13, ?14, ?15, ?16)
             "#,
         )
         .bind(&receipt_id)
@@ -437,6 +511,14 @@ impl OfflineDatabase {
         .bind(&request.idempotency_key)
         .bind(&request.request_id)
         .bind(&now)
+        .bind(
+            warranty
+                .as_ref()
+                .map(|terms| i64::from(terms.duration_days)),
+        )
+        .bind(warranty.as_ref().map(|terms| terms.label_snapshot.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.starts_at.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.expires_at.as_str()))
         .execute(&mut *transaction)
         .await
         .map_err(|error| receipt_insert_error(&request.receipt_no, error))?;
@@ -608,6 +690,51 @@ impl OfflineDatabase {
 
         let mut validated = Vec::with_capacity(request.results.len());
         for result in &request.results {
+            let (quality_label_id, quality_label_snapshot) = if let Some(quality_label_id) =
+                &result.quality_label_id
+            {
+                let label = sqlx::query(
+                    r#"
+                        SELECT id, name, disposition, active, created_at, updated_at,
+                               (SELECT COUNT(*)
+                                  FROM quality_inspection_results result
+                                 WHERE result.workspace_id = label.workspace_id
+                                   AND result.quality_label_id = label.id) AS usage_count
+                          FROM quality_labels
+                          AS label
+                         WHERE workspace_id = ?1 AND id = ?2
+                        "#,
+                )
+                .bind(workspace_id)
+                .bind(quality_label_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| storage("load inspection quality label", error))?
+                .map(quality_label_from_sqlite_row)
+                .transpose()?
+                .ok_or_else(|| ApplicationError::NotFound {
+                    entity: "quality_label".to_owned(),
+                    key: quality_label_id.clone(),
+                })?;
+                if !label.active {
+                    return Err(ApplicationError::Conflict {
+                        entity: "quality_label".to_owned(),
+                        key: label.name,
+                        message: "quality label is inactive".to_owned(),
+                    });
+                }
+                if label.disposition.outcome() != result.outcome {
+                    return Err(ApplicationError::Conflict {
+                        entity: "quality_label_disposition".to_owned(),
+                        key: label.name,
+                        message: "quality label does not match the requested inventory handling"
+                            .to_owned(),
+                    });
+                }
+                (Some(label.quality_label_id), Some(label.name))
+            } else {
+                (None, None)
+            };
             let mut unit = load_inventory_unit(&mut transaction, workspace_id, &result.barcode)
                 .await?
                 .ok_or_else(|| ApplicationError::NotFound {
@@ -638,6 +765,8 @@ impl OfflineDatabase {
                 unit,
                 previous_location_id,
                 previous_version,
+                quality_label_id,
+                quality_label_snapshot,
             });
         }
 
@@ -673,8 +802,9 @@ impl OfflineDatabase {
                 r#"
                 INSERT INTO quality_inspection_results (
                     id, workspace_id, inspection_id, inventory_unit_id, result,
-                    defect_code, measurements_json, notes, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    quality_label_id, quality_label_snapshot, defect_code,
+                    measurements_json, notes, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
             )
             .bind(result_id)
@@ -682,6 +812,8 @@ impl OfflineDatabase {
             .bind(&inspection_id)
             .bind(&validated_result.unit.id)
             .bind(quality_outcome_name(validated_result.input.outcome))
+            .bind(&validated_result.quality_label_id)
+            .bind(&validated_result.quality_label_snapshot)
             .bind(clean_optional(validated_result.input.defect_code))
             .bind(measurements_json)
             .bind(clean_optional(validated_result.input.notes))
@@ -939,6 +1071,252 @@ impl OfflineDatabase {
             goods_owners,
             suppliers,
         })
+    }
+
+    pub async fn list_quality_labels(&self) -> ApplicationResult<Vec<QualityLabel>> {
+        let mut labels = sqlx::query(
+            r#"
+            SELECT label.id, label.name, label.disposition, label.active,
+                   label.created_at, label.updated_at,
+                   (SELECT COUNT(*)
+                      FROM quality_inspection_results result
+                     WHERE result.workspace_id = label.workspace_id
+                       AND result.quality_label_id = label.id) AS usage_count
+              FROM quality_labels label
+             WHERE label.workspace_id = ?1
+             ORDER BY label.active DESC, label.disposition, label.name, label.id
+            "#,
+        )
+        .bind(self.workspace_id())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("list quality labels", error))?
+        .into_iter()
+        .map(quality_label_from_sqlite_row)
+        .collect::<ApplicationResult<Vec<_>>>()?;
+        let history_rows = sqlx::query(
+            r#"
+            SELECT id, quality_label_id, old_name, new_name,
+                   changed_by_snapshot, change_note, changed_at
+              FROM quality_label_name_history
+             WHERE workspace_id = ?1
+             ORDER BY changed_at DESC, id DESC
+            "#,
+        )
+        .bind(self.workspace_id())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("list quality label name history", error))?;
+        let mut history_by_label: HashMap<String, Vec<QualityLabelNameHistory>> = HashMap::new();
+        for row in history_rows {
+            let quality_label_id: String = row
+                .try_get("quality_label_id")
+                .map_err(|error| storage("read quality label history label id", error))?;
+            history_by_label
+                .entry(quality_label_id)
+                .or_default()
+                .push(quality_label_name_history_from_sqlite_row(row)?);
+        }
+        for label in &mut labels {
+            label.name_history = history_by_label
+                .remove(&label.quality_label_id)
+                .unwrap_or_default();
+        }
+        Ok(labels)
+    }
+
+    pub async fn save_quality_label(
+        &self,
+        input: SaveQualityLabelRequest,
+    ) -> ApplicationResult<QualityLabel> {
+        let input = normalize_quality_label(input)?;
+        let workspace_id = self.workspace_id();
+        let now = application_now()?;
+        let normalized_name = input.name.to_lowercase();
+        let mut transaction = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| storage("begin quality label transaction", error))?;
+        ensure_workspace_writable(&mut transaction, workspace_id).await?;
+
+        let updating = input.quality_label_id.is_some();
+        let mut previous_label: Option<(String, QualityLabelDisposition, u64)> = None;
+        let quality_label_id = if let Some(quality_label_id) = input.quality_label_id.clone() {
+            let current = sqlx::query(
+                r#"
+                SELECT label.name, label.disposition,
+                       (SELECT COUNT(*)
+                          FROM quality_inspection_results result
+                         WHERE result.workspace_id = label.workspace_id
+                           AND result.quality_label_id = label.id) AS usage_count
+                  FROM quality_labels label
+                 WHERE label.workspace_id = ?1 AND label.id = ?2
+                "#,
+            )
+            .bind(workspace_id)
+            .bind(&quality_label_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| storage("find quality label for update", error))?;
+            let current = current.ok_or_else(|| ApplicationError::NotFound {
+                entity: "quality_label".to_owned(),
+                key: quality_label_id.clone(),
+            })?;
+            let current_name: String = current
+                .try_get("name")
+                .map_err(|error| storage("read current quality label name", error))?;
+            let current_disposition_value: String = current
+                .try_get("disposition")
+                .map_err(|error| storage("read current quality label disposition", error))?;
+            let current_disposition =
+                QualityLabelDisposition::from_database_value(&current_disposition_value)
+                    .ok_or_else(|| {
+                        storage(
+                            "read current quality label disposition",
+                            format!("unknown value {current_disposition_value}"),
+                        )
+                    })?;
+            let usage_count = u64::try_from(
+                current
+                    .try_get::<i64, _>("usage_count")
+                    .map_err(|error| storage("read quality label usage count", error))?,
+            )
+            .map_err(|error| storage("read quality label usage count", error))?;
+            if usage_count > 0 && current_disposition != input.disposition {
+                return Err(ApplicationError::Conflict {
+                    entity: "quality_label_disposition".to_owned(),
+                    key: current_name,
+                    message: "a used quality label cannot change inventory handling; create a new label instead"
+                        .to_owned(),
+                });
+            }
+            previous_label = Some((current_name, current_disposition, usage_count));
+            quality_label_id
+        } else {
+            new_id()
+        };
+
+        let conflicting_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM quality_labels WHERE workspace_id = ?1 AND normalized_name = ?2 AND id <> ?3",
+        )
+        .bind(workspace_id)
+        .bind(&normalized_name)
+        .bind(&quality_label_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| storage("check quality label name", error))?;
+        if conflicting_id.is_some() {
+            return Err(ApplicationError::Conflict {
+                entity: "quality_label".to_owned(),
+                key: input.name,
+                message: "quality label name already exists in this workspace".to_owned(),
+            });
+        }
+
+        if updating {
+            sqlx::query(
+                r#"
+                UPDATE quality_labels
+                   SET name = ?1, normalized_name = ?2, disposition = ?3,
+                       active = ?4, updated_at = ?5
+                 WHERE workspace_id = ?6 AND id = ?7
+                "#,
+            )
+            .bind(&input.name)
+            .bind(&normalized_name)
+            .bind(input.disposition.database_value())
+            .bind(i64::from(input.active))
+            .bind(&now)
+            .bind(workspace_id)
+            .bind(&quality_label_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| storage("update quality label", error))?;
+            if let Some((old_name, _, _)) = &previous_label {
+                if old_name != &input.name {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO quality_label_name_history (
+                            id, workspace_id, quality_label_id, old_name, new_name,
+                            changed_by, changed_by_snapshot, change_note, changed_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, 'local', '本机操作', ?6, ?7)
+                        "#,
+                    )
+                    .bind(new_id())
+                    .bind(workspace_id)
+                    .bind(&quality_label_id)
+                    .bind(old_name)
+                    .bind(&input.name)
+                    .bind(&input.rename_note)
+                    .bind(&now)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| storage("record quality label name history", error))?;
+                }
+            }
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO quality_labels (
+                    id, workspace_id, name, normalized_name, disposition, active,
+                    created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                "#,
+            )
+            .bind(&quality_label_id)
+            .bind(workspace_id)
+            .bind(&input.name)
+            .bind(&normalized_name)
+            .bind(input.disposition.database_value())
+            .bind(i64::from(input.active))
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| storage("create quality label", error))?;
+        }
+
+        let label = sqlx::query(
+            r#"
+            SELECT label.id, label.name, label.disposition, label.active,
+                   label.created_at, label.updated_at,
+                   (SELECT COUNT(*)
+                      FROM quality_inspection_results result
+                     WHERE result.workspace_id = label.workspace_id
+                       AND result.quality_label_id = label.id) AS usage_count
+              FROM quality_labels label
+             WHERE label.workspace_id = ?1 AND label.id = ?2
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(&quality_label_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| storage("load saved quality label", error))
+        .and_then(quality_label_from_sqlite_row)?;
+        let mut label = label;
+        label.name_history = sqlx::query(
+            r#"
+            SELECT id, quality_label_id, old_name, new_name,
+                   changed_by_snapshot, change_note, changed_at
+              FROM quality_label_name_history
+             WHERE workspace_id = ?1 AND quality_label_id = ?2
+             ORDER BY changed_at DESC, id DESC
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(&quality_label_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| storage("load saved quality label name history", error))?
+        .into_iter()
+        .map(quality_label_name_history_from_sqlite_row)
+        .collect::<ApplicationResult<Vec<_>>>()?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| storage("commit quality label", error))?;
+        Ok(label)
     }
 
     pub async fn create_catalog_product(
@@ -1314,6 +1692,37 @@ struct ValidatedInspectionResult {
     unit: InventoryUnit,
     previous_location_id: String,
     previous_version: u64,
+    quality_label_id: Option<String>,
+    quality_label_snapshot: Option<String>,
+}
+
+fn normalize_quality_label(
+    mut input: SaveQualityLabelRequest,
+) -> ApplicationResult<SaveQualityLabelRequest> {
+    input.quality_label_id = clean_optional(input.quality_label_id);
+    if let Some(quality_label_id) = &input.quality_label_id {
+        Uuid::parse_str(quality_label_id)
+            .map_err(|_| validation("quality_label_id", "must be a UUID"))?;
+    }
+    input.name = normalized_display_name("quality label name", input.name)?;
+    if input.name.chars().count() > 40 {
+        return Err(validation(
+            "quality label name",
+            "must be at most 40 characters",
+        ));
+    }
+    input.rename_note = clean_optional(input.rename_note);
+    if input
+        .rename_note
+        .as_ref()
+        .is_some_and(|note| note.chars().count() > 200)
+    {
+        return Err(validation(
+            "quality label rename note",
+            "must be at most 200 characters",
+        ));
+    }
+    Ok(input)
 }
 
 fn normalize_catalog_product(
@@ -1483,6 +1892,15 @@ fn normalize_inspection_request(
             std::mem::take(&mut result.barcode),
         )?
         .to_uppercase();
+        result.quality_label_id = clean_optional(result.quality_label_id.take());
+        if let Some(quality_label_id) = &result.quality_label_id {
+            Uuid::parse_str(quality_label_id).map_err(|_| {
+                validation(
+                    &format!("results[{index}].quality_label_id"),
+                    "must be a UUID",
+                )
+            })?;
+        }
         result.defect_code = clean_optional(result.defect_code.take());
         result.notes = clean_optional(result.notes.take());
         if !result.measurements.is_object() {
@@ -1912,6 +2330,73 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn quality_label_from_sqlite_row(row: sqlx::sqlite::SqliteRow) -> ApplicationResult<QualityLabel> {
+    let disposition: String = row
+        .try_get("disposition")
+        .map_err(|error| storage("read quality label disposition", error))?;
+    Ok(QualityLabel {
+        quality_label_id: row
+            .try_get("id")
+            .map_err(|error| storage("read quality label id", error))?,
+        name: row
+            .try_get("name")
+            .map_err(|error| storage("read quality label name", error))?,
+        disposition: QualityLabelDisposition::from_database_value(&disposition).ok_or_else(
+            || {
+                storage(
+                    "read quality label disposition",
+                    format!("unknown value {disposition}"),
+                )
+            },
+        )?,
+        active: row
+            .try_get::<i64, _>("active")
+            .map_err(|error| storage("read quality label state", error))?
+            != 0,
+        usage_count: u64::try_from(
+            row.try_get::<i64, _>("usage_count")
+                .map_err(|error| storage("read quality label usage count", error))?,
+        )
+        .map_err(|error| storage("read quality label usage count", error))?,
+        name_history: Vec::new(),
+        created_at: row
+            .try_get("created_at")
+            .map_err(|error| storage("read quality label creation time", error))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|error| storage("read quality label update time", error))?,
+    })
+}
+
+fn quality_label_name_history_from_sqlite_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> ApplicationResult<QualityLabelNameHistory> {
+    Ok(QualityLabelNameHistory {
+        history_id: row
+            .try_get("id")
+            .map_err(|error| storage("read quality label history id", error))?,
+        old_name: row
+            .try_get("old_name")
+            .map_err(|error| storage("read old quality label name", error))?,
+        new_name: row
+            .try_get("new_name")
+            .map_err(|error| storage("read new quality label name", error))?,
+        changed_by: row
+            .try_get("changed_by_snapshot")
+            .map_err(|error| storage("read quality label history actor", error))?,
+        change_note: row
+            .try_get("change_note")
+            .map_err(|error| storage("read quality label rename note", error))?,
+        changed_at: row
+            .try_get("changed_at")
+            .map_err(|error| storage("read quality label rename time", error))?,
+    })
+}
+
 fn empty_json_object() -> Value {
     json!({})
 }
@@ -2032,6 +2517,7 @@ mod tests {
             actor_id: "operator-1".to_owned(),
             barcodes: barcodes.iter().map(|value| (*value).to_owned()).collect(),
             notes: None,
+            warranty: None,
         }
     }
 
@@ -2054,6 +2540,7 @@ mod tests {
                 .map(|(barcode, outcome)| InspectionResultInput {
                     barcode: barcode.to_owned(),
                     outcome,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: json!({}),
                     notes: None,
@@ -2737,6 +3224,138 @@ mod tests {
         assert_eq!(receipt_count, 1);
         assert_eq!(movement_count, 2);
         assert_eq!(audit_count, 1);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn quality_labels_are_multi_value_persistent_and_snapshot_inspection_history() {
+        let (database, path) = test_database_with_default_catalog().await;
+        let available = database
+            .save_quality_label(SaveQualityLabelRequest {
+                quality_label_id: None,
+                name: "  外观完好  ".to_owned(),
+                disposition: QualityLabelDisposition::Available,
+                active: true,
+                rename_note: None,
+            })
+            .await
+            .expect("create available quality label");
+        let quarantine = database
+            .save_quality_label(SaveQualityLabelRequest {
+                quality_label_id: None,
+                name: "屏幕异常".to_owned(),
+                disposition: QualityLabelDisposition::Quarantine,
+                active: true,
+                rename_note: None,
+            })
+            .await
+            .expect("create quarantine quality label");
+        assert_eq!(database.list_quality_labels().await.unwrap().len(), 2);
+
+        database
+            .post_receipt(receipt_request(
+                "quality-label-receipt-request",
+                "quality-label-receipt-key",
+                "R-QUALITY-LABEL",
+                &["LABEL-SNAPSHOT", "LABEL-INACTIVE", "LABEL-MISMATCH"],
+            ))
+            .await
+            .expect("post quality label test receipt");
+        let mut inspection = inspection_request(
+            "quality-label-inspection-request",
+            "quality-label-inspection-key",
+            "Q-QUALITY-LABEL",
+            InspectionKind::Initial,
+            vec![("LABEL-SNAPSHOT", QualityOutcome::Passed)],
+        );
+        inspection.results[0].quality_label_id = Some(available.quality_label_id.clone());
+        database
+            .complete_inspection(inspection)
+            .await
+            .expect("complete labeled inspection");
+
+        let renamed = database
+            .save_quality_label(SaveQualityLabelRequest {
+                quality_label_id: Some(available.quality_label_id.clone()),
+                name: "验收通过".to_owned(),
+                disposition: QualityLabelDisposition::Available,
+                active: false,
+                rename_note: Some("统一验收用语".to_owned()),
+            })
+            .await
+            .expect("rename and deactivate quality label");
+        assert_eq!(renamed.usage_count, 1);
+        assert_eq!(renamed.name_history.len(), 1);
+        assert_eq!(renamed.name_history[0].old_name, "外观完好");
+        assert_eq!(renamed.name_history[0].new_name, "验收通过");
+        assert_eq!(
+            renamed.name_history[0].change_note.as_deref(),
+            Some("统一验收用语")
+        );
+        assert_eq!(renamed.name_history[0].changed_by, "本机操作");
+        let trace = database
+            .inventory_trace("LABEL-SNAPSHOT")
+            .await
+            .expect("trace labeled inventory");
+        assert_eq!(
+            trace.inspections[0].quality_label_snapshot.as_deref(),
+            Some("外观完好")
+        );
+
+        assert!(matches!(
+            database
+                .save_quality_label(SaveQualityLabelRequest {
+                    quality_label_id: Some(available.quality_label_id.clone()),
+                    name: "验收通过".to_owned(),
+                    disposition: QualityLabelDisposition::Quarantine,
+                    active: false,
+                    rename_note: None,
+                })
+                .await,
+            Err(ApplicationError::Conflict { entity, .. }) if entity == "quality_label_disposition"
+        ));
+        let history_id = renamed.name_history[0].history_id.clone();
+        assert!(sqlx::query(
+            "UPDATE quality_label_name_history SET new_name = '篡改' WHERE id = ?1"
+        )
+        .bind(&history_id)
+        .execute(database.pool())
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM quality_label_name_history WHERE id = ?1")
+                .bind(&history_id)
+                .execute(database.pool())
+                .await
+                .is_err()
+        );
+
+        let mut inactive = inspection_request(
+            "quality-label-inactive-request",
+            "quality-label-inactive-key",
+            "Q-QUALITY-INACTIVE",
+            InspectionKind::Initial,
+            vec![("LABEL-INACTIVE", QualityOutcome::Passed)],
+        );
+        inactive.results[0].quality_label_id = Some(available.quality_label_id.clone());
+        assert!(matches!(
+            database.complete_inspection(inactive).await,
+            Err(ApplicationError::Conflict { entity, .. }) if entity == "quality_label"
+        ));
+
+        let mut mismatched = inspection_request(
+            "quality-label-mismatch-request",
+            "quality-label-mismatch-key",
+            "Q-QUALITY-MISMATCH",
+            InspectionKind::Initial,
+            vec![("LABEL-MISMATCH", QualityOutcome::Passed)],
+        );
+        mismatched.results[0].quality_label_id = Some(quarantine.quality_label_id);
+        assert!(matches!(
+            database.complete_inspection(mismatched).await,
+            Err(ApplicationError::Conflict { entity, .. })
+                if entity == "quality_label_disposition"
+        ));
         close_and_remove(database, path).await;
     }
 

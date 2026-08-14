@@ -2024,6 +2024,27 @@ async fn v2_network_complete_inspection(
 }
 
 #[tauri::command]
+async fn v2_network_list_quality_labels(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+) -> Result<Vec<v2::application::QualityLabel>, String> {
+    client
+        .list_quality_labels()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_save_quality_label(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::application::SaveQualityLabelRequest,
+) -> Result<v2::application::QualityLabel, String> {
+    client
+        .save_quality_label(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn v2_network_list_inventory(
     client: tauri::State<'_, v2::network_client::NetworkClient>,
     query: v2::application::InventoryListQuery,
@@ -2131,6 +2152,29 @@ async fn v2_complete_inspection(
     activation::require_activated(&app)?;
     database
         .complete_inspection(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_list_quality_labels(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+) -> Result<Vec<v2::application::QualityLabel>, String> {
+    database
+        .list_quality_labels()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_save_quality_label(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::SaveQualityLabelRequest,
+) -> Result<v2::application::QualityLabel, String> {
+    activation::require_activated(&app)?;
+    database
+        .save_quality_label(input)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2247,6 +2291,147 @@ async fn v2_get_outbound_order(
         .outbound_order_details(&order_id)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_list_receipt_records(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    query: v2::records::RecordSearchQuery,
+) -> Result<Vec<v2::records::ReceiptRecord>, String> {
+    database.list_receipt_records(query).await
+}
+
+#[tauri::command]
+async fn v2_list_outbound_order_records(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    query: v2::records::RecordSearchQuery,
+) -> Result<Vec<v2::records::OutboundOrderRecord>, String> {
+    database.list_outbound_order_records(query).await
+}
+
+#[tauri::command]
+async fn v2_receipt_document(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    receipt_id: String,
+) -> Result<v2::records::ReceiptDocument, String> {
+    database.receipt_document(&receipt_id).await
+}
+
+#[tauri::command]
+async fn v2_outbound_order_document(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    order_id: String,
+) -> Result<v2::records::OutboundOrderDocument, String> {
+    database.outbound_order_document(&order_id).await
+}
+
+#[tauri::command]
+async fn v2_lookup_return_candidate(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    barcode: String,
+) -> Result<v2::records::ReturnCandidate, String> {
+    database.lookup_return_candidate(&barcode).await
+}
+
+#[tauri::command]
+async fn v2_export_receipt_document(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    receipt_id: String,
+    path: String,
+) -> Result<(), String> {
+    let document = database.receipt_document(&receipt_id).await?;
+    v2::records::write_receipt_workbook(path, &document)
+}
+
+#[tauri::command]
+async fn v2_export_outbound_order_document(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    order_id: String,
+    path: String,
+) -> Result<(), String> {
+    let document = database.outbound_order_document(&order_id).await?;
+    v2::records::write_outbound_workbook(path, &document)
+}
+
+#[tauri::command]
+async fn v2_network_list_receipt_records(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    query: v2::records::RecordSearchQuery,
+) -> Result<Vec<v2::records::ReceiptRecord>, String> {
+    client
+        .list_receipt_records(&query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_list_outbound_order_records(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    query: v2::records::RecordSearchQuery,
+) -> Result<Vec<v2::records::OutboundOrderRecord>, String> {
+    client
+        .list_outbound_order_records(&query)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_receipt_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    receipt_id: String,
+) -> Result<v2::records::ReceiptDocument, String> {
+    client
+        .receipt_document(&receipt_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_outbound_order_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    order_id: String,
+) -> Result<v2::records::OutboundOrderDocument, String> {
+    client
+        .outbound_order_document(&order_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_lookup_return_candidate(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    barcode: String,
+) -> Result<v2::records::ReturnCandidate, String> {
+    client
+        .lookup_return_candidate(&barcode)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_export_receipt_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    receipt_id: String,
+    path: String,
+) -> Result<(), String> {
+    let document = client
+        .receipt_document(&receipt_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    v2::records::write_receipt_workbook(path, &document)
+}
+
+#[tauri::command]
+async fn v2_network_export_outbound_order_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    order_id: String,
+    path: String,
+) -> Result<(), String> {
+    let document = client
+        .outbound_order_document(&order_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    v2::records::write_outbound_workbook(path, &document)
 }
 
 #[derive(serde::Deserialize)]
@@ -2414,6 +2599,8 @@ pub fn run() {
             v2_preview_legacy_excel,
             v2_commit_legacy_excel,
             v2_complete_inspection,
+            v2_list_quality_labels,
+            v2_save_quality_label,
             v2_list_inventory,
             v2_inventory_barcode_exists,
             v2_inventory_trace,
@@ -2424,6 +2611,13 @@ pub fn run() {
             v2_confirm_outbound_delivery,
             v2_return_outbound_shipment,
             v2_get_outbound_order,
+            v2_list_receipt_records,
+            v2_list_outbound_order_records,
+            v2_receipt_document,
+            v2_outbound_order_document,
+            v2_lookup_return_candidate,
+            v2_export_receipt_document,
+            v2_export_outbound_order_document,
             v2_create_offline_backup,
             v2_verify_offline_backup,
             v2_restore_offline_backup,
@@ -2448,6 +2642,8 @@ pub fn run() {
             v2_network_save_catalog_party,
             v2_network_list_warehouses,
             v2_network_complete_inspection,
+            v2_network_list_quality_labels,
+            v2_network_save_quality_label,
             v2_network_list_inventory,
             v2_network_inventory_barcode_exists,
             v2_network_inventory_trace,
@@ -2457,6 +2653,13 @@ pub fn run() {
             v2_network_ship_outbound_order,
             v2_network_confirm_outbound_delivery,
             v2_network_return_outbound_shipment,
+            v2_network_list_receipt_records,
+            v2_network_list_outbound_order_records,
+            v2_network_receipt_document,
+            v2_network_outbound_order_document,
+            v2_network_lookup_return_candidate,
+            v2_network_export_receipt_document,
+            v2_network_export_outbound_order_document,
             play_beep
         ])
         .run(tauri::generate_context!())

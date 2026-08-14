@@ -7,7 +7,8 @@
 use super::application::{
     CatalogParty, CatalogProduct, CompleteInspectionResponse, CreateCatalogPartyRequest,
     CreateCatalogProductRequest, InventoryListResponse, InventorySummaryResponse,
-    PostReceiptResponse, ReferenceCatalog, SaveCatalogPartyRequest,
+    PostReceiptResponse, QualityLabel, ReferenceCatalog, SaveCatalogPartyRequest,
+    SaveQualityLabelRequest,
 };
 use super::identity_admin::{
     CreateTenantUserRequest, CreateTenantUserResponse, DisableTenantUserRequest,
@@ -23,6 +24,10 @@ use super::network_ops::{
     NetworkAllocateOutboundRequest, NetworkCompleteInspectionRequest,
     NetworkConfirmOutboundDeliveryRequest, NetworkCreateOutboundOrderRequest,
     NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
+};
+use super::records::{
+    OutboundOrderDocument, OutboundOrderRecord, ReceiptDocument, ReceiptRecord, RecordSearchQuery,
+    ReturnCandidate,
 };
 use super::traceability::{InventoryBarcodeExistsResponse, InventoryTrace};
 use super::upgrade::{NetworkUpgradeImportRequest, NetworkUpgradeImportResponse};
@@ -266,6 +271,19 @@ impl NetworkClient {
             .await
     }
 
+    pub async fn list_quality_labels(&self) -> Result<Vec<QualityLabel>, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/quality/labels/query", &Value::Null)
+            .await
+    }
+
+    pub async fn save_quality_label(
+        &self,
+        request: &SaveQualityLabelRequest,
+    ) -> Result<QualityLabel, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/quality/labels/save", request)
+            .await
+    }
+
     pub async fn create_catalog_product(
         &self,
         request: &CreateCatalogProductRequest,
@@ -315,6 +333,58 @@ impl NetworkClient {
             Method::POST,
             "/v1/inventory/barcodes/exists",
             &serde_json::json!({ "barcode": barcode }),
+        )
+        .await
+    }
+
+    pub async fn list_receipt_records(
+        &self,
+        query: &RecordSearchQuery,
+    ) -> Result<Vec<ReceiptRecord>, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/receipts/query", query)
+            .await
+    }
+
+    pub async fn list_outbound_order_records(
+        &self,
+        query: &RecordSearchQuery,
+    ) -> Result<Vec<OutboundOrderRecord>, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/outbound/query", query)
+            .await
+    }
+
+    pub async fn receipt_document(
+        &self,
+        receipt_id: &str,
+    ) -> Result<ReceiptDocument, NetworkClientError> {
+        self.authorized_json(
+            Method::POST,
+            "/v1/records/receipts/detail",
+            &serde_json::json!({"id": receipt_id}),
+        )
+        .await
+    }
+
+    pub async fn outbound_order_document(
+        &self,
+        order_id: &str,
+    ) -> Result<OutboundOrderDocument, NetworkClientError> {
+        self.authorized_json(
+            Method::POST,
+            "/v1/records/outbound/detail",
+            &serde_json::json!({"id": order_id}),
+        )
+        .await
+    }
+
+    pub async fn lookup_return_candidate(
+        &self,
+        barcode: &str,
+    ) -> Result<ReturnCandidate, NetworkClientError> {
+        self.authorized_json(
+            Method::POST,
+            "/v1/records/returns/candidate",
+            &serde_json::json!({"barcode": barcode}),
         )
         .await
     }

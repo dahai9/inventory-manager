@@ -1,10 +1,10 @@
 //! One-time, offline SQLite to network PostgreSQL upgrade packages.
 //!
-//! Version 2 uses an uncompressed directory whose name ends in `.invpack` and
-//! preserves inbound supplier identity plus product scanner rules. Version 1
-//! remains readable so packages exported by the previous offline release can
-//! still be upgraded, while older network services reject new version 2 data
-//! instead of silently discarding the added fields.
+//! Version 3 uses an uncompressed directory whose name ends in `.invpack` and
+//! preserves quality-label definitions and result snapshots in addition to the
+//! version 2 supplier and scanner fields. Versions 1 and 2 remain readable,
+//! while older network services reject version 3 data instead of silently
+//! discarding the added fields.
 //! Keeping the package inspectable avoids adding an archive dependency and makes
 //! every file independently verifiable. A later archive representation must
 //! increment `PACKAGE_FORMAT_VERSION` and retain the same safety properties.
@@ -29,10 +29,10 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub const PRODUCT_ID: &str = "inventory-manager";
-pub const PACKAGE_FORMAT_VERSION: u32 = 2;
+pub const PACKAGE_FORMAT_VERSION: u32 = 3;
 const MIN_SUPPORTED_PACKAGE_FORMAT_VERSION: u32 = 1;
 pub const LOGICAL_SCHEMA_VERSION: i64 = 1;
-const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 5;
+const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 8;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const CHECKSUMS_FILE: &str = "checksums.json";
@@ -365,6 +365,14 @@ const INBOUND_TABLES: &[TableSpec] = &[
 ];
 
 const QUALITY_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "quality_labels",
+        order_by: "id",
+    },
+    TableSpec {
+        name: "quality_label_name_history",
+        order_by: "id",
+    },
     TableSpec {
         name: "quality_inspections",
         order_by: "id",
@@ -1404,6 +1412,7 @@ fn validate_relational_data(
         ("inbound_receipts", &["workspace_id", "receipt_no"]),
         ("inbound_receipts", &["workspace_id", "idempotency_key"]),
         ("inventory_units", &["workspace_id", "barcode"]),
+        ("quality_labels", &["workspace_id", "normalized_name"]),
         ("quality_inspections", &["workspace_id", "inspection_no"]),
         ("quality_inspections", &["workspace_id", "idempotency_key"]),
         (
@@ -1467,6 +1476,16 @@ fn validate_relational_data(
             "quality_inspection_results",
             "inventory_unit_id",
             "inventory_units",
+        ),
+        (
+            "quality_inspection_results",
+            "quality_label_id",
+            "quality_labels",
+        ),
+        (
+            "quality_label_name_history",
+            "quality_label_id",
+            "quality_labels",
         ),
         ("quality_waivers", "inventory_unit_id", "inventory_units"),
         (
@@ -1544,16 +1563,122 @@ fn validate_relational_data(
             table,
             field,
             target,
-            table == "inbound_receipts" && field == "supplier_party_id",
+            (table == "inbound_receipts" && field == "supplier_party_id")
+                || (table == "quality_inspection_results" && field == "quality_label_id"),
         )?;
     }
     for field in ["from_location_id", "to_location_id"] {
         validate_foreign_key(records, &ids, "stock_movements", field, "locations", true)?;
     }
 
+    validate_quality_label_snapshots(records)?;
+    validate_quality_label_name_history(records)?;
     validate_inbound_quantities(records)?;
     validate_outbound_quantities(records)?;
     validate_inventory_projections(records)?;
+    Ok(())
+}
+
+fn validate_quality_label_snapshots(
+    records: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<(), UpgradeError> {
+    let labels: HashMap<&str, &str> = table_records(records, "quality_labels")
+        .iter()
+        .map(|record| {
+            Ok((
+                required_string(record, "quality_labels", "id")?,
+                required_string(record, "quality_labels", "disposition")?,
+            ))
+        })
+        .collect::<Result<_, UpgradeError>>()?;
+    for record in table_records(records, "quality_inspection_results") {
+        let label_id = record.get("quality_label_id").and_then(Value::as_str);
+        let snapshot = record.get("quality_label_snapshot").and_then(Value::as_str);
+        match (label_id, snapshot) {
+            (None, None) => continue,
+            (Some(label_id), Some(snapshot)) if !snapshot.trim().is_empty() => {
+                let disposition = labels.get(label_id).ok_or_else(|| {
+                    UpgradeError::Data(format!(
+                        "quality_inspection_results.quality_label_id references missing quality_labels.{label_id}"
+                    ))
+                })?;
+                let result = required_string(record, "quality_inspection_results", "result")?;
+                let expected = match *disposition {
+                    "available" => "passed",
+                    "quarantine" => "failed",
+                    other => {
+                        return Err(UpgradeError::Data(format!(
+                            "quality_labels.{label_id} has unknown disposition {other}"
+                        )))
+                    }
+                };
+                if result != expected {
+                    return Err(UpgradeError::Data(format!(
+                        "quality inspection label {label_id} disposition {disposition} does not match result {result}"
+                    )));
+                }
+            }
+            _ => {
+                return Err(UpgradeError::Data(
+                    "quality inspection label id and non-empty snapshot must appear together"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_quality_label_name_history(
+    records: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<(), UpgradeError> {
+    for record in table_records(records, "quality_label_name_history") {
+        let old_name = required_string(record, "quality_label_name_history", "old_name")?;
+        let new_name = required_string(record, "quality_label_name_history", "new_name")?;
+        if old_name == new_name {
+            return Err(UpgradeError::Data(
+                "quality_label_name_history old_name and new_name must differ".to_owned(),
+            ));
+        }
+        if old_name.chars().count() > 40 || new_name.chars().count() > 40 {
+            return Err(UpgradeError::Data(
+                "quality_label_name_history names must be at most 40 characters".to_owned(),
+            ));
+        }
+        let actor = required_string(record, "quality_label_name_history", "changed_by_snapshot")?;
+        if actor.chars().count() > 100 {
+            return Err(UpgradeError::Data(
+                "quality_label_name_history changed_by_snapshot must be at most 100 characters"
+                    .to_owned(),
+            ));
+        }
+        let note = record
+            .get("change_note")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    UpgradeError::Data(
+                        "quality_label_name_history.change_note must be a string or null"
+                            .to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        if let Some(note) = note {
+            if note.chars().count() > 200 {
+                return Err(UpgradeError::Data(
+                    "quality_label_name_history change_note must be at most 200 characters"
+                        .to_owned(),
+                ));
+            }
+        }
+        validate_utc_rfc3339(required_string(
+            record,
+            "quality_label_name_history",
+            "changed_at",
+        )?)
+        .map_err(UpgradeError::Data)?;
+    }
     Ok(())
 }
 
@@ -2662,9 +2787,11 @@ impl<'a> PgUpgradeTransaction<'a> {
                     (tenant_id, id, receipt_no, owner_party_id, warehouse_id,
                      supplier_party_id, source_reference, received_at, status,
                      actor_id, source_actor_id, idempotency_key, request_id,
-                     created_at)
+                     created_at, warranty_duration_days, warranty_label_snapshot,
+                     warranty_started_at, warranty_expires_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10,
-                        $11, $12, $13, $14::timestamptz)
+                        $11, $12, $13, $14::timestamptz, $15, $16,
+                        $17::timestamptz, $18::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2689,6 +2816,26 @@ impl<'a> PgUpgradeTransaction<'a> {
             .bind(string_field(record, "inbound_receipts", "idempotency_key")?)
             .bind(string_field(record, "inbound_receipts", "request_id")?)
             .bind(string_field(record, "inbound_receipts", "created_at")?)
+            .bind(optional_i32_field(
+                record,
+                "inbound_receipts",
+                "warranty_duration_days",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "inbound_receipts",
+                "warranty_label_snapshot",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "inbound_receipts",
+                "warranty_started_at",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "inbound_receipts",
+                "warranty_expires_at",
+            )?)
             .execute(&mut *self.transaction)
             .await?;
         }
@@ -2763,6 +2910,79 @@ impl<'a> PgUpgradeTransaction<'a> {
         actor_id: Uuid,
         records: &BTreeMap<String, Vec<Map<String, Value>>>,
     ) -> Result<(), PgUpgradeError> {
+        for record in records_for(records, "quality_labels") {
+            sqlx::query(
+                r#"
+                INSERT INTO quality_labels
+                    (tenant_id, id, name, normalized_name, disposition, active,
+                     created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz,
+                        $8::timestamptz)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(uuid_field(record, "quality_labels", "id")?)
+            .bind(string_field(record, "quality_labels", "name")?)
+            .bind(string_field(record, "quality_labels", "normalized_name")?)
+            .bind(string_field(record, "quality_labels", "disposition")?)
+            .bind(bool_field(record, "quality_labels", "active")?)
+            .bind(string_field(record, "quality_labels", "created_at")?)
+            .bind(string_field(record, "quality_labels", "updated_at")?)
+            .execute(&mut *self.transaction)
+            .await?;
+        }
+        for record in records_for(records, "quality_label_name_history") {
+            sqlx::query(
+                r#"
+                INSERT INTO quality_label_name_history
+                    (tenant_id, id, quality_label_id, old_name, new_name,
+                     changed_by, changed_by_snapshot, source_actor_id,
+                     change_note, changed_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                        $10::timestamptz)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(uuid_field(record, "quality_label_name_history", "id")?)
+            .bind(uuid_field(
+                record,
+                "quality_label_name_history",
+                "quality_label_id",
+            )?)
+            .bind(string_field(
+                record,
+                "quality_label_name_history",
+                "old_name",
+            )?)
+            .bind(string_field(
+                record,
+                "quality_label_name_history",
+                "new_name",
+            )?)
+            .bind(actor_id)
+            .bind(string_field(
+                record,
+                "quality_label_name_history",
+                "changed_by_snapshot",
+            )?)
+            .bind(string_field(
+                record,
+                "quality_label_name_history",
+                "changed_by",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "quality_label_name_history",
+                "change_note",
+            )?)
+            .bind(string_field(
+                record,
+                "quality_label_name_history",
+                "changed_at",
+            )?)
+            .execute(&mut *self.transaction)
+            .await?;
+        }
         for record in records_for(records, "quality_inspections") {
             sqlx::query(
                 r#"
@@ -2805,8 +3025,10 @@ impl<'a> PgUpgradeTransaction<'a> {
                 r#"
                 INSERT INTO quality_inspection_results
                     (tenant_id, id, inspection_id, inventory_unit_id, result,
-                     defect_code, measurements_json, notes, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz)
+                     quality_label_id, quality_label_snapshot, defect_code,
+                     measurements_json, notes, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -2825,6 +3047,16 @@ impl<'a> PgUpgradeTransaction<'a> {
                 record,
                 "quality_inspection_results",
                 "result",
+            )?)
+            .bind(optional_uuid_field(
+                record,
+                "quality_inspection_results",
+                "quality_label_id",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "quality_inspection_results",
+                "quality_label_snapshot",
             )?)
             .bind(optional_string_field(
                 record,
@@ -3043,9 +3275,11 @@ impl<'a> PgUpgradeTransaction<'a> {
                 INSERT INTO outbound_shipments
                     (tenant_id, id, shipment_no, outbound_order_id, status,
                      shipped_at, actor_id, source_actor_id, idempotency_key,
-                     request_id, created_at)
+                     request_id, created_at, warranty_duration_days,
+                     warranty_label_snapshot, warranty_started_at, warranty_expires_at)
                 VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7, $8, $9,
-                        $10, $11::timestamptz)
+                        $10, $11::timestamptz, $12, $13, $14::timestamptz,
+                        $15::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -3067,6 +3301,26 @@ impl<'a> PgUpgradeTransaction<'a> {
             )?)
             .bind(string_field(record, "outbound_shipments", "request_id")?)
             .bind(string_field(record, "outbound_shipments", "created_at")?)
+            .bind(optional_i32_field(
+                record,
+                "outbound_shipments",
+                "warranty_duration_days",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "outbound_shipments",
+                "warranty_label_snapshot",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "outbound_shipments",
+                "warranty_started_at",
+            )?)
+            .bind(optional_string_field(
+                record,
+                "outbound_shipments",
+                "warranty_expires_at",
+            )?)
             .execute(&mut *self.transaction)
             .await?;
         }
@@ -3495,6 +3749,8 @@ const NETWORK_BUSINESS_TABLES: &[&str] = &[
     "inbound_receipts",
     "inbound_receipt_lines",
     "inventory_units",
+    "quality_labels",
+    "quality_label_name_history",
     "quality_inspections",
     "quality_inspection_results",
     "quality_waivers",
@@ -3586,6 +3842,25 @@ fn i64_field(record: &Map<String, Value>, table: &str, field: &str) -> Result<i6
 
 fn i32_field(record: &Map<String, Value>, table: &str, field: &str) -> Result<i32, PgUpgradeError> {
     i32::try_from(i64_field(record, table, field)?).map_err(|_| {
+        PgUpgradeError::Data(format!("{table}.{field} does not fit PostgreSQL integer"))
+    })
+}
+
+fn optional_i32_field(
+    record: &Map<String, Value>,
+    table: &str,
+    field: &str,
+) -> Result<Option<i32>, PgUpgradeError> {
+    let Some(value) = record.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let integer = value.as_i64().ok_or_else(|| {
+        PgUpgradeError::Data(format!("{table}.{field} must be an integer or null"))
+    })?;
+    i32::try_from(integer).map(Some).map_err(|_| {
         PgUpgradeError::Data(format!("{table}.{field} does not fit PostgreSQL integer"))
     })
 }
@@ -3721,6 +3996,21 @@ mod tests {
         ))
         .await
         .expect("create supplier and scanner schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0006_business_party_contact_details.sql"
+        ))
+        .await
+        .expect("create business party contact schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0007_quality_labels.sql"
+        ))
+        .await
+        .expect("create quality label schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0008_quality_label_name_history.sql"
+        ))
+        .await
+        .expect("create quality label history schema");
         pool.execute(
             "CREATE TABLE _sqlx_migrations (version BIGINT NOT NULL, success BOOLEAN NOT NULL)",
         )
@@ -3761,6 +4051,36 @@ mod tests {
     #[tokio::test]
     async fn export_is_deterministic_and_validates_before_import() {
         let (pool, workspace_id, source_instance_id) = test_pool().await;
+        let quality_label_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO quality_labels
+                (id, workspace_id, name, normalized_name, disposition, active,
+                 created_at, updated_at)
+            VALUES (?1, ?2, '外观完好', '外观完好', 'available', 1,
+                    '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z')
+            "#,
+        )
+        .bind(&quality_label_id)
+        .bind(&workspace_id)
+        .execute(&pool)
+        .await
+        .expect("seed quality label");
+        sqlx::query(
+            r#"
+            INSERT INTO quality_label_name_history
+                (id, workspace_id, quality_label_id, old_name, new_name,
+                 changed_by, changed_by_snapshot, change_note, changed_at)
+            VALUES (?1, ?2, ?3, '外观正常', '外观完好', 'local', '本机操作',
+                    '统一命名', '2026-07-31T00:00:01Z')
+            "#,
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&workspace_id)
+        .bind(&quality_label_id)
+        .execute(&pool)
+        .await
+        .expect("seed quality label history");
         sqlx::query(
             r#"
             INSERT INTO audit_logs
@@ -3814,6 +4134,11 @@ mod tests {
         let validated = validate_package(&first.path).expect("validate exported package");
         assert_eq!(validated.manifest, first.manifest);
         assert_eq!(validated.entity_counts.get("workspaces"), Some(&1));
+        assert_eq!(validated.entity_counts.get("quality_labels"), Some(&1));
+        assert_eq!(
+            validated.entity_counts.get("quality_label_name_history"),
+            Some(&1)
+        );
         assert_eq!(validated.entity_counts.get("audit_logs"), Some(&1));
         assert_eq!(validated.package_checksum, first.package_checksum);
         let audit = String::from_utf8(fs::read(first.path.join("audit.jsonl")).unwrap())
@@ -4342,6 +4667,7 @@ mod tests {
                 actor_id: "offline-receiver-a".to_owned(),
                 barcodes: vec![source_barcode_a.clone()],
                 notes: None,
+                warranty: None,
             })
             .await
             .expect("post source receipt A");
@@ -4359,6 +4685,7 @@ mod tests {
                 actor_id: "offline-receiver-b".to_owned(),
                 barcodes: vec![source_barcode_b.clone()],
                 notes: None,
+                warranty: None,
             })
             .await
             .expect("post source receipt B");
@@ -4374,6 +4701,7 @@ mod tests {
                 results: vec![InspectionResultInput {
                     barcode: source_barcode_a.clone(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: serde_json::json!({"voltage": 3.3}),
                     notes: None,
@@ -4392,6 +4720,7 @@ mod tests {
                 results: vec![InspectionResultInput {
                     barcode: source_barcode_b.clone(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: serde_json::json!({"voltage": 3.4}),
                     notes: None,
@@ -4421,6 +4750,7 @@ mod tests {
                 order_id: first_order.order_id.clone(),
                 order_line_id: first_order.order_line_id.clone(),
                 barcodes: Vec::new(),
+                allow_mixed_skus: false,
                 actor_id: "offline-allocator-one".to_owned(),
             })
             .await
@@ -4449,6 +4779,7 @@ mod tests {
                 barcodes: Vec::new(),
                 shipped_at: "2026-08-03T01:10:00Z".to_owned(),
                 actor_id: "offline-shipper-one".to_owned(),
+                warranty: None,
             })
             .await
             .expect("ship first source order");
@@ -4491,6 +4822,7 @@ mod tests {
                 results: vec![InspectionResultInput {
                     barcode: returned_item.barcode.clone(),
                     outcome: QualityOutcome::Passed,
+                    quality_label_id: None,
                     defect_code: None,
                     measurements: serde_json::json!({"retest": true}),
                     notes: Some("return retest passed".to_owned()),
@@ -4519,6 +4851,7 @@ mod tests {
                 order_id: second_order.order_id.clone(),
                 order_line_id: second_order.order_line_id.clone(),
                 barcodes: vec![returned_item.barcode.clone()],
+                allow_mixed_skus: false,
                 actor_id: "offline-allocator-two".to_owned(),
             })
             .await
@@ -4533,6 +4866,7 @@ mod tests {
                 barcodes: Vec::new(),
                 shipped_at: "2026-08-03T02:10:00Z".to_owned(),
                 actor_id: "offline-shipper-two".to_owned(),
+                warranty: None,
             })
             .await
             .expect("ship returned source unit again");

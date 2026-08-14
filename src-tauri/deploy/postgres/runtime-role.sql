@@ -35,6 +35,7 @@ GRANT INSERT, UPDATE
              public.inbound_receipts,
              public.inbound_receipt_lines,
              public.inventory_units,
+             public.quality_labels,
              public.quality_inspections,
              public.quality_inspection_results,
              public.quality_waivers,
@@ -53,6 +54,7 @@ GRANT INSERT, UPDATE
 GRANT INSERT
     ON TABLE public.stock_movements,
              public.audit_logs,
+             public.quality_label_name_history,
              public.migration_packages
     TO :"runtime_role";
 

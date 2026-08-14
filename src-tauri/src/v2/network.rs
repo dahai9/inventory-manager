@@ -7,8 +7,9 @@
 use super::application::{
     CatalogParty, CatalogPartyRole, CatalogProduct, CreateCatalogPartyRequest,
     CreateCatalogProductRequest, InventoryListItem, InventoryListQuery, InventoryListResponse,
-    InventorySummaryQuery, InventorySummaryResponse, PostReceiptResponse, ReceiptUnit,
-    ReferenceCatalog, SaveCatalogPartyRequest,
+    InventorySummaryQuery, InventorySummaryResponse, PostReceiptResponse, QualityLabel,
+    QualityLabelDisposition, QualityLabelNameHistory, ReceiptUnit, ReferenceCatalog,
+    SaveCatalogPartyRequest, SaveQualityLabelRequest,
 };
 use super::auth::{
     authenticate_password, issue_session, revoke_session, rotate_refresh_token, AuthError,
@@ -20,10 +21,12 @@ use super::upgrade::{
     NetworkUpgradeImportResponse, NetworkUpgradeImportStatus, NetworkUpgradeTarget,
     PgUpgradeAdapter, PgUpgradeError, PostgresImportError, UpgradeError,
 };
+use super::warranty::resolve_warranty;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgRow;
 use sqlx::{Postgres, Row, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -33,6 +36,41 @@ pub const PERMISSION_RECEIPT_WRITE: &str = "inventory.receipt.write";
 pub const PERMISSION_INVENTORY_READ: &str = PERMISSION_NETWORK_ACCESS;
 pub const PERMISSION_UPGRADE_IMPORT: &str = "inventory.upgrade.import";
 const RECEIPT_SCOPE: &str = "post_inbound_receipt";
+
+fn quality_label_from_postgres_row(row: PgRow) -> NetworkResult<QualityLabel> {
+    let disposition: String = row.try_get("disposition")?;
+    Ok(QualityLabel {
+        quality_label_id: row.try_get::<Uuid, _>("id")?.to_string(),
+        name: row.try_get("name")?,
+        disposition: QualityLabelDisposition::from_database_value(&disposition).ok_or_else(
+            || {
+                NetworkServiceError::Invalid(format!(
+                    "unknown quality label disposition {disposition}"
+                ))
+            },
+        )?,
+        active: row.try_get("active")?,
+        usage_count: u64::try_from(row.try_get::<i64, _>("usage_count")?).map_err(|error| {
+            NetworkServiceError::Invalid(format!("invalid quality label usage count: {error}"))
+        })?,
+        name_history: Vec::new(),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn quality_label_name_history_from_postgres_row(
+    row: PgRow,
+) -> NetworkResult<QualityLabelNameHistory> {
+    Ok(QualityLabelNameHistory {
+        history_id: row.try_get::<Uuid, _>("id")?.to_string(),
+        old_name: row.try_get("old_name")?,
+        new_name: row.try_get("new_name")?,
+        changed_by: row.try_get("changed_by_snapshot")?,
+        change_note: row.try_get("change_note")?,
+        changed_at: row.try_get("changed_at")?,
+    })
+}
 
 #[derive(Clone)]
 pub struct NetworkService {
@@ -111,6 +149,8 @@ impl NetworkService {
     ) -> NetworkResult<PostReceiptResponse> {
         let request = normalize_receipt(request)?;
         let digest = request_digest(&request)?;
+        let warranty = resolve_warranty(request.warranty.clone(), &request.received_at)
+            .map_err(NetworkServiceError::Invalid)?;
         let mut authorized = self
             .database
             .begin_authorized_request(tenant_id, session_token, PERMISSION_RECEIPT_WRITE)
@@ -179,9 +219,10 @@ impl NetworkService {
             INSERT INTO inbound_receipts
                 (tenant_id, id, receipt_no, owner_party_id, warehouse_id,
                  supplier_party_id, source_reference, received_at, status,
-                 actor_id, idempotency_key, request_id)
+                 actor_id, idempotency_key, request_id, warranty_duration_days,
+                 warranty_label_snapshot, warranty_started_at, warranty_expires_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, 'posted',
-                    $9, $10, $11)
+                    $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz)
             "#,
         )
         .bind(tenant_id)
@@ -195,6 +236,10 @@ impl NetworkService {
         .bind(actor_id)
         .bind(&request.idempotency_key)
         .bind(&request.request_id)
+        .bind(warranty.as_ref().map(|terms| terms.duration_days as i32))
+        .bind(warranty.as_ref().map(|terms| terms.label_snapshot.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.starts_at.as_str()))
+        .bind(warranty.as_ref().map(|terms| terms.expires_at.as_str()))
         .execute(&mut **transaction)
         .await
         .map_err(|error| conflict_or_database("receipt", &request.receipt_no, error))?;
@@ -478,6 +523,260 @@ impl NetworkService {
             goods_owners,
             suppliers,
         })
+    }
+
+    pub async fn list_quality_labels(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+    ) -> NetworkResult<Vec<QualityLabel>> {
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+        let mut labels = sqlx::query(
+            r#"
+            SELECT label.id, label.name, label.disposition, label.active,
+                   label.created_at::text AS created_at,
+                   label.updated_at::text AS updated_at,
+                   (SELECT COUNT(*)
+                      FROM quality_inspection_results result
+                     WHERE result.tenant_id = label.tenant_id
+                       AND result.quality_label_id = label.id) AS usage_count
+              FROM quality_labels label
+             WHERE label.tenant_id = $1
+             ORDER BY label.active DESC, label.disposition, label.name, label.id
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(quality_label_from_postgres_row)
+        .collect::<NetworkResult<Vec<_>>>()?;
+        let history_rows = sqlx::query(
+            r#"
+            SELECT id, quality_label_id, old_name, new_name,
+                   changed_by_snapshot, change_note,
+                   changed_at::text AS changed_at
+              FROM quality_label_name_history
+             WHERE tenant_id = $1
+             ORDER BY changed_at DESC, id DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let mut history_by_label: HashMap<String, Vec<QualityLabelNameHistory>> = HashMap::new();
+        for row in history_rows {
+            let quality_label_id = row.try_get::<Uuid, _>("quality_label_id")?.to_string();
+            history_by_label
+                .entry(quality_label_id)
+                .or_default()
+                .push(quality_label_name_history_from_postgres_row(row)?);
+        }
+        for label in &mut labels {
+            label.name_history = history_by_label
+                .remove(&label.quality_label_id)
+                .unwrap_or_default();
+        }
+        authorized.commit().await?;
+        Ok(labels)
+    }
+
+    pub async fn save_quality_label(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        input: SaveQualityLabelRequest,
+    ) -> NetworkResult<QualityLabel> {
+        let name = normalized_display_name("quality label name", input.name)?;
+        if name.chars().count() > 40 {
+            return Err(NetworkServiceError::Invalid(
+                "quality label name must be at most 40 characters".to_owned(),
+            ));
+        }
+        let normalized_name = name.to_lowercase();
+        let rename_note =
+            normalize_optional_party_field("quality label rename note", input.rename_note, 200)?;
+        let requested_id = input
+            .quality_label_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                Uuid::parse_str(value).map_err(|_| {
+                    NetworkServiceError::Invalid("quality_label_id must be a UUID".to_owned())
+                })
+            })
+            .transpose()?;
+        let mut authorized = self
+            .database
+            .begin_authorized_request(
+                tenant_id,
+                session_token,
+                super::network_ops::PERMISSION_QUALITY_WRITE,
+            )
+            .await?;
+        let actor_id = authorized.session().identity.user_id;
+        let transaction = authorized.sqlx_transaction();
+        let quality_label_id = requested_id.unwrap_or_else(Uuid::now_v7);
+        let mut previous_label: Option<(String, QualityLabelDisposition, u64)> = None;
+        if requested_id.is_some() {
+            let current = sqlx::query(
+                r#"
+                SELECT label.name, label.disposition,
+                       (SELECT COUNT(*)
+                          FROM quality_inspection_results result
+                         WHERE result.tenant_id = label.tenant_id
+                           AND result.quality_label_id = label.id) AS usage_count
+                  FROM quality_labels label
+                 WHERE label.tenant_id = $1 AND label.id = $2
+                 FOR UPDATE
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(quality_label_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let current = current.ok_or_else(|| NetworkServiceError::Conflict {
+                entity: "quality_label".to_owned(),
+                key: quality_label_id.to_string(),
+            })?;
+            let current_name: String = current.try_get("name")?;
+            let current_disposition_value: String = current.try_get("disposition")?;
+            let current_disposition =
+                QualityLabelDisposition::from_database_value(&current_disposition_value)
+                    .ok_or_else(|| {
+                        NetworkServiceError::Invalid(format!(
+                            "unknown quality label disposition {current_disposition_value}"
+                        ))
+                    })?;
+            let usage_count =
+                u64::try_from(current.try_get::<i64, _>("usage_count")?).map_err(|error| {
+                    NetworkServiceError::Invalid(format!(
+                        "invalid quality label usage count: {error}"
+                    ))
+                })?;
+            if usage_count > 0 && current_disposition != input.disposition {
+                return Err(NetworkServiceError::Conflict {
+                    entity: "quality_label_disposition".to_owned(),
+                    key: current_name,
+                });
+            }
+            previous_label = Some((current_name, current_disposition, usage_count));
+        }
+        let conflicting_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM quality_labels WHERE tenant_id = $1 AND normalized_name = $2 AND id <> $3",
+        )
+        .bind(tenant_id)
+        .bind(&normalized_name)
+        .bind(quality_label_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if conflicting_id.is_some() {
+            return Err(NetworkServiceError::Conflict {
+                entity: "quality_label".to_owned(),
+                key: name,
+            });
+        }
+
+        let row = if requested_id.is_some() {
+            let row = sqlx::query(
+                r#"
+                UPDATE quality_labels
+                   SET name = $1, normalized_name = $2, disposition = $3,
+                       active = $4, updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = $5 AND id = $6
+                RETURNING id, name, disposition, active,
+                          created_at::text AS created_at, updated_at::text AS updated_at,
+                          (SELECT COUNT(*)
+                             FROM quality_inspection_results result
+                            WHERE result.tenant_id = quality_labels.tenant_id
+                              AND result.quality_label_id = quality_labels.id) AS usage_count
+                "#,
+            )
+            .bind(&name)
+            .bind(&normalized_name)
+            .bind(input.disposition.database_value())
+            .bind(input.active)
+            .bind(tenant_id)
+            .bind(quality_label_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if let Some((old_name, _, _)) = &previous_label {
+                if old_name != &name {
+                    let actor_name: String = sqlx::query_scalar(
+                        "SELECT display_name FROM users WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(actor_id)
+                    .fetch_one(&mut **transaction)
+                    .await?;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO quality_label_name_history (
+                            tenant_id, id, quality_label_id, old_name, new_name,
+                            changed_by, changed_by_snapshot, source_actor_id,
+                            change_note, changed_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8,
+                                  CURRENT_TIMESTAMP)
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(Uuid::now_v7())
+                    .bind(quality_label_id)
+                    .bind(old_name)
+                    .bind(&name)
+                    .bind(actor_id)
+                    .bind(actor_name)
+                    .bind(&rename_note)
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+            }
+            row
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO quality_labels
+                    (tenant_id, id, name, normalized_name, disposition, active)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, name, disposition, active,
+                          created_at::text AS created_at, updated_at::text AS updated_at,
+                          0::bigint AS usage_count
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(quality_label_id)
+            .bind(&name)
+            .bind(&normalized_name)
+            .bind(input.disposition.database_value())
+            .bind(input.active)
+            .fetch_one(&mut **transaction)
+            .await?
+        };
+        let mut label = quality_label_from_postgres_row(row)?;
+        label.name_history = sqlx::query(
+            r#"
+            SELECT id, quality_label_id, old_name, new_name,
+                   changed_by_snapshot, change_note,
+                   changed_at::text AS changed_at
+              FROM quality_label_name_history
+             WHERE tenant_id = $1 AND quality_label_id = $2
+             ORDER BY changed_at DESC, id DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(quality_label_id)
+        .fetch_all(&mut **transaction)
+        .await?
+        .into_iter()
+        .map(quality_label_name_history_from_postgres_row)
+        .collect::<NetworkResult<Vec<_>>>()?;
+        authorized.commit().await?;
+        Ok(label)
     }
 
     pub async fn create_catalog_product(
@@ -965,6 +1264,8 @@ pub struct NetworkPostReceiptRequest {
     pub received_at: String,
     pub barcodes: Vec<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub warranty: Option<super::warranty::WarrantyInput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1513,6 +1814,7 @@ mod tests {
             received_at: "2026-08-03T01:00:00Z".to_owned(),
             barcodes: vec!["SN-1".to_owned(), "SN-1".to_owned()],
             notes: None,
+            warranty: None,
         })
         .expect_err("duplicates must fail");
         assert!(
