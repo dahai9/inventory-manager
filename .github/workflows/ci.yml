@@ -66,6 +66,11 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0004_upgrade_source_actor_provenance.sql
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -c "INSERT INTO tenants (id, slug, name) VALUES ('0198d9f0-2a74-7000-8000-000000000021', 'pre-v5-ci', 'Pre V5 CI'); INSERT INTO roles (tenant_id, id, code, name) VALUES ('0198d9f0-2a74-7000-8000-000000000021', '0198d9f0-2a74-7000-8000-000000000022', 'tenant_admin', 'Existing tenant admin');"
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0005_tenant_identity_administration.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0006_inbound_supplier_and_sku_scan_rules.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0007_business_party_contact_details.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0008_quality_labels.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0009_quality_label_name_history.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0010_document_warranties.sql
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -v runtime_role=inventory_runtime -f src-tauri/deploy/postgres/runtime-role.sql
 
       - name: Test Rust workspace

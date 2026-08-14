@@ -4934,7 +4934,7 @@ mod tests {
         .expect("verify imported rows");
         for (column, expected) in [
             ("workspaces", 1_i64),
-            ("parties", 4),
+            ("parties", 6),
             ("receipts", 2),
             ("receipt_lines", 2),
             ("units", 2),
