@@ -9,7 +9,7 @@ use super::application::{
     CreateCatalogProductRequest, InventoryListItem, InventoryListQuery, InventoryListResponse,
     InventorySummaryQuery, InventorySummaryResponse, PostReceiptResponse, QualityLabel,
     QualityLabelDisposition, QualityLabelNameHistory, ReceiptUnit, ReferenceCatalog,
-    SaveCatalogPartyRequest, SaveQualityLabelRequest,
+    SaveCatalogPartyRequest, SaveCatalogProductRequest, SaveQualityLabelRequest,
 };
 use super::auth::{
     authenticate_password, issue_session, revoke_session, rotate_refresh_token, AuthError,
@@ -824,6 +824,81 @@ impl NetworkService {
         Ok(product)
     }
 
+    pub async fn save_catalog_product(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        input: SaveCatalogProductRequest,
+    ) -> NetworkResult<CatalogProduct> {
+        let input = normalize_saved_catalog_product(input)?;
+        let Some(sku_id) = input.sku_id else {
+            return self
+                .create_catalog_product(
+                    tenant_id,
+                    session_token,
+                    CreateCatalogProductRequest {
+                        code: input.code,
+                        name: input.name,
+                        serial_prefix: input.serial_prefix,
+                        serial_forbidden_chars: input.serial_forbidden_chars,
+                    },
+                )
+                .await;
+        };
+        let sku_id = Uuid::parse_str(&sku_id)
+            .map_err(|_| NetworkServiceError::Invalid("sku_id must be a UUID".to_owned()))?;
+        let mut authorized = self
+            .database
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_RECEIPT_WRITE)
+            .await?;
+        let transaction = authorized.sqlx_transaction();
+
+        let conflicting_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM skus WHERE tenant_id = $1 AND code = $2 AND id <> $3",
+        )
+        .bind(tenant_id)
+        .bind(&input.code)
+        .bind(sku_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if conflicting_id.is_some() {
+            return Err(NetworkServiceError::Conflict {
+                entity: "sku".to_owned(),
+                key: input.code,
+            });
+        }
+
+        let row = sqlx::query(
+            r#"
+            UPDATE skus
+               SET code = $1, name = $2, serial_prefix = $3, serial_forbidden_chars = $4
+             WHERE tenant_id = $5 AND id = $6 AND active
+            RETURNING id, code, name, serial_prefix, serial_forbidden_chars
+            "#,
+        )
+        .bind(&input.code)
+        .bind(&input.name)
+        .bind(&input.serial_prefix)
+        .bind(&input.serial_forbidden_chars)
+        .bind(tenant_id)
+        .bind(sku_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| NetworkServiceError::Conflict {
+            entity: "sku".to_owned(),
+            key: sku_id.to_string(),
+        })?;
+        let product = CatalogProduct {
+            sku_id: row.try_get::<Uuid, _>("id")?.to_string(),
+            code: row.try_get("code")?,
+            name: row.try_get("name")?,
+            serial_prefix: row.try_get("serial_prefix")?,
+            serial_forbidden_chars: row.try_get("serial_forbidden_chars")?,
+        };
+        authorized.commit().await?;
+        Ok(product)
+    }
+
     pub async fn create_catalog_party(
         &self,
         tenant_id: Uuid,
@@ -1207,6 +1282,60 @@ impl NetworkService {
             summary.inventory.add(inventory_status, count);
             summary.quality.add(quality_status, count);
         }
+
+        let product_rows = sqlx::query(
+            r#"
+            SELECT units.sku_id, sku.code AS sku_code, sku.name AS sku_name,
+                   receipt.supplier_party_id,
+                   COALESCE(supplier.display_name, '历史来源未记录') AS supplier_name,
+                   units.inventory_status, COUNT(*) AS unit_count
+              FROM inventory_units units
+              JOIN skus sku
+                ON sku.tenant_id = units.tenant_id
+               AND sku.id = units.sku_id
+              JOIN inbound_receipt_lines line
+                ON line.tenant_id = units.tenant_id
+               AND line.id = units.inbound_receipt_line_id
+              JOIN inbound_receipts receipt
+                ON receipt.tenant_id = units.tenant_id
+               AND receipt.id = line.receipt_id
+              LEFT JOIN business_parties supplier
+                ON supplier.tenant_id = units.tenant_id
+               AND supplier.id = receipt.supplier_party_id
+             WHERE units.tenant_id = $1
+               AND ($2 IS NULL OR units.owner_party_id = $2)
+               AND ($3 IS NULL OR units.sku_id = $3)
+               AND units.inventory_status IN ('received', 'available', 'reserved', 'quarantined')
+             GROUP BY units.sku_id, sku.code, sku.name, receipt.supplier_party_id,
+                      supplier.display_name, units.inventory_status
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(owner_party_id)
+        .bind(sku_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+
+        for row in product_rows {
+            let count = u64::try_from(row.try_get::<i64, _>("unit_count")?).map_err(|_| {
+                NetworkServiceError::Invalid("invalid on-hand product count".to_owned())
+            })?;
+            let inventory_status: String = row.try_get("inventory_status")?;
+            let inventory_status =
+                serde_json::from_value(serde_json::Value::String(inventory_status))
+                    .map_err(|error| NetworkServiceError::Invalid(error.to_string()))?;
+            summary.add_on_hand_group(
+                row.try_get::<Uuid, _>("sku_id")?.to_string(),
+                row.try_get("sku_code")?,
+                row.try_get("sku_name")?,
+                row.try_get::<Option<Uuid>, _>("supplier_party_id")?
+                    .map(|value| value.to_string()),
+                row.try_get("supplier_name")?,
+                inventory_status,
+                count,
+            );
+        }
+        summary.sort_on_hand_products();
         authorized.commit().await?;
         Ok(summary)
     }
@@ -1569,6 +1698,32 @@ fn normalize_catalog_product(
         )));
     }
     Ok(input)
+}
+
+fn normalize_saved_catalog_product(
+    mut input: SaveCatalogProductRequest,
+) -> NetworkResult<SaveCatalogProductRequest> {
+    input.sku_id = input
+        .sku_id
+        .map(|sku_id| required("sku_id", sku_id))
+        .transpose()?;
+    if let Some(sku_id) = &input.sku_id {
+        Uuid::parse_str(sku_id)
+            .map_err(|_| NetworkServiceError::Invalid("sku_id must be a UUID".to_owned()))?;
+    }
+    let normalized = normalize_catalog_product(CreateCatalogProductRequest {
+        code: input.code,
+        name: input.name,
+        serial_prefix: input.serial_prefix,
+        serial_forbidden_chars: input.serial_forbidden_chars,
+    })?;
+    Ok(SaveCatalogProductRequest {
+        sku_id: input.sku_id,
+        code: normalized.code,
+        name: normalized.name,
+        serial_prefix: normalized.serial_prefix,
+        serial_forbidden_chars: normalized.serial_forbidden_chars,
+    })
 }
 
 fn normalize_saved_catalog_party(

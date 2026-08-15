@@ -1518,6 +1518,19 @@ async fn v2_create_catalog_product(
 }
 
 #[tauri::command]
+async fn v2_save_catalog_product(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::application::SaveCatalogProductRequest,
+) -> Result<v2::application::CatalogProduct, String> {
+    activation::require_activated(&app)?;
+    database
+        .save_catalog_product(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn v2_create_catalog_party(
     app: tauri::AppHandle,
     database: tauri::State<'_, v2::OfflineDatabase>,
@@ -1976,6 +1989,17 @@ async fn v2_network_create_catalog_product(
 ) -> Result<v2::application::CatalogProduct, String> {
     client
         .create_catalog_product(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_save_catalog_product(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::application::SaveCatalogProductRequest,
+) -> Result<v2::application::CatalogProduct, String> {
+    client
+        .save_catalog_product(&input)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2593,6 +2617,7 @@ pub fn run() {
             v2_post_receipt,
             v2_list_reference_catalog,
             v2_create_catalog_product,
+            v2_save_catalog_product,
             v2_create_catalog_party,
             v2_save_catalog_party,
             v2_inspect_legacy_workbook,
@@ -2638,6 +2663,7 @@ pub fn run() {
             v2_network_post_receipt,
             v2_network_list_reference_catalog,
             v2_network_create_catalog_product,
+            v2_network_save_catalog_product,
             v2_network_create_catalog_party,
             v2_network_save_catalog_party,
             v2_network_list_warehouses,

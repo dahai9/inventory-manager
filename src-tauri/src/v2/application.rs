@@ -133,6 +133,18 @@ pub struct CreateCatalogProductRequest {
     pub serial_forbidden_chars: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveCatalogProductRequest {
+    #[serde(default)]
+    pub sku_id: Option<String>,
+    pub code: String,
+    pub name: String,
+    #[serde(default)]
+    pub serial_prefix: Option<String>,
+    #[serde(default)]
+    pub serial_forbidden_chars: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogPartyRole {
@@ -377,10 +389,30 @@ pub struct QualityStatusSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventorySupplierStockSummary {
+    pub supplier_party_id: Option<String>,
+    pub supplier_name: String,
+    pub on_hand_units: u64,
+    pub inventory: InventoryStatusSummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryProductStockSummary {
+    pub sku_id: String,
+    pub sku_code: String,
+    pub sku_name: String,
+    pub on_hand_units: u64,
+    pub inventory: InventoryStatusSummary,
+    pub suppliers: Vec<InventorySupplierStockSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventorySummaryResponse {
     pub total_units: u64,
     pub inventory: InventoryStatusSummary,
     pub quality: QualityStatusSummary,
+    #[serde(default)]
+    pub products: Vec<InventoryProductStockSummary>,
 }
 
 impl OfflineDatabase {
@@ -1372,6 +1404,81 @@ impl OfflineDatabase {
         })
     }
 
+    pub async fn save_catalog_product(
+        &self,
+        input: SaveCatalogProductRequest,
+    ) -> ApplicationResult<CatalogProduct> {
+        let input = normalize_saved_catalog_product(input)?;
+        let Some(sku_id) = input.sku_id else {
+            return self
+                .create_catalog_product(CreateCatalogProductRequest {
+                    code: input.code,
+                    name: input.name,
+                    serial_prefix: input.serial_prefix,
+                    serial_forbidden_chars: input.serial_forbidden_chars,
+                })
+                .await;
+        };
+        let workspace_id = self.workspace_id();
+        let mut transaction = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| storage("begin catalog product save transaction", error))?;
+        ensure_workspace_writable(&mut transaction, workspace_id).await?;
+
+        let conflicting_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM skus WHERE workspace_id = ?1 AND code = ?2 AND id <> ?3",
+        )
+        .bind(workspace_id)
+        .bind(&input.code)
+        .bind(&sku_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| storage("check catalog product code", error))?;
+        if conflicting_id.is_some() {
+            return Err(ApplicationError::Conflict {
+                entity: "sku".to_owned(),
+                key: input.code,
+                message: "product code already exists in this workspace".to_owned(),
+            });
+        }
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE skus
+               SET code = ?1, name = ?2, serial_prefix = ?3, serial_forbidden_chars = ?4
+             WHERE workspace_id = ?5 AND id = ?6 AND active = 1
+            "#,
+        )
+        .bind(&input.code)
+        .bind(&input.name)
+        .bind(&input.serial_prefix)
+        .bind(&input.serial_forbidden_chars)
+        .bind(workspace_id)
+        .bind(&sku_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| storage("update catalog product", error))?;
+        if updated.rows_affected() != 1 {
+            return Err(ApplicationError::NotFound {
+                entity: "sku".to_owned(),
+                key: sku_id,
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| storage("commit catalog product save", error))?;
+        Ok(CatalogProduct {
+            sku_id,
+            code: input.code,
+            name: input.name,
+            serial_prefix: input.serial_prefix,
+            serial_forbidden_chars: input.serial_forbidden_chars,
+        })
+    }
+
     pub async fn create_catalog_party(
         &self,
         input: CreateCatalogPartyRequest,
@@ -1654,7 +1761,121 @@ impl OfflineDatabase {
             summary.inventory.add(inventory_status, count);
             summary.quality.add(quality_status, count);
         }
+
+        let product_rows = sqlx::query(
+            r#"
+            SELECT units.sku_id, sku.code AS sku_code, sku.name AS sku_name,
+                   receipt.supplier_party_id,
+                   COALESCE(supplier.display_name, '历史来源未记录') AS supplier_name,
+                   units.inventory_status, COUNT(*) AS unit_count
+              FROM inventory_units units
+              JOIN skus sku
+                ON sku.id = units.sku_id
+               AND sku.workspace_id = units.workspace_id
+              JOIN inbound_receipt_lines line
+                ON line.id = units.inbound_receipt_line_id
+               AND line.workspace_id = units.workspace_id
+              JOIN inbound_receipts receipt
+                ON receipt.id = line.receipt_id
+               AND receipt.workspace_id = units.workspace_id
+              LEFT JOIN business_parties supplier
+                ON supplier.id = receipt.supplier_party_id
+               AND supplier.workspace_id = units.workspace_id
+             WHERE units.workspace_id = ?1
+               AND (?2 IS NULL OR units.owner_party_id = ?2)
+               AND (?3 IS NULL OR units.sku_id = ?3)
+               AND units.inventory_status IN ('received', 'available', 'reserved', 'quarantined')
+             GROUP BY units.sku_id, sku.code, sku.name, receipt.supplier_party_id,
+                      supplier.display_name, units.inventory_status
+            "#,
+        )
+        .bind(self.workspace_id())
+        .bind(&owner_party_id)
+        .bind(&sku_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| storage("summarize on-hand products", error))?;
+
+        for row in product_rows {
+            let count = nonnegative_u64("on-hand product group count", row.try_get("unit_count")?)?;
+            let inventory_status = parse_inventory_status(row.try_get("inventory_status")?)?;
+            summary.add_on_hand_group(
+                row.try_get("sku_id")?,
+                row.try_get("sku_code")?,
+                row.try_get("sku_name")?,
+                row.try_get("supplier_party_id")?,
+                row.try_get("supplier_name")?,
+                inventory_status,
+                count,
+            );
+        }
+        summary.sort_on_hand_products();
         Ok(summary)
+    }
+}
+
+impl InventorySummaryResponse {
+    pub(crate) fn add_on_hand_group(
+        &mut self,
+        sku_id: String,
+        sku_code: String,
+        sku_name: String,
+        supplier_party_id: Option<String>,
+        supplier_name: String,
+        inventory_status: InventoryStatus,
+        count: u64,
+    ) {
+        let product =
+            if let Some(index) = self.products.iter().position(|item| item.sku_id == sku_id) {
+                &mut self.products[index]
+            } else {
+                self.products.push(InventoryProductStockSummary {
+                    sku_id: sku_id.clone(),
+                    sku_code,
+                    sku_name,
+                    ..InventoryProductStockSummary::default()
+                });
+                self.products.last_mut().expect("product was just inserted")
+            };
+        product.on_hand_units += count;
+        product.inventory.add(inventory_status, count);
+
+        let supplier = if let Some(index) = product
+            .suppliers
+            .iter()
+            .position(|item| item.supplier_party_id == supplier_party_id)
+        {
+            &mut product.suppliers[index]
+        } else {
+            product.suppliers.push(InventorySupplierStockSummary {
+                supplier_party_id,
+                supplier_name,
+                ..InventorySupplierStockSummary::default()
+            });
+            product
+                .suppliers
+                .last_mut()
+                .expect("supplier was just inserted")
+        };
+        supplier.on_hand_units += count;
+        supplier.inventory.add(inventory_status, count);
+    }
+
+    pub(crate) fn sort_on_hand_products(&mut self) {
+        for product in &mut self.products {
+            product.suppliers.sort_by(|left, right| {
+                right
+                    .on_hand_units
+                    .cmp(&left.on_hand_units)
+                    .then_with(|| left.supplier_name.cmp(&right.supplier_name))
+            });
+        }
+        self.products.sort_by(|left, right| {
+            right
+                .on_hand_units
+                .cmp(&left.on_hand_units)
+                .then_with(|| left.sku_code.cmp(&right.sku_code))
+        });
     }
 }
 
@@ -1752,6 +1973,28 @@ fn normalize_catalog_product(
         ));
     }
     Ok(input)
+}
+
+fn normalize_saved_catalog_product(
+    mut input: SaveCatalogProductRequest,
+) -> ApplicationResult<SaveCatalogProductRequest> {
+    input.sku_id = clean_optional(input.sku_id);
+    if let Some(sku_id) = &input.sku_id {
+        Uuid::parse_str(sku_id).map_err(|_| validation("sku_id", "must be a UUID"))?;
+    }
+    let normalized = normalize_catalog_product(CreateCatalogProductRequest {
+        code: input.code,
+        name: input.name,
+        serial_prefix: input.serial_prefix,
+        serial_forbidden_chars: input.serial_forbidden_chars,
+    })?;
+    Ok(SaveCatalogProductRequest {
+        sku_id: input.sku_id,
+        code: normalized.code,
+        name: normalized.name,
+        serial_prefix: normalized.serial_prefix,
+        serial_forbidden_chars: normalized.serial_forbidden_chars,
+    })
 }
 
 fn normalize_catalog_party(
@@ -2627,6 +2870,71 @@ mod tests {
         assert_eq!(allowed.serial_prefix.as_deref(), Some("SN"));
     }
 
+    #[tokio::test]
+    async fn saved_catalog_product_keeps_identity_for_existing_and_new_inventory() {
+        let (database, path) = test_database_with_default_catalog().await;
+        let original = database
+            .list_reference_catalog()
+            .await
+            .expect("list original catalog")
+            .products
+            .into_iter()
+            .next()
+            .expect("default product");
+        let first = database
+            .post_receipt(receipt_request(
+                "product-edit-request-1",
+                "product-edit-key-1",
+                "product-edit-receipt-1",
+                &["EDIT001"],
+            ))
+            .await
+            .expect("receive inventory before product edit");
+
+        let saved = database
+            .save_catalog_product(SaveCatalogProductRequest {
+                sku_id: Some(original.sku_id.clone()),
+                code: " model-edited ".to_owned(),
+                name: "型号已编辑".to_owned(),
+                serial_prefix: Some("edit".to_owned()),
+                serial_forbidden_chars: "-, ".to_owned(),
+            })
+            .await
+            .expect("save edited product");
+        assert_eq!(saved.sku_id, original.sku_id);
+        assert_eq!(saved.code, "MODEL-EDITED");
+        assert_eq!(first.sku_id, saved.sku_id);
+
+        let mut second_request = receipt_request(
+            "product-edit-request-2",
+            "product-edit-key-2",
+            "product-edit-receipt-2",
+            &["EDIT002"],
+        );
+        second_request.sku_code = saved.code.clone();
+        second_request.sku_name = saved.name.clone();
+        let second = database
+            .post_receipt(second_request)
+            .await
+            .expect("receive inventory after product edit");
+        assert_eq!(second.sku_id, saved.sku_id);
+
+        let inventory = database
+            .list_inventory(InventoryListQuery {
+                sku_id: Some(saved.sku_id.clone()),
+                ..InventoryListQuery::default()
+            })
+            .await
+            .expect("list inventory for edited product");
+        assert_eq!(inventory.total, 2);
+        assert!(inventory.items.iter().all(|item| {
+            item.sku_id == saved.sku_id
+                && item.sku_code == saved.code
+                && item.sku_name == saved.name
+        }));
+        close_and_remove(database, path).await;
+    }
+
     #[test]
     fn receipt_response_deserializes_legacy_payload_without_supplier_identity() {
         let response: PostReceiptResponse = serde_json::from_value(json!({
@@ -3499,6 +3807,12 @@ mod tests {
         assert_eq!(summary.inventory.quarantined, 1);
         assert_eq!(summary.quality.passed, 1);
         assert_eq!(summary.quality.failed, 1);
+        assert_eq!(summary.products.len(), 1);
+        assert_eq!(summary.products[0].sku_code, "MODEL-X");
+        assert_eq!(summary.products[0].on_hand_units, 2);
+        assert_eq!(summary.products[0].suppliers.len(), 1);
+        assert_eq!(summary.products[0].suppliers[0].supplier_name, "供应商 A");
+        assert_eq!(summary.products[0].suppliers[0].on_hand_units, 2);
 
         let inspection_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM quality_inspections")
             .fetch_one(database.pool())
@@ -3516,6 +3830,58 @@ mod tests {
         assert_eq!(inspection_count, 1);
         assert_eq!(result_count, 2);
         assert_eq!(movement_count, 4);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn inventory_summary_groups_on_hand_products_by_supplier_and_excludes_departed_units() {
+        let (database, path) = test_database_with_default_catalog().await;
+        create_test_party(&database, "供应商 B", CatalogPartyRole::Supplier).await;
+
+        database
+            .post_receipt(receipt_request(
+                "summary-source-a-request",
+                "summary-source-a-key",
+                "R-SUMMARY-A",
+                &["SUMMARY-A-1"],
+            ))
+            .await
+            .expect("post first supplier receipt");
+        let mut source_b = receipt_request(
+            "summary-source-b-request",
+            "summary-source-b-key",
+            "R-SUMMARY-B",
+            &["SUMMARY-B-1", "SUMMARY-B-2"],
+        );
+        source_b.supplier_name = "供应商 B".to_owned();
+        database
+            .post_receipt(source_b)
+            .await
+            .expect("post second supplier receipt");
+
+        sqlx::query(
+            "UPDATE inventory_units SET inventory_status = 'delivered' WHERE barcode = 'SUMMARY-B-2'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("mark one unit as departed");
+
+        let summary = database
+            .inventory_summary(InventorySummaryQuery::default())
+            .await
+            .expect("summarize supplier stock");
+        assert_eq!(summary.total_units, 3);
+        assert_eq!(summary.inventory.received, 2);
+        assert_eq!(summary.inventory.delivered, 1);
+        assert_eq!(summary.products.len(), 1);
+        let product = &summary.products[0];
+        assert_eq!(product.on_hand_units, 2);
+        assert_eq!(product.inventory.received, 2);
+        assert_eq!(product.suppliers.len(), 2);
+        assert_eq!(product.suppliers[0].supplier_name, "供应商 A");
+        assert_eq!(product.suppliers[0].on_hand_units, 1);
+        assert_eq!(product.suppliers[1].supplier_name, "供应商 B");
+        assert_eq!(product.suppliers[1].on_hand_units, 1);
         close_and_remove(database, path).await;
     }
 

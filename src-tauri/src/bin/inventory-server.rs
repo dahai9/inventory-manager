@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use inventory_manager_lib::v2::application::{
     CreateCatalogPartyRequest, CreateCatalogProductRequest, SaveCatalogPartyRequest,
-    SaveQualityLabelRequest,
+    SaveCatalogProductRequest, SaveQualityLabelRequest,
 };
 use inventory_manager_lib::v2::auth::{AuthError, AuthorizationDenial};
 use inventory_manager_lib::v2::identity_admin::{
@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/reference/catalog/query", post(list_reference_catalog))
         .route("/v1/reference/products", post(create_catalog_product))
+        .route("/v1/reference/products/save", post(save_catalog_product))
         .route("/v1/reference/parties", post(create_catalog_party))
         .route("/v1/reference/parties/save", post(save_catalog_party))
         .route("/v1/reference/warehouses/query", post(list_warehouses))
@@ -562,6 +563,21 @@ async fn create_catalog_product(
     state
         .service
         .create_catalog_product(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn save_catalog_product(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<SaveCatalogProductRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .save_catalog_product(tenant_id, bearer, request)
         .await
         .map(Json)
         .map_err(Into::into)

@@ -274,6 +274,12 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
     assert_eq!(summary.total_units, 1);
     assert_eq!(summary.inventory.received, 1);
     assert_eq!(summary.quality.untested, 1);
+    assert_eq!(summary.products.len(), 1);
+    assert_eq!(summary.products[0].sku_code, "SKU-X");
+    assert_eq!(summary.products[0].on_hand_units, 1);
+    assert_eq!(summary.products[0].suppliers.len(), 1);
+    assert_eq!(summary.products[0].suppliers[0].supplier_name, "Supplier A");
+    assert_eq!(summary.products[0].suppliers[0].on_hand_units, 1);
     let cross_tenant = service
         .inventory_summary(
             Uuid::now_v7(),

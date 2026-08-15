@@ -8,7 +8,7 @@ use super::application::{
     CatalogParty, CatalogProduct, CompleteInspectionResponse, CreateCatalogPartyRequest,
     CreateCatalogProductRequest, InventoryListResponse, InventorySummaryResponse,
     PostReceiptResponse, QualityLabel, ReferenceCatalog, SaveCatalogPartyRequest,
-    SaveQualityLabelRequest,
+    SaveCatalogProductRequest, SaveQualityLabelRequest,
 };
 use super::identity_admin::{
     CreateTenantUserRequest, CreateTenantUserResponse, DisableTenantUserRequest,
@@ -289,6 +289,14 @@ impl NetworkClient {
         request: &CreateCatalogProductRequest,
     ) -> Result<CatalogProduct, NetworkClientError> {
         self.authorized_json(Method::POST, "/v1/reference/products", request)
+            .await
+    }
+
+    pub async fn save_catalog_product(
+        &self,
+        request: &SaveCatalogProductRequest,
+    ) -> Result<CatalogProduct, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/reference/products/save", request)
             .await
     }
 

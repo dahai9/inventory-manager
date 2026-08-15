@@ -11,6 +11,8 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   ArrowRight,
+  ArrowDown,
+  ArrowUp,
   Bell,
   Boxes,
   CheckCircle2,
@@ -26,6 +28,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  SlidersHorizontal,
   ShieldAlert,
   Truck,
   Tags,
@@ -44,6 +47,7 @@ import "./InventoryWorkspace.css";
 type WorkspacePage = "overview" | "catalog" | "receipt" | "quality" | "inventory" | "lifecycle" | "records" | "returns" | "outbound" | "legacy-import" | "users" | "settings";
 type WorkspaceMode = "offline" | "network";
 type NavigationGroupId = "operations" | "inventory_data" | "catalog" | "system";
+type SearchClearPreferenceKey = "inventory" | "lifecycle" | "records";
 type CatalogTab = "products" | "parties";
 type ReceiptStep = 1 | 2 | 3;
 type QualityStep = 1 | 2;
@@ -159,7 +163,8 @@ interface ReferenceCatalog {
   suppliers: CatalogParty[];
 }
 
-interface CreateCatalogProductRequest {
+interface SaveCatalogProductRequest {
+  sku_id: string | null;
   code: string;
   name: string;
   serial_prefix: string | null;
@@ -384,10 +389,27 @@ interface QualityStatusSummary {
   waived: number;
 }
 
+interface InventorySupplierStockSummary {
+  supplier_party_id: string | null;
+  supplier_name: string;
+  on_hand_units: number;
+  inventory: InventoryStatusSummary;
+}
+
+interface InventoryProductStockSummary {
+  sku_id: string;
+  sku_code: string;
+  sku_name: string;
+  on_hand_units: number;
+  inventory: InventoryStatusSummary;
+  suppliers: InventorySupplierStockSummary[];
+}
+
 interface DashboardDto {
   total_units: number;
   inventory: InventoryStatusSummary;
   quality: QualityStatusSummary;
+  products: InventoryProductStockSummary[];
 }
 
 interface CreateOutboundOrderRequest {
@@ -696,6 +718,16 @@ const navigationItems: NavigationItem[] = [
   { id: "settings", label: "数据与设置", description: "备份、恢复和升级", icon: Settings, group: "system" },
 ];
 
+const defaultOverviewShortcuts: WorkspacePage[] = ["receipt", "quality", "inventory", "outbound"];
+const overviewShortcutLimit = 6;
+const searchClearPreferencesStorageKey = "inventory-v2-clear-search-after-enter";
+
+const defaultSearchClearPreferences: Record<SearchClearPreferenceKey, boolean> = {
+  inventory: false,
+  lifecycle: false,
+  records: false,
+};
+
 const inventoryStatusLabels: Record<InventoryStatus, string> = {
   received: "待检入库",
   available: "可用",
@@ -936,6 +968,50 @@ function getStoredNetworkValue(key: string): string {
   }
 }
 
+function getStoredSearchClearPreferences(): Record<SearchClearPreferenceKey, boolean> {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(searchClearPreferencesStorageKey) ?? "null");
+    if (!parsed || typeof parsed !== "object") return { ...defaultSearchClearPreferences };
+    const values = parsed as Partial<Record<SearchClearPreferenceKey, unknown>>;
+    return {
+      inventory: values.inventory === true,
+      lifecycle: values.lifecycle === true,
+      records: values.records === true,
+    };
+  } catch {
+    return { ...defaultSearchClearPreferences };
+  }
+}
+
+function overviewShortcutStorageKey(mode: WorkspaceMode): string {
+  return `inventory-v2-overview-shortcuts-${mode}`;
+}
+
+function availableOverviewShortcutIds(mode: WorkspaceMode): Set<WorkspacePage> {
+  return new Set(
+    navigationItems
+      .filter((item) => item.id !== "overview" && (!item.mode || item.mode === mode))
+      .map((item) => item.id),
+  );
+}
+
+function getStoredOverviewShortcuts(mode: WorkspaceMode): WorkspacePage[] {
+  const available = availableOverviewShortcutIds(mode);
+  const fallback = defaultOverviewShortcuts.filter((pageId) => available.has(pageId));
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(overviewShortcutStorageKey(mode)) ?? "null");
+    if (!Array.isArray(parsed)) return fallback;
+    const unique = parsed.filter((value, index): value is WorkspacePage => (
+      typeof value === "string"
+      && available.has(value as WorkspacePage)
+      && parsed.indexOf(value) === index
+    )).slice(0, overviewShortcutLimit);
+    return unique.length > 0 ? unique : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function getNetworkDeviceId(): string {
   const storageKey = "inventory-v2-network-device-id";
   const existing = getStoredNetworkValue(storageKey);
@@ -1014,6 +1090,14 @@ export default function InventoryWorkspace({
   const [dashboard, setDashboard] = useState<DashboardDto | null>(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [selectedOverviewSkuId, setSelectedOverviewSkuId] = useState("");
+  const [overviewShortcutPreferences, setOverviewShortcutPreferences] = useState<Record<WorkspaceMode, WorkspacePage[]>>(() => ({
+    offline: getStoredOverviewShortcuts("offline"),
+    network: getStoredOverviewShortcuts("network"),
+  }));
+  const [overviewShortcutEditorOpen, setOverviewShortcutEditorOpen] = useState(false);
+  const [overviewShortcutDraft, setOverviewShortcutDraft] = useState<WorkspacePage[]>([]);
+  const [searchClearPreferences, setSearchClearPreferences] = useState<Record<SearchClearPreferenceKey, boolean>>(() => getStoredSearchClearPreferences());
 
   const [catalog, setCatalog] = useState<ReferenceCatalog | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
@@ -1024,6 +1108,7 @@ export default function InventoryWorkspace({
   const [newProductName, setNewProductName] = useState("");
   const [newProductSerialPrefix, setNewProductSerialPrefix] = useState("");
   const [newProductForbiddenChars, setNewProductForbiddenChars] = useState("-, ");
+  const [editingProductId, setEditingProductId] = useState<string | null>(null);
   const [editingPartyId, setEditingPartyId] = useState<string | null>(null);
   const [newPartyName, setNewPartyName] = useState("");
   const [newPartyRoles, setNewPartyRoles] = useState<Set<CatalogPartyRole>>(() => new Set(["supplier"]));
@@ -1035,6 +1120,9 @@ export default function InventoryWorkspace({
   const [newPartyNotes, setNewPartyNotes] = useState("");
 
   const [supplierName, setSupplierName] = useState("");
+  const [receiptProductInput, setReceiptProductInput] = useState("");
+  const [receiptProductSuggestionsOpen, setReceiptProductSuggestionsOpen] = useState(false);
+  const [receiptSupplierSuggestionsOpen, setReceiptSupplierSuggestionsOpen] = useState(false);
   const [selectedProductId, setSelectedProductId] = useState("");
   const [receivedAt, setReceivedAt] = useState(getLocalDateTimeValue);
   const [sourceReference, setSourceReference] = useState("");
@@ -1090,6 +1178,14 @@ export default function InventoryWorkspace({
   const [inventoryStatus, setInventoryStatus] = useState<InventoryStatus | "">("");
   const [qualityStatus, setQualityStatus] = useState<QualityStatus | "">("");
   const [lifecycleSearch, setLifecycleSearch] = useState("");
+  const inventorySearchRef = useRef(inventorySearch);
+  const inventoryStatusRef = useRef(inventoryStatus);
+  const qualityStatusRef = useRef(qualityStatus);
+  const lifecycleSearchRef = useRef(lifecycleSearch);
+  inventorySearchRef.current = inventorySearch;
+  inventoryStatusRef.current = inventoryStatus;
+  qualityStatusRef.current = qualityStatus;
+  lifecycleSearchRef.current = lifecycleSearch;
 
   const [outboundReceiver, setOutboundReceiver] = useState("");
   const [outboundReceiverSuggestionsOpen, setOutboundReceiverSuggestionsOpen] = useState(false);
@@ -1116,6 +1212,8 @@ export default function InventoryWorkspace({
 
   const [recordTab, setRecordTab] = useState<"receipt" | "outbound">("outbound");
   const [recordSearch, setRecordSearch] = useState("");
+  const recordSearchRef = useRef(recordSearch);
+  recordSearchRef.current = recordSearch;
   const [receiptRecords, setReceiptRecords] = useState<ReceiptRecord[]>([]);
   const [outboundRecords, setOutboundRecords] = useState<OutboundOrderRecord[]>([]);
   const [recordLoading, setRecordLoading] = useState(false);
@@ -1145,9 +1243,29 @@ export default function InventoryWorkspace({
     () => catalog?.products.find((product) => product.sku_id === selectedProductId) ?? null,
     [catalog, selectedProductId],
   );
+  const selectedSupplier = useMemo(() => {
+    const normalized = supplierName.trim().toLocaleLowerCase();
+    return catalog?.suppliers.find((party) => party.display_name.toLocaleLowerCase() === normalized) ?? null;
+  }, [catalog, supplierName]);
+  const receiptProductSuggestions = useMemo(() => {
+    const query = receiptProductInput.trim().toLocaleLowerCase();
+    const products = catalog?.products ?? [];
+    if (!query) return products.slice(0, 8);
+    return products
+      .filter((product) => `${product.code} ${product.name}`.toLocaleLowerCase().includes(query))
+      .slice(0, 8);
+  }, [catalog, receiptProductInput]);
+  const receiptSupplierSuggestions = useMemo(() => {
+    const query = supplierName.trim().toLocaleLowerCase();
+    const suppliers = catalog?.suppliers ?? [];
+    if (!query) return suppliers.slice(0, 8);
+    return suppliers
+      .filter((party) => party.display_name.toLocaleLowerCase().includes(query))
+      .slice(0, 8);
+  }, [catalog, supplierName]);
   const receiptMissingDetails = [
     !selectedProduct ? "商品" : null,
-    !catalog?.suppliers.some((party) => party.display_name === supplierName) ? "供应商" : null,
+    !selectedSupplier ? "供应商" : null,
     !receivedAt ? "入库时间" : null,
     mode === "network" && !networkWarehouses.some((warehouse) => warehouse.warehouse_id === networkWarehouseId)
       ? "入库仓库"
@@ -1227,9 +1345,14 @@ export default function InventoryWorkspace({
       setSelectedProductId((current) => nextCatalog.products.some((product) => product.sku_id === current)
         ? current
         : (nextCatalog.products[0]?.sku_id ?? ""));
-      setSupplierName((current) => nextCatalog.suppliers.some((party) => party.display_name === current)
-        ? current
-        : (nextCatalog.suppliers[0]?.display_name ?? ""));
+      setReceiptProductInput((current) => {
+        const matched = nextCatalog.products.find((product) => product.code.toLocaleLowerCase() === current.trim().toLocaleLowerCase());
+        return matched?.code ?? nextCatalog.products[0]?.code ?? "";
+      });
+      setSupplierName((current) => {
+        const matched = nextCatalog.suppliers.find((party) => party.display_name.toLocaleLowerCase() === current.trim().toLocaleLowerCase());
+        return matched?.display_name ?? nextCatalog.suppliers[0]?.display_name ?? "";
+      });
     } catch (error) {
       if (context === workspaceContextRef.current) {
         setCatalogNotice({ type: "error", text: `读取基础资料失败：${displayError(error)}` });
@@ -1247,7 +1370,15 @@ export default function InventoryWorkspace({
     try {
       const command = mode === "network" ? "v2_network_get_dashboard" : "v2_get_dashboard";
       const response = await invoke<DashboardDto>(command, { query: { owner_party_id: null, sku_id: null } });
-      if (context === workspaceContextRef.current) setDashboard(response);
+      if (context === workspaceContextRef.current) {
+        const products = response.products ?? [];
+        setDashboard({ ...response, products });
+        setSelectedOverviewSkuId((current) => (
+          products.some((product) => product.sku_id === current)
+            ? current
+            : (products[0]?.sku_id ?? "")
+        ));
+      }
     } catch (error) {
       if (context === workspaceContextRef.current) setDashboardError(displayError(error));
     } finally {
@@ -1306,31 +1437,33 @@ export default function InventoryWorkspace({
     }
   }, [mode, networkStatus?.authenticated]);
 
-  const refreshInventory = useCallback(async () => {
+  const refreshInventory = useCallback(async (): Promise<boolean> => {
     const context = workspaceContextRef.current;
-    if (mode === "network" && !networkStatus?.authenticated) return;
+    if (mode === "network" && !networkStatus?.authenticated) return false;
     setInventoryLoading(true);
     setInventoryError(null);
     try {
       const query: InventoryListQuery = {
         ...emptyInventoryQuery(),
-        search: inventorySearch.trim() || null,
-        inventory_status: inventoryStatus || null,
-        quality_status: qualityStatus || null,
+        search: inventorySearchRef.current.trim() || null,
+        inventory_status: inventoryStatusRef.current || null,
+        quality_status: qualityStatusRef.current || null,
       };
       const command = mode === "network" ? "v2_network_list_inventory" : "v2_list_inventory";
       const response = await invoke<InventoryListResponse>(command, { query });
-      if (context !== workspaceContextRef.current) return;
+      if (context !== workspaceContextRef.current) return false;
       setInventoryItems(response.items);
       setInventoryTotal(response.total);
+      return true;
     } catch (error) {
       if (context === workspaceContextRef.current) setInventoryError(displayError(error));
+      return false;
     } finally {
       if (context === workspaceContextRef.current) setInventoryLoading(false);
     }
-  }, [inventorySearch, inventoryStatus, qualityStatus, mode, networkStatus?.authenticated]);
+  }, [mode, networkStatus?.authenticated]);
 
-  async function openInventoryTrace(barcode: string) {
+  async function openInventoryTrace(barcode: string): Promise<boolean> {
     const context = workspaceContextRef.current;
     setInventoryTraceBarcode(barcode);
     setInventoryTrace(null);
@@ -1341,32 +1474,38 @@ export default function InventoryWorkspace({
     try {
       const command = mode === "network" ? "v2_network_inventory_trace" : "v2_inventory_trace";
       const trace = await invoke<InventoryTrace>(command, { barcode });
-      if (context === workspaceContextRef.current) setInventoryTrace(trace);
+      if (context !== workspaceContextRef.current) return false;
+      setInventoryTrace(trace);
+      return true;
     } catch (error) {
       if (context === workspaceContextRef.current) setInventoryTraceError(displayError(error));
+      return false;
     } finally {
       if (context === workspaceContextRef.current) setInventoryTraceLoading(false);
     }
   }
 
-  async function searchLifecycle(event?: FormEvent<HTMLFormElement>) {
+  async function searchLifecycle(event?: FormEvent<HTMLFormElement>, fromEnter = false) {
     event?.preventDefault();
     const barcode = lifecycleSearch.trim();
     if (!barcode) {
       setInventoryTraceError("请输入或扫描 SN");
       return;
     }
-    await openInventoryTrace(barcode);
+    const loaded = await openInventoryTrace(barcode);
+    if (fromEnter && loaded && searchClearPreferences.lifecycle && lifecycleSearchRef.current.trim() === barcode) {
+      setLifecycleSearch("");
+    }
   }
 
-  async function refreshRecords() {
-    if (mode === "network" && !networkStatus?.authenticated) return;
+  async function refreshRecords(): Promise<boolean> {
+    if (mode === "network" && !networkStatus?.authenticated) return false;
     setRecordLoading(true);
     setRecordNotice(null);
     setSelectedReceiptDocument(null);
     setSelectedOutboundDocument(null);
     try {
-      const query = { search: recordSearch.trim() || null, limit: 200 };
+      const query = { search: recordSearchRef.current.trim() || null, limit: 200 };
       if (recordTab === "receipt") {
         const command = mode === "network" ? "v2_network_list_receipt_records" : "v2_list_receipt_records";
         setReceiptRecords(await invoke<ReceiptRecord[]>(command, { query }));
@@ -1374,10 +1513,28 @@ export default function InventoryWorkspace({
         const command = mode === "network" ? "v2_network_list_outbound_order_records" : "v2_list_outbound_order_records";
         setOutboundRecords(await invoke<OutboundOrderRecord[]>(command, { query }));
       }
+      return true;
     } catch (error) {
       setRecordNotice({ type: "error", text: `读取单据失败：${displayError(error)}` });
+      return false;
     } finally {
       setRecordLoading(false);
+    }
+  }
+
+  async function submitInventorySearch(fromEnter = false) {
+    const submittedSearch = inventorySearchRef.current;
+    const loaded = await refreshInventory();
+    if (fromEnter && loaded && searchClearPreferences.inventory && inventorySearchRef.current === submittedSearch) {
+      setInventorySearch("");
+    }
+  }
+
+  async function submitRecordsSearch(fromEnter = false) {
+    const submittedSearch = recordSearchRef.current;
+    const loaded = await refreshRecords();
+    if (fromEnter && loaded && searchClearPreferences.records && recordSearchRef.current === submittedSearch) {
+      setRecordSearch("");
     }
   }
 
@@ -1609,6 +1766,7 @@ export default function InventoryWorkspace({
     setNewProductName("");
     setNewProductSerialPrefix("");
     setNewProductForbiddenChars("-, ");
+    setEditingProductId(null);
     setEditingPartyId(null);
     setNewPartyName("");
     setNewPartyRoles(new Set(["supplier"]));
@@ -1646,6 +1804,18 @@ export default function InventoryWorkspace({
     setNewPartyEmail(party.email ?? "");
     setNewPartyAddress(party.address ?? "");
     setNewPartyNotes(party.notes ?? "");
+    setCatalogNotice(null);
+    setCatalogCreateOpen(true);
+  }
+
+  function openCatalogProductEdit(product: CatalogProduct) {
+    resetCatalogDraft();
+    setCatalogTab("products");
+    setEditingProductId(product.sku_id);
+    setNewProductCode(product.code);
+    setNewProductName(product.name);
+    setNewProductSerialPrefix(product.serial_prefix ?? "");
+    setNewProductForbiddenChars(product.serial_forbidden_chars);
     setCatalogNotice(null);
     setCatalogCreateOpen(true);
   }
@@ -1726,6 +1896,37 @@ export default function InventoryWorkspace({
     setReceiptWarrantyManualStart(false);
     setReceiptWarrantyStartsAt(getLocalDateTimeValue());
     setReceiptStep(1);
+  }
+
+  function chooseReceiptProduct(product: CatalogProduct) {
+    setReceiptProductInput(product.code);
+    setSelectedProductId(product.sku_id);
+    setReceiptProductSuggestionsOpen(false);
+    setScannerInput("");
+    setReceiptNotice(null);
+  }
+
+  function updateReceiptProductInput(value: string) {
+    setReceiptProductInput(value);
+    const normalized = value.trim().toLocaleLowerCase();
+    const matched = (catalog?.products ?? []).find((product) => (
+      product.code.toLocaleLowerCase() === normalized
+      || product.name.toLocaleLowerCase() === normalized
+    ));
+    setSelectedProductId(matched?.sku_id ?? "");
+    setReceiptProductSuggestionsOpen(true);
+    setScannerInput("");
+    setReceiptNotice(null);
+  }
+
+  function chooseReceiptSupplier(party: CatalogParty) {
+    setSupplierName(party.display_name);
+    setReceiptSupplierSuggestionsOpen(false);
+  }
+
+  function updateReceiptSupplierInput(value: string) {
+    setSupplierName(value);
+    setReceiptSupplierSuggestionsOpen(true);
   }
 
   function canOpenQualityStep(step: QualityStep): boolean {
@@ -1820,6 +2021,9 @@ export default function InventoryWorkspace({
     setDashboard(null);
     setDashboardLoading(false);
     setDashboardError(null);
+    setSelectedOverviewSkuId("");
+    setOverviewShortcutEditorOpen(false);
+    setOverviewShortcutDraft([]);
 
     setCatalog(null);
     setCatalogLoading(false);
@@ -1827,6 +2031,9 @@ export default function InventoryWorkspace({
     setCatalogCreateOpen(false);
     resetCatalogDraft();
     setSelectedProductId("");
+    setReceiptProductInput("");
+    setReceiptProductSuggestionsOpen(false);
+    setReceiptSupplierSuggestionsOpen(false);
     setSupplierName("");
 
     setScannedBarcodes([]);
@@ -2006,24 +2213,23 @@ export default function InventoryWorkspace({
     }
     setCatalogLoading(true);
     try {
-      const input: CreateCatalogProductRequest = {
+      const input: SaveCatalogProductRequest = {
+        sku_id: editingProductId,
         code: newProductCode,
         name: newProductName,
         serial_prefix: newProductSerialPrefix.trim() || null,
         serial_forbidden_chars: newProductForbiddenChars,
       };
-      const command = mode === "network" ? "v2_network_create_catalog_product" : "v2_create_catalog_product";
+      const command = mode === "network" ? "v2_network_save_catalog_product" : "v2_save_catalog_product";
       const product = await invoke<CatalogProduct>(command, { input });
       setSelectedProductId(product.sku_id);
-      setNewProductCode("");
-      setNewProductName("");
-      setNewProductSerialPrefix("");
-      setNewProductForbiddenChars("-, ");
-      setCatalogNotice({ type: "success", text: `已创建商品 ${product.code}。` });
+      setReceiptProductInput(product.code);
+      setCatalogNotice({ type: "success", text: `已${editingProductId ? "更新" : "创建"}商品 ${product.code}。` });
       await refreshCatalog();
       setCatalogCreateOpen(false);
+      resetCatalogDraft();
     } catch (error) {
-      setCatalogNotice({ type: "error", text: `创建商品失败：${displayError(error)}` });
+      setCatalogNotice({ type: "error", text: `保存商品失败：${displayError(error)}` });
     } finally {
       setCatalogLoading(false);
     }
@@ -2056,7 +2262,10 @@ export default function InventoryWorkspace({
       };
       const command = mode === "network" ? "v2_network_save_catalog_party" : "v2_save_catalog_party";
       const party = await invoke<CatalogParty>(command, { input });
-      if (party.roles.includes("supplier")) setSupplierName(party.display_name);
+      if (party.roles.includes("supplier")) {
+        setSupplierName(party.display_name);
+        setReceiptSupplierSuggestionsOpen(false);
+      }
       setCatalogNotice({ type: "success", text: `已保存往来方 ${party.display_name}。` });
       await refreshCatalog();
       setCatalogCreateOpen(false);
@@ -2828,6 +3037,77 @@ export default function InventoryWorkspace({
     }
   }
 
+  function openOverviewShortcutEditor() {
+    const available = availableOverviewShortcutIds(mode);
+    const current = overviewShortcutPreferences[mode].filter((pageId) => available.has(pageId));
+    setOverviewShortcutDraft(current.length > 0 ? current : defaultOverviewShortcuts.filter((pageId) => available.has(pageId)));
+    setOverviewShortcutEditorOpen(true);
+  }
+
+  function toggleOverviewShortcut(pageId: WorkspacePage, checked: boolean) {
+    setOverviewShortcutDraft((current) => {
+      if (!checked) return current.filter((item) => item !== pageId);
+      if (current.includes(pageId) || current.length >= overviewShortcutLimit) return current;
+      return [...current, pageId];
+    });
+  }
+
+  function moveOverviewShortcut(pageId: WorkspacePage, direction: -1 | 1) {
+    setOverviewShortcutDraft((current) => {
+      const index = current.indexOf(pageId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  function resetOverviewShortcutDraft() {
+    const available = availableOverviewShortcutIds(mode);
+    setOverviewShortcutDraft(defaultOverviewShortcuts.filter((pageId) => available.has(pageId)));
+  }
+
+  function saveOverviewShortcuts() {
+    if (overviewShortcutDraft.length === 0) return;
+    const saved = [...overviewShortcutDraft];
+    setOverviewShortcutPreferences((current) => ({ ...current, [mode]: saved }));
+    try {
+      window.localStorage.setItem(overviewShortcutStorageKey(mode), JSON.stringify(saved));
+    } catch {
+      // The current session still keeps the preference when local storage is unavailable.
+    }
+    setOverviewShortcutEditorOpen(false);
+  }
+
+  function updateSearchClearPreference(key: SearchClearPreferenceKey, checked: boolean) {
+    const next = { ...searchClearPreferences, [key]: checked };
+    setSearchClearPreferences(next);
+    try {
+      window.localStorage.setItem(searchClearPreferencesStorageKey, JSON.stringify(next));
+    } catch {
+      // Keep the preference for this session when local storage is unavailable.
+    }
+  }
+
+  function resetSearchClearPreferences() {
+    const next = { ...defaultSearchClearPreferences };
+    setSearchClearPreferences(next);
+    try {
+      window.localStorage.setItem(searchClearPreferencesStorageKey, JSON.stringify(next));
+    } catch {
+      // Keep the preference for this session when local storage is unavailable.
+    }
+  }
+
+  function overviewShortcutDescription(pageId: WorkspacePage, onHandUnits: number): string {
+    if (pageId === "quality") return `${dashboard?.quality.untested ?? 0} 件待检`;
+    if (pageId === "inventory") return `${onHandUnits} 件当前在库`;
+    if (pageId === "receipt") return "新建扫码批次";
+    if (pageId === "outbound") return "凑单与交货";
+    return navigationItems.find((item) => item.id === pageId)?.description ?? "";
+  }
+
   function renderNetworkLogin() {
     return (
       <section className="v2-page v2-network-gate" aria-labelledby="v2-network-login-title">
@@ -2856,13 +3136,33 @@ export default function InventoryWorkspace({
   function renderOverview() {
     const inventory = dashboard?.inventory;
     const quality = dashboard?.quality;
+    const products = dashboard?.products ?? [];
+    const onHandUnits = products.reduce((total, product) => total + product.on_hand_units, 0);
+    const selectedProduct = products.find((product) => product.sku_id === selectedOverviewSkuId) ?? products[0] ?? null;
+    const availableShortcutIds = availableOverviewShortcutIds(mode);
+    const shortcutItems = overviewShortcutPreferences[mode]
+      .filter((pageId) => availableShortcutIds.has(pageId))
+      .flatMap((pageId) => {
+        const item = navigationItems.find((candidate) => candidate.id === pageId);
+        return item ? [item] : [];
+      });
+    const shortcutChoices = navigationItems.filter((item) => (
+      item.id !== "overview" && (!item.mode || item.mode === mode)
+    ));
+    const orderedShortcutChoices = [
+      ...overviewShortcutDraft.flatMap((pageId) => {
+        const item = shortcutChoices.find((candidate) => candidate.id === pageId);
+        return item ? [item] : [];
+      }),
+      ...shortcutChoices.filter((item) => !overviewShortcutDraft.includes(item.id)),
+    ];
     return (
       <section className="v2-page" aria-labelledby="v2-overview-title">
         <div className="v2-page-heading">
           <div>
             <span className="v2-eyebrow">库存工作台</span>
             <h2 id="v2-overview-title">业务概览</h2>
-            <p>查看单件库存、待检和隔离情况。</p>
+            <p>查看在库商品、供应商分布和作业状态。</p>
           </div>
           <button className="v2-button" type="button" onClick={() => void refreshDashboard()} disabled={dashboardLoading}>
             <RefreshCw size={16} className={dashboardLoading ? "v2-spin" : ""} /> 刷新
@@ -2870,20 +3170,52 @@ export default function InventoryWorkspace({
         </div>
         {dashboardError && <div className="v2-notice error">读取概览失败：{dashboardError}</div>}
         <section className="v2-overview-shortcuts" aria-label="常用作业">
-          <strong>常用作业</strong>
-          <div>
-            <button type="button" onClick={() => navigateToPage("receipt")} disabled={modeSwitchDisabled}><PackagePlus size={18} /><span><b>入库</b><small>新建扫码批次</small></span></button>
-            <button type="button" onClick={() => navigateToPage("quality")} disabled={modeSwitchDisabled}><ClipboardCheck size={18} /><span><b>质检</b><small>{quality?.untested ?? 0} 件待检</small></span></button>
-            <button type="button" onClick={() => navigateToPage("inventory")} disabled={modeSwitchDisabled}><Boxes size={18} /><span><b>库存</b><small>{dashboard?.total_units ?? 0} 件可追溯</small></span></button>
-            <button type="button" onClick={() => navigateToPage("outbound")} disabled={modeSwitchDisabled}><Truck size={18} /><span><b>出库</b><small>凑单与交货</small></span></button>
+          <header><strong>常用作业</strong><button className="v2-icon-button" type="button" onClick={openOverviewShortcutEditor} aria-label="自定义常用作业" title="自定义常用作业"><SlidersHorizontal size={16} /></button></header>
+          <div className="v2-overview-shortcut-list">
+            {shortcutItems.map((item) => {
+              const ShortcutIcon = item.icon;
+              return <button key={item.id} type="button" onClick={() => navigateToPage(item.id)} disabled={modeSwitchDisabled}><ShortcutIcon size={18} /><span><b>{item.label}</b><small>{overviewShortcutDescription(item.id, onHandUnits)}</small></span></button>;
+            })}
           </div>
         </section>
         <div className="v2-metric-grid" aria-busy={dashboardLoading}>
-          <article className="v2-metric-card primary"><span>库存单件总数</span><strong>{dashboard?.total_units ?? "—"}</strong><small>所有状态的可追踪条码</small></article>
+          <article className="v2-metric-card primary"><span>当前在库</span><strong>{dashboard ? onHandUnits : "—"}</strong><small>{dashboard ? `${products.length} 种商品，系统累计追踪 ${dashboard.total_units} 件` : "待检、可用、预留与隔离库存"}</small></article>
           <article className="v2-metric-card"><span>可用库存</span><strong>{inventory?.available ?? "—"}</strong><small>{displayedQualityStatusLabels.passed}，可参与凑单</small></article>
           <article className="v2-metric-card warning"><span>待检库存</span><strong>{quality?.untested ?? "—"}</strong><small>入库后尚未完成初检</small></article>
           <article className="v2-metric-card danger"><span>隔离库存</span><strong>{inventory?.quarantined ?? "—"}</strong><small>{displayedQualityStatusLabels.failed}或退回待复检</small></article>
         </div>
+        <section className="v2-panel v2-overview-stock" aria-labelledby="v2-overview-stock-title">
+          <header className="v2-overview-stock-heading">
+            <div><h3 id="v2-overview-stock-title">在库商品</h3><small>待检、可用、预留和隔离中的实物</small></div>
+            <span>{products.length} 种 · {onHandUnits} 件</span>
+          </header>
+          <div className="v2-overview-stock-layout">
+            <div className="v2-overview-product-table-wrap">
+              <table className="v2-overview-product-table">
+                <thead><tr><th>商品</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead>
+                <tbody>
+                  {!dashboardLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={6}>当前没有在库商品</td></tr>}
+                  {products.map((product) => <tr className={selectedProduct?.sku_id === product.sku_id ? "selected" : ""} key={product.sku_id}>
+                    <td><button className="v2-overview-product-select" type="button" onClick={() => setSelectedOverviewSkuId(product.sku_id)} aria-pressed={selectedProduct?.sku_id === product.sku_id}><strong>{product.sku_code}</strong><span>{product.sku_name}</span></button></td>
+                    <td><strong>{product.on_hand_units}</strong></td>
+                    <td>{product.inventory.available}</td>
+                    <td>{product.inventory.received}</td>
+                    <td>{product.inventory.reserved}</td>
+                    <td>{product.inventory.quarantined}</td>
+                  </tr>)}
+                </tbody>
+              </table>
+            </div>
+            <aside className="v2-overview-supplier-detail" aria-live="polite">
+              {selectedProduct ? <>
+                <header><div><span>供应商分布</span><h4>{selectedProduct.sku_code} · {selectedProduct.sku_name}</h4></div><strong>{selectedProduct.on_hand_units} 件</strong></header>
+                <div className="v2-overview-supplier-table-wrap"><table><thead><tr><th>供应商</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead><tbody>
+                  {selectedProduct.suppliers.map((supplier) => <tr key={supplier.supplier_party_id ?? supplier.supplier_name}><td>{supplier.supplier_name}</td><td><strong>{supplier.on_hand_units}</strong></td><td>{supplier.inventory.available}</td><td>{supplier.inventory.received}</td><td>{supplier.inventory.reserved}</td><td>{supplier.inventory.quarantined}</td></tr>)}
+                </tbody></table></div>
+              </> : <div className="v2-overview-stock-empty"><Boxes size={28} /><span>没有可显示的供应商库存</span></div>}
+            </aside>
+          </div>
+        </section>
         <div className="v2-summary-grid">
           <article className="v2-panel">
             <h3>库存状态</h3>
@@ -2904,6 +3236,26 @@ export default function InventoryWorkspace({
             </div>
           </article>
         </div>
+        {overviewShortcutEditorOpen && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setOverviewShortcutEditorOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setOverviewShortcutEditorOpen(false); }}>
+          <section className="v2-catalog-modal v2-shortcut-modal" role="dialog" aria-modal="true" aria-labelledby="v2-shortcut-modal-title" tabIndex={-1}>
+            <header><div><span>概览设置</span><h3 id="v2-shortcut-modal-title">自定义常用作业</h3></div><button className="v2-icon-button" type="button" onClick={() => setOverviewShortcutEditorOpen(false)} aria-label="关闭" title="关闭"><X size={18} /></button></header>
+            <div className="v2-shortcut-editor-body">
+              <div className="v2-shortcut-editor-heading"><strong>{mode === "network" ? "团队版" : "本机版"}</strong><span>已选择 {overviewShortcutDraft.length} / {overviewShortcutLimit}</span></div>
+              <div className="v2-shortcut-editor-list">
+                {orderedShortcutChoices.map((item) => {
+                  const ItemIcon = item.icon;
+                  const selectedIndex = overviewShortcutDraft.indexOf(item.id);
+                  const selected = selectedIndex >= 0;
+                  return <div className={`v2-shortcut-editor-row ${selected ? "selected" : ""}`} key={item.id}>
+                    <label><input type="checkbox" checked={selected} disabled={!selected && overviewShortcutDraft.length >= overviewShortcutLimit} onChange={(event) => toggleOverviewShortcut(item.id, event.target.checked)} /><ItemIcon size={17} /><span><strong>{item.label}</strong><small>{item.description}</small></span></label>
+                    {selected && <div><button className="v2-icon-button" type="button" onClick={() => moveOverviewShortcut(item.id, -1)} disabled={selectedIndex === 0} aria-label={`上移${item.label}`} title="上移"><ArrowUp size={15} /></button><button className="v2-icon-button" type="button" onClick={() => moveOverviewShortcut(item.id, 1)} disabled={selectedIndex === overviewShortcutDraft.length - 1} aria-label={`下移${item.label}`} title="下移"><ArrowDown size={15} /></button></div>}
+                  </div>;
+                })}
+              </div>
+            </div>
+            <footer className="v2-shortcut-editor-actions"><button className="v2-button" type="button" onClick={resetOverviewShortcutDraft}><RotateCcw size={16} /> 恢复默认</button><div><button className="v2-button" type="button" onClick={() => setOverviewShortcutEditorOpen(false)}>取消</button><button className="v2-button primary" type="button" onClick={saveOverviewShortcuts} disabled={overviewShortcutDraft.length === 0}>保存</button></div></footer>
+          </section>
+        </div>}
       </section>
     );
   }
@@ -2945,9 +3297,9 @@ export default function InventoryWorkspace({
             </div>
             <div className="v2-table-wrap">
               <table className="v2-catalog-table">
-                <thead><tr><th>商品编码</th><th>商品名称</th><th>SN 前缀</th><th>禁用字符或片段</th></tr></thead>
+                <thead><tr><th>商品编码</th><th>商品名称</th><th>SN 前缀</th><th>禁用字符或片段</th><th aria-label="操作" /></tr></thead>
                 <tbody>
-                  {!catalogLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={4}><div className="v2-catalog-empty"><Tags size={28} /><strong>暂无商品</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate("products")} disabled={mutationDisabled}><Plus size={16} /> 新增商品</button></div></td></tr>}
+                  {!catalogLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={5}><div className="v2-catalog-empty"><Tags size={28} /><strong>暂无商品</strong><button className="v2-button primary" type="button" onClick={() => openCatalogCreate("products")} disabled={mutationDisabled}><Plus size={16} /> 新增商品</button></div></td></tr>}
                   {products.map((product) => {
                     const forbiddenTokens = parseForbiddenSerialTokens(product.serial_forbidden_chars);
                     return (
@@ -2956,6 +3308,7 @@ export default function InventoryWorkspace({
                         <td>{product.name}</td>
                         <td>{product.serial_prefix ? <code className="v2-rule-token">{product.serial_prefix}</code> : <span className="v2-muted-value">不限</span>}</td>
                         <td>{forbiddenTokens.length > 0 ? <div className="v2-token-list">{forbiddenTokens.map((token, index) => <code className="v2-rule-token danger" key={`${token}-${index}`}>{token === " " ? "空格" : token}</code>)}</div> : <span className="v2-muted-value">无</span>}</td>
+                        <td><button className="v2-icon-button" type="button" onClick={() => openCatalogProductEdit(product)} disabled={mutationDisabled || catalogLoading} aria-label={`编辑商品 ${product.code}`} title="编辑商品"><Pencil size={16} /></button></td>
                       </tr>
                     );
                   })}
@@ -2987,8 +3340,8 @@ export default function InventoryWorkspace({
         {catalogCreateOpen && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeCatalogCreate(); }} onKeyDown={(event) => { if (event.key === "Escape") closeCatalogCreate(); }}>
           <section className="v2-catalog-modal" role="dialog" aria-modal="true" aria-labelledby="v2-catalog-create-title">
             <header>
-              <div><span>{activeTabLabel}</span><h3 id="v2-catalog-create-title">{catalogTab === "parties" && editingPartyId ? "编辑往来方" : createButtonLabel}</h3></div>
-              <button className="v2-icon-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading} aria-label="关闭新增窗口" title="关闭"><X size={17} /></button>
+              <div><span>{activeTabLabel}</span><h3 id="v2-catalog-create-title">{catalogTab === "products" && editingProductId ? "编辑商品" : catalogTab === "parties" && editingPartyId ? "编辑往来方" : createButtonLabel}</h3></div>
+              <button className="v2-icon-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading} aria-label="关闭商品或往来方窗口" title="关闭"><X size={17} /></button>
             </header>
             {catalogTab === "products" ? <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogProduct}>
               <div className="v2-form-grid">
@@ -2997,8 +3350,9 @@ export default function InventoryWorkspace({
                 <label><span>SN 前缀</span><input value={newProductSerialPrefix} onChange={(event) => setNewProductSerialPrefix(event.target.value)} placeholder="可选，例如 RAM" autoComplete="off" disabled={catalogLoading || mutationDisabled} /></label>
                 <label><span>SN 禁用字符或片段</span><input value={newProductForbiddenChars} onChange={(event) => setNewProductForbiddenChars(event.target.value)} placeholder="使用英文逗号分隔" autoComplete="off" disabled={catalogLoading || mutationDisabled} /><small>英文逗号分隔；默认禁止连字符和空格。</small></label>
               </div>
+              {editingProductId && <div className="v2-rule-hint"><ShieldAlert size={17} /><span>商品会保持原 SKU 身份，已有入库、订单和生命周期关联不会改变；扫码规则只约束后续入库。</span></div>}
               {catalogNotice?.type === "error" && <div className="v2-notice error">{catalogNotice.text}</div>}
-              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}><Plus size={16} /> 保存商品</button></div>
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeCatalogCreate} disabled={catalogLoading}>取消</button><button className="v2-button primary" type="submit" disabled={catalogLoading || mutationDisabled}>{editingProductId ? <CheckCircle2 size={16} /> : <Plus size={16} />} 保存商品</button></div>
             </form> : <form className="v2-form v2-catalog-modal-form" onSubmit={submitCatalogParty}>
               <div className="v2-form-grid">
                 <label><span>名称 *</span><input value={newPartyName} onChange={(event) => setNewPartyName(event.target.value)} placeholder="例如 深圳某某科技" autoComplete="organization" autoFocus required disabled={catalogLoading || mutationDisabled} /></label>
@@ -3060,14 +3414,32 @@ export default function InventoryWorkspace({
             <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{receiptDetailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
             {!catalogLoading && catalog && missingCatalogEntries.length > 0 && <div className="v2-notice warning v2-receipt-prerequisite" role="alert"><span>缺少基础资料：{missingCatalogEntries.join("、")}。请先新增后再扫码。</span><button className="v2-button" type="button" onClick={() => openCatalogCreateFromReceipt(firstMissingCatalogTab)}><Plus size={16} /> 新增{missingCatalogEntries[0]}</button></div>}
             <div className="v2-form-grid">
-            <label><span>商品 *</span><select value={selectedProductId} onChange={(event) => { setSelectedProductId(event.target.value); setScannerInput(""); setReceiptNotice(null); }} required disabled={catalogLoading || scanChecking || productLocked || products.length === 0}>
-              {products.length === 0 && <option value="">{catalogLoading ? "正在读取商品…" : "没有可用商品"}</option>}
-              {products.map((product) => <option key={product.sku_id} value={product.sku_id}>{product.code} · {product.name}</option>)}
-            </select>{productLocked && <small>当前批次已有 SN，商品已锁定。</small>}</label>
-            <label><span>供应商 *</span><select value={supplierName} onChange={(event) => setSupplierName(event.target.value)} required disabled={catalogLoading || suppliers.length === 0}>
-              {suppliers.length === 0 && <option value="">{catalogLoading ? "正在读取供应商…" : "没有可用供应商"}</option>}
-              {suppliers.map((party) => <option key={party.party_id} value={party.display_name}>{party.display_name}</option>)}
-            </select></label>
+            <label className="v2-receipt-autocomplete"><span>商品 *</span><div className="v2-receipt-autocomplete-control">
+              <input value={receiptProductInput} onChange={(event) => updateReceiptProductInput(event.target.value)} onFocus={() => setReceiptProductSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptProductSuggestionsOpen(false), 120)} onKeyDown={(event) => {
+                if (event.key === "Escape") setReceiptProductSuggestionsOpen(false);
+                if (event.key === "Enter" && receiptProductSuggestionsOpen && receiptProductSuggestions.length > 0) {
+                  event.preventDefault();
+                  chooseReceiptProduct(receiptProductSuggestions[0]);
+                }
+              }} placeholder={catalogLoading ? "正在读取商品…" : "输入编码或名称查找"} required disabled={catalogLoading || scanChecking || productLocked || products.length === 0} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={receiptProductSuggestionsOpen} aria-controls="v2-receipt-product-suggestions" />
+              {receiptProductSuggestionsOpen && !productLocked && <div id="v2-receipt-product-suggestions" className="v2-receipt-autocomplete-suggestions" role="listbox">
+                {receiptProductSuggestions.map((product) => <button key={product.sku_id} type="button" role="option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReceiptProduct(product)}><strong>{product.code}</strong><small>{product.name}</small></button>)}
+                {!catalogLoading && receiptProductSuggestions.length === 0 && <div className="v2-receipt-autocomplete-empty">没有匹配的商品</div>}
+              </div>}
+            </div>{productLocked && <small>当前批次已有 SN，商品已锁定。</small>}{!productLocked && selectedProduct && <small>已绑定目录商品：{selectedProduct.code} · {selectedProduct.name}</small>}</label>
+            <label className="v2-receipt-autocomplete"><span>供应商 *</span><div className="v2-receipt-autocomplete-control">
+              <input value={supplierName} onChange={(event) => updateReceiptSupplierInput(event.target.value)} onFocus={() => setReceiptSupplierSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptSupplierSuggestionsOpen(false), 120)} onKeyDown={(event) => {
+                if (event.key === "Escape") setReceiptSupplierSuggestionsOpen(false);
+                if (event.key === "Enter" && receiptSupplierSuggestionsOpen && receiptSupplierSuggestions.length > 0) {
+                  event.preventDefault();
+                  chooseReceiptSupplier(receiptSupplierSuggestions[0]);
+                }
+              }} placeholder={catalogLoading ? "正在读取供应商…" : "输入供应商名称查找"} required disabled={catalogLoading || suppliers.length === 0} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={receiptSupplierSuggestionsOpen} aria-controls="v2-receipt-supplier-suggestions" />
+              {receiptSupplierSuggestionsOpen && <div id="v2-receipt-supplier-suggestions" className="v2-receipt-autocomplete-suggestions" role="listbox">
+                {receiptSupplierSuggestions.map((party) => <button key={party.party_id} type="button" role="option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReceiptSupplier(party)}><strong>{party.display_name}</strong><small>{party.contact_name || "历史供应商"}</small></button>)}
+                {!catalogLoading && receiptSupplierSuggestions.length === 0 && <div className="v2-receipt-autocomplete-empty">没有匹配的供应商</div>}
+              </div>}
+            </div>{selectedSupplier && <small>已绑定供应商档案：{selectedSupplier.display_name}</small>}</label>
             <label><span>入库时间 *</span><input type="datetime-local" step="1" value={receivedAt} onChange={(event) => setReceivedAt(event.target.value)} required /></label>
             {mode === "network" && <label><span>入库仓库 *</span><select value={networkWarehouseId} onChange={(event) => {
               const value = event.target.value;
@@ -3320,8 +3692,8 @@ export default function InventoryWorkspace({
           <div><span className="v2-eyebrow">库存台账</span><h2 id="v2-inventory-title">单件库存</h2><p>按条码、货主、型号或单号搜索当前库存投影。</p></div>
           <button className="v2-button" type="button" onClick={() => void refreshInventory()} disabled={inventoryLoading}><RefreshCw size={16} className={inventoryLoading ? "v2-spin" : ""} /> 刷新</button>
         </div>
-        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void refreshInventory(); }}>
-          <label className="v2-search"><Search size={17} /><input value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} placeholder="条码、货主、型号、入库单号" /></label>
+        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void submitInventorySearch(); }}>
+          <label className="v2-search"><Search size={17} /><input value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!inventoryLoading) void submitInventorySearch(true); } }} placeholder="条码、货主、型号、入库单号" /></label>
           <select aria-label="库存状态" value={inventoryStatus} onChange={(event) => setInventoryStatus(event.target.value as InventoryStatus | "")}><option value="">全部库存状态</option>{Object.entries(inventoryStatusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
           <select aria-label="质检状态" value={qualityStatus} onChange={(event) => setQualityStatus(event.target.value as QualityStatus | "")}><option value="">全部质检状态</option>{Object.entries(displayedQualityStatusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
           <button className="v2-button primary" type="submit" disabled={inventoryLoading}>查询</button>
@@ -3387,7 +3759,7 @@ export default function InventoryWorkspace({
       <section className="v2-page v2-lifecycle-page" aria-labelledby="v2-lifecycle-title">
         <div className="v2-page-heading"><div><span className="v2-eyebrow">库存与数据</span><h2 id="v2-lifecycle-title">单件生命周期</h2><p>按 SN 查看来源、质检、销售和售后全部事实。</p></div></div>
         <form className="v2-panel v2-lifecycle-search" onSubmit={(event) => void searchLifecycle(event)}>
-          <label className="v2-search"><Search size={19} /><input value={lifecycleSearch} onChange={(event) => setLifecycleSearch(event.target.value)} placeholder="扫描或输入唯一 SN" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label>
+          <label className="v2-search"><Search size={19} /><input value={lifecycleSearch} onChange={(event) => setLifecycleSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!inventoryTraceLoading) void searchLifecycle(undefined, true); } }} placeholder="扫描或输入唯一 SN" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label>
           <button className="v2-button primary" type="submit" disabled={inventoryTraceLoading}><Search size={16} /> 查询生命周期</button>
         </form>
         {inventoryTraceError && <div className="v2-notice error">读取生命周期失败：{inventoryTraceError}</div>}
@@ -3418,7 +3790,7 @@ export default function InventoryWorkspace({
     return (
       <section className="v2-page" aria-labelledby="v2-records-title">
         <div className="v2-page-heading"><div><span className="v2-eyebrow">库存与数据</span><h2 id="v2-records-title">单据查询</h2><p>按订单号、客户、供应商或 SN 查询历史单据。</p></div><button className="v2-button" type="button" onClick={() => void refreshRecords()} disabled={recordLoading}><RefreshCw size={16} className={recordLoading ? "v2-spin" : ""} /> 刷新</button></div>
-        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void refreshRecords(); }}><label className="v2-search"><Search size={17} /><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="订单号、出库单号、客户、供应商或 SN" /></label><button className="v2-button primary" type="submit">查询</button></form>
+        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void submitRecordsSearch(); }}><label className="v2-search"><Search size={17} /><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!recordLoading) void submitRecordsSearch(true); } }} placeholder="订单号、出库单号、客户、供应商或 SN" /></label><button className="v2-button primary" type="submit" disabled={recordLoading}>查询</button></form>
         {recordNotice && <div className={`v2-notice ${recordNotice.type}`}>{recordNotice.text}</div>}
         <div className="v2-record-tabs" role="tablist"><button type="button" className={recordTab === "outbound" ? "active" : ""} onClick={() => setRecordTab("outbound")}><Truck size={16} /> 出库订单 <span>{outboundRecords.length}</span></button><button type="button" className={recordTab === "receipt" ? "active" : ""} onClick={() => setRecordTab("receipt")}><PackagePlus size={16} /> 收货单 <span>{receiptRecords.length}</span></button></div>
         {recordTab === "outbound" ? <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>订单编号</th><th>客户</th><th>最近出库</th><th>数量</th><th>售后</th><th>状态</th><th /></tr></thead><tbody>{outboundRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配出库订单</td></tr>}{outboundRecords.map((record) => <tr key={record.order_id}><td><strong className="v2-mono">{record.order_no}</strong><small>{formatDateTime(record.created_at)}</small></td><td>{record.receiver_name}</td><td><strong>{record.latest_shipment_no ?? "未出库"}</strong><small>{record.latest_shipped_at ? formatDateTime(record.latest_shipped_at) : ""}</small></td><td>{record.item_count} 件</td><td>{record.returned_count > 0 ? <span className="v2-badge inventory-quarantined">退货 {record.returned_count}</span> : "—"}</td><td><span className="v2-badge">{record.status}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openOutboundDocument(record.order_id)} title="查看订单详情" aria-label="查看订单详情"><Search size={16} /></button></td></tr>)}</tbody></table></div></div> : <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>收货单号</th><th>供应商</th><th>货主</th><th>入库时间</th><th>数量</th><th>质保</th><th /></tr></thead><tbody>{receiptRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配收货单</td></tr>}{receiptRecords.map((record) => <tr key={record.receipt_id}><td><strong className="v2-mono">{record.receipt_no}</strong><small>{record.source_reference ?? "无来源单号"}</small></td><td>{record.supplier_name ?? "未记录"}</td><td>{record.owner_name}</td><td>{formatDateTime(record.received_at)}</td><td>{record.item_count} 件</td><td>{record.warranty ? record.warranty.label_snapshot : "无质保"}</td><td><button className="v2-icon-button" type="button" onClick={() => void openReceiptDocument(record.receipt_id)} title="查看收货单详情" aria-label="查看收货单详情"><Search size={16} /></button></td></tr>)}</tbody></table></div></div>}
@@ -3582,6 +3954,15 @@ export default function InventoryWorkspace({
         <div className="v2-page-heading">
           <div><span className="v2-eyebrow">数据安全</span><h2 id="v2-settings-title">备份、恢复与版本升级</h2><p>离线数据恢复和一次性网络升级。</p></div>
         </div>
+        <section className="v2-panel v2-query-settings-panel">
+          <div className="v2-settings-heading"><div><h3>查询输入行为</h3><small>设置三个查询页面按回车查询后是否清空输入框，扫码枪连续查询时更方便。</small></div><SlidersHorizontal size={20} /></div>
+          <div className="v2-query-settings-list">
+            <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.inventory} onChange={(event) => updateSearchClearPreference("inventory", event.target.checked)} /><span><strong>库存查询</strong><small>回车查询完成后清空库存搜索词</small></span></label>
+            <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.lifecycle} onChange={(event) => updateSearchClearPreference("lifecycle", event.target.checked)} /><span><strong>生命周期</strong><small>回车查询完成后清空 SN 输入框</small></span></label>
+            <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.records} onChange={(event) => updateSearchClearPreference("records", event.target.checked)} /><span><strong>单据查询</strong><small>回车查询完成后清空单据搜索词</small></span></label>
+          </div>
+          <div className="v2-query-settings-actions"><span>默认关闭，避免查询后失去当前检索条件。</span><button className="v2-button" type="button" onClick={resetSearchClearPreferences}>恢复默认</button></div>
+        </section>
         <div className="v2-settings-grid">
           <section className="v2-panel v2-settings-panel">
             <div className="v2-settings-heading"><div><h3>离线 SQLite 备份</h3><small>工作区一致性快照</small></div><Warehouse size={20} /></div>
