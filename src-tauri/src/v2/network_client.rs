@@ -31,6 +31,9 @@ use super::records::{
 };
 use super::traceability::{InventoryBarcodeExistsResponse, InventoryTrace};
 use super::upgrade::{NetworkUpgradeImportRequest, NetworkUpgradeImportResponse};
+use super::voiding::{
+    CopyDocumentSnRequest, CopyDocumentSnResponse, VoidDocumentRequest, VoidDocumentResponse,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -383,6 +386,38 @@ impl NetworkClient {
             &serde_json::json!({"id": order_id}),
         )
         .await
+    }
+
+    pub async fn void_receipt_document(
+        &self,
+        request: &VoidDocumentRequest,
+    ) -> Result<VoidDocumentResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/receipts/void", request)
+            .await
+    }
+
+    pub async fn void_outbound_order_document(
+        &self,
+        request: &VoidDocumentRequest,
+    ) -> Result<VoidDocumentResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/outbound/void", request)
+            .await
+    }
+
+    pub async fn copy_receipt_document_sns(
+        &self,
+        request: &CopyDocumentSnRequest,
+    ) -> Result<CopyDocumentSnResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/receipts/copy-sns", request)
+            .await
+    }
+
+    pub async fn copy_outbound_order_document_sns(
+        &self,
+        request: &CopyDocumentSnRequest,
+    ) -> Result<CopyDocumentSnResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/records/outbound/copy-sns", request)
+            .await
     }
 
     pub async fn lookup_return_candidate(

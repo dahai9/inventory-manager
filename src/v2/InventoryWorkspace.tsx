@@ -14,10 +14,12 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
+  Ban,
   Boxes,
   CheckCircle2,
   ChevronDown,
   ClipboardCheck,
+  Copy,
   FileSpreadsheet,
   Gauge,
   LogOut,
@@ -35,6 +37,7 @@ import {
   Users,
   Warehouse,
   History,
+  KeyRound,
   Download,
   Clock3,
   X,
@@ -334,6 +337,7 @@ interface InventoryTrace {
     movement_type: string;
     source_type: string;
     source_id: string;
+    source_reference: string | null;
     occurred_at: string;
   }>;
   outbound: Array<{
@@ -576,6 +580,8 @@ interface DocumentItem {
   sku_code: string;
   sku_name: string;
   barcode: string;
+  inventory_status: InventoryStatus;
+  allocation_status: string | null;
   owner_name: string | null;
   shipment_id: string | null;
   shipment_line_id: string | null;
@@ -586,6 +592,17 @@ interface DocumentItem {
   returned_at: string | null;
   return_reason: string | null;
   return_disposition: string | null;
+}
+
+interface DocumentVoidInfo {
+  reason: string;
+  actor_id: string;
+  voided_at: string;
+}
+
+interface DocumentVoidEligibility {
+  can_void: boolean;
+  blockers: string[];
 }
 
 interface ReceiptDocument {
@@ -599,6 +616,8 @@ interface ReceiptDocument {
   item_count: number;
   warranty: WarrantyTerms | null;
   items: DocumentItem[];
+  void_info: DocumentVoidInfo | null;
+  void_eligibility: DocumentVoidEligibility;
 }
 
 interface OutboundOrderDocument {
@@ -612,6 +631,42 @@ interface OutboundOrderDocument {
   item_count: number;
   returned_count: number;
   items: DocumentItem[];
+  void_info: DocumentVoidInfo | null;
+  void_eligibility: DocumentVoidEligibility;
+}
+
+interface VoidDocumentResponse {
+  document_id: string;
+  document_no: string;
+  document_kind: "inbound_receipt" | "outbound_order";
+  status: "voided";
+  voided_at: string;
+  voided_inventory_count: number;
+  released_inventory_count: number;
+  quarantined_inventory_count: number;
+  idempotent_replay: boolean;
+}
+
+interface CopyDocumentSnResponse {
+  document_id: string;
+  document_no: string;
+  document_kind: "inbound_receipt" | "outbound_order";
+  barcodes: string[];
+}
+
+interface VoidDialogState {
+  kind: "receipt" | "outbound";
+  documentId: string;
+  documentNo: string;
+  itemCount: number;
+  blockers: string[];
+}
+
+interface SnCopyDialogState {
+  kind: "receipt" | "outbound";
+  documentId: string;
+  documentNo: string;
+  itemCount: number;
 }
 
 interface ReturnCandidate {
@@ -846,7 +901,24 @@ const movementSourceLabels: Record<string, string> = {
   outbound_shipment: "出库单",
   delivery_confirmation: "签收确认",
   outbound_return_batch: "退货单",
+  document_void: "单据作废",
 };
+
+const documentStatusLabels: Record<string, string> = {
+  draft: "草稿",
+  posted: "已入库",
+  open: "待分配",
+  partially_allocated: "部分分配",
+  allocated: "已分配",
+  partially_shipped: "部分出库",
+  shipped: "已出库",
+  completed: "已完成",
+  voided: "已作废",
+};
+
+function documentStatusLabel(status: string): string {
+  return documentStatusLabels[status] ?? status;
+}
 
 function buildLifecycleEvents(
   trace: InventoryTrace,
@@ -935,7 +1007,7 @@ function buildLifecycleEvents(
       occurredAt: movement.occurred_at,
       className: ["scrapped", "voided", "returned_to_owner"].includes(movement.movement_type) ? "warning" : "muted",
       title: movementLabels[movement.movement_type] ?? `库存变动 · ${movement.movement_type}`,
-      details: [`来源：${sourceLabel}`, `关联记录：${movement.source_id}`],
+      details: [`来源：${sourceLabel}`, `关联记录：${movement.source_reference ?? movement.source_id}`],
       sequence: 300 + index,
     });
   });
@@ -1220,6 +1292,18 @@ export default function InventoryWorkspace({
   const [recordNotice, setRecordNotice] = useState<Notice | null>(null);
   const [selectedReceiptDocument, setSelectedReceiptDocument] = useState<ReceiptDocument | null>(null);
   const [selectedOutboundDocument, setSelectedOutboundDocument] = useState<OutboundOrderDocument | null>(null);
+  const [voidDialog, setVoidDialog] = useState<VoidDialogState | null>(null);
+  const [voidReason, setVoidReason] = useState("");
+  const [voidPassword, setVoidPassword] = useState("");
+  const [voidLoading, setVoidLoading] = useState(false);
+  const [snCopyDialog, setSnCopyDialog] = useState<SnCopyDialogState | null>(null);
+  const [snCopyPassword, setSnCopyPassword] = useState("");
+  const [snCopyLoading, setSnCopyLoading] = useState(false);
+  const [operationCurrentPassword, setOperationCurrentPassword] = useState("");
+  const [operationNewPassword, setOperationNewPassword] = useState("");
+  const [operationConfirmPassword, setOperationConfirmPassword] = useState("");
+  const [operationPasswordLoading, setOperationPasswordLoading] = useState(false);
+  const [operationPasswordNotice, setOperationPasswordNotice] = useState<Notice | null>(null);
 
   const [returnBarcode, setReturnBarcode] = useState("");
   const [returnCandidate, setReturnCandidate] = useState<ReturnCandidate | null>(null);
@@ -1582,6 +1666,147 @@ export default function InventoryWorkspace({
       setRecordNotice({ type: "error", text: `导出失败：${displayError(error)}` });
     } finally {
       setRecordLoading(false);
+    }
+  }
+
+  function openSnCopyDialog(
+    kind: "receipt" | "outbound",
+    documentId: string,
+    documentNo: string,
+    itemCount: number,
+  ) {
+    setSnCopyPassword("");
+    setSnCopyDialog({ kind, documentId, documentNo, itemCount });
+  }
+
+  function closeSnCopyDialog() {
+    if (snCopyLoading) return;
+    setSnCopyDialog(null);
+    setSnCopyPassword("");
+  }
+
+  async function submitSnCopy(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!snCopyDialog || !snCopyPassword) return;
+    setSnCopyLoading(true);
+    setRecordNotice(null);
+    try {
+      const prefix = mode === "network" ? "v2_network" : "v2";
+      const command = `${prefix}_copy_${snCopyDialog.kind === "receipt" ? "receipt_document" : "outbound_order_document"}_sns`;
+      const response = await invoke<CopyDocumentSnResponse>(command, {
+        input: {
+          document_id: snCopyDialog.documentId,
+          password: snCopyPassword,
+          actor_id: mode === "offline" ? resolvedActorId : null,
+          request_id: createId(),
+        },
+      });
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("当前环境不支持写入剪贴板");
+      }
+      await navigator.clipboard.writeText(response.barcodes.join("\n"));
+      const count = response.barcodes.length;
+      setSnCopyDialog(null);
+      setSnCopyPassword("");
+      setRecordNotice({
+        type: "success",
+        text: `已复制 ${response.document_no} 的 ${count} 个 SN（每行一个）`,
+      });
+    } catch (error) {
+      setRecordNotice({ type: "error", text: `复制 SN 失败：${displayError(error)}` });
+    } finally {
+      setSnCopyLoading(false);
+    }
+  }
+
+  function openVoidDialog(
+    kind: "receipt" | "outbound",
+    documentId: string,
+    documentNo: string,
+    itemCount: number,
+    eligibility: DocumentVoidEligibility,
+  ) {
+    if (!eligibility.can_void) {
+      setRecordNotice({
+        type: "warning",
+        text: eligibility.blockers[0] ?? "该单据当前不能作废",
+      });
+      return;
+    }
+    setVoidReason("");
+    setVoidPassword("");
+    setVoidDialog({ kind, documentId, documentNo, itemCount, blockers: eligibility.blockers });
+  }
+
+  function closeVoidDialog() {
+    if (voidLoading) return;
+    setVoidDialog(null);
+    setVoidReason("");
+    setVoidPassword("");
+  }
+
+  async function submitVoidDocument(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!voidDialog || !voidReason.trim() || !voidPassword) return;
+    setVoidLoading(true);
+    setRecordNotice(null);
+    try {
+      const prefix = mode === "network" ? "v2_network" : "v2";
+      const command = `${prefix}_void_${voidDialog.kind === "receipt" ? "receipt_document" : "outbound_order_document"}`;
+      const response = await invoke<VoidDocumentResponse>(command, {
+        input: {
+          document_id: voidDialog.documentId,
+          reason: voidReason.trim(),
+          password: voidPassword,
+          actor_id: mode === "offline" ? resolvedActorId : null,
+          request_id: createId(),
+          idempotency_key: createId(),
+        },
+      });
+      const kind = voidDialog.kind;
+      const documentId = voidDialog.documentId;
+      setVoidDialog(null);
+      setVoidReason("");
+      setVoidPassword("");
+      await Promise.all([refreshRecords(), refreshDashboard(), refreshInventory()]);
+      if (kind === "receipt") await openReceiptDocument(documentId);
+      else await openOutboundDocument(documentId);
+      setRecordNotice({
+        type: "success",
+        text: `${response.document_no} 已作废。作废库存 ${response.voided_inventory_count} 件，解除预留 ${response.released_inventory_count} 件，保持隔离 ${response.quarantined_inventory_count} 件。`,
+      });
+    } catch (error) {
+      setRecordNotice({ type: "error", text: `作废失败：${displayError(error)}` });
+    } finally {
+      setVoidLoading(false);
+    }
+  }
+
+  async function changeOperationPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setOperationPasswordNotice(null);
+    if (operationNewPassword !== operationConfirmPassword) {
+      setOperationPasswordNotice({ type: "error", text: "两次输入的新密码不一致" });
+      return;
+    }
+    setOperationPasswordLoading(true);
+    try {
+      await invoke("v2_change_operation_password", {
+        input: {
+          current_password: operationCurrentPassword,
+          new_password: operationNewPassword,
+          actor_id: resolvedActorId,
+          request_id: createId(),
+        },
+      });
+      setOperationCurrentPassword("");
+      setOperationNewPassword("");
+      setOperationConfirmPassword("");
+      setOperationPasswordNotice({ type: "success", text: "危险操作密码已更新" });
+    } catch (error) {
+      setOperationPasswordNotice({ type: "error", text: `修改密码失败：${displayError(error)}` });
+    } finally {
+      setOperationPasswordLoading(false);
     }
   }
 
@@ -2078,6 +2303,21 @@ export default function InventoryWorkspace({
 
     resetOutboundWorkflow(false);
     setOutboundLoading(false);
+    setReceiptRecords([]);
+    setOutboundRecords([]);
+    setRecordLoading(false);
+    setRecordNotice(null);
+    setSelectedReceiptDocument(null);
+    setSelectedOutboundDocument(null);
+    setVoidDialog(null);
+    setVoidReason("");
+    setVoidPassword("");
+    setVoidLoading(false);
+    setOperationCurrentPassword("");
+    setOperationNewPassword("");
+    setOperationConfirmPassword("");
+    setOperationPasswordLoading(false);
+    setOperationPasswordNotice(null);
 
     setNetworkWarehouses([]);
     setNetworkWarehouseId("");
@@ -2100,6 +2340,10 @@ export default function InventoryWorkspace({
       || qualityLoading
       || outboundLoading
       || catalogLoading
+      || recordLoading
+      || voidLoading
+      || snCopyLoading
+      || operationPasswordLoading
       || dataOperationRef.current
       || dataOperationLoading
       || childPanelBusyRef.current
@@ -3793,9 +4037,62 @@ export default function InventoryWorkspace({
         <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void submitRecordsSearch(); }}><label className="v2-search"><Search size={17} /><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!recordLoading) void submitRecordsSearch(true); } }} placeholder="订单号、出库单号、客户、供应商或 SN" /></label><button className="v2-button primary" type="submit" disabled={recordLoading}>查询</button></form>
         {recordNotice && <div className={`v2-notice ${recordNotice.type}`}>{recordNotice.text}</div>}
         <div className="v2-record-tabs" role="tablist"><button type="button" className={recordTab === "outbound" ? "active" : ""} onClick={() => setRecordTab("outbound")}><Truck size={16} /> 出库订单 <span>{outboundRecords.length}</span></button><button type="button" className={recordTab === "receipt" ? "active" : ""} onClick={() => setRecordTab("receipt")}><PackagePlus size={16} /> 收货单 <span>{receiptRecords.length}</span></button></div>
-        {recordTab === "outbound" ? <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>订单编号</th><th>客户</th><th>最近出库</th><th>数量</th><th>售后</th><th>状态</th><th /></tr></thead><tbody>{outboundRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配出库订单</td></tr>}{outboundRecords.map((record) => <tr key={record.order_id}><td><strong className="v2-mono">{record.order_no}</strong><small>{formatDateTime(record.created_at)}</small></td><td>{record.receiver_name}</td><td><strong>{record.latest_shipment_no ?? "未出库"}</strong><small>{record.latest_shipped_at ? formatDateTime(record.latest_shipped_at) : ""}</small></td><td>{record.item_count} 件</td><td>{record.returned_count > 0 ? <span className="v2-badge inventory-quarantined">退货 {record.returned_count}</span> : "—"}</td><td><span className="v2-badge">{record.status}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openOutboundDocument(record.order_id)} title="查看订单详情" aria-label="查看订单详情"><Search size={16} /></button></td></tr>)}</tbody></table></div></div> : <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>收货单号</th><th>供应商</th><th>货主</th><th>入库时间</th><th>数量</th><th>质保</th><th /></tr></thead><tbody>{receiptRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配收货单</td></tr>}{receiptRecords.map((record) => <tr key={record.receipt_id}><td><strong className="v2-mono">{record.receipt_no}</strong><small>{record.source_reference ?? "无来源单号"}</small></td><td>{record.supplier_name ?? "未记录"}</td><td>{record.owner_name}</td><td>{formatDateTime(record.received_at)}</td><td>{record.item_count} 件</td><td>{record.warranty ? record.warranty.label_snapshot : "无质保"}</td><td><button className="v2-icon-button" type="button" onClick={() => void openReceiptDocument(record.receipt_id)} title="查看收货单详情" aria-label="查看收货单详情"><Search size={16} /></button></td></tr>)}</tbody></table></div></div>}
-        {selectedOutboundDocument && <section className="v2-panel v2-record-detail"><header><div><span className="v2-eyebrow">出库订单详情</span><h3>{selectedOutboundDocument.order_no} · {selectedOutboundDocument.receiver_name}</h3></div><div className="v2-detail-actions"><button className="v2-button" type="button" onClick={() => void exportBusinessDocument("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no)}><Download size={16} /> 导出出库单</button><button className="v2-icon-button" type="button" onClick={() => setSelectedOutboundDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button></div></header><div className="v2-record-detail-meta"><span>订单状态 <strong>{selectedOutboundDocument.status}</strong></span><span>最近出库 <strong>{selectedOutboundDocument.latest_shipment_no ?? "未出库"}</strong></span><span>客户质保 <strong>{selectedOutboundDocument.items.find((item) => item.warranty)?.warranty?.label_snapshot ?? "无质保"}</strong></span></div><div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>出库单</th><th>质保</th><th>售后</th></tr></thead><tbody>{selectedOutboundDocument.items.map((item) => <tr key={`${item.barcode}-${item.shipment_line_id ?? "allocation"}`}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td>{item.shipment_no ?? "未出库"}</td><td>{item.warranty ? item.warranty.label_snapshot : "无质保"}</td><td>{item.return_no ? `${item.return_no} · ${formatDateTime(item.returned_at ?? "")}` : "—"}</td></tr>)}</tbody></table></div></section>}
-        {selectedReceiptDocument && <section className="v2-panel v2-record-detail"><header><div><span className="v2-eyebrow">收货单详情</span><h3>{selectedReceiptDocument.receipt_no} · {selectedReceiptDocument.supplier_name ?? "未记录供应商"}</h3></div><div className="v2-detail-actions"><button className="v2-button" type="button" onClick={() => void exportBusinessDocument("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no)}><Download size={16} /> 导出收货单</button><button className="v2-icon-button" type="button" onClick={() => setSelectedReceiptDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button></div></header><div className="v2-record-detail-meta"><span>货主 <strong>{selectedReceiptDocument.owner_name}</strong></span><span>入库时间 <strong>{formatDateTime(selectedReceiptDocument.received_at)}</strong></span><span>质保 <strong>{selectedReceiptDocument.warranty ? selectedReceiptDocument.warranty.label_snapshot : "无质保"}</strong></span></div><div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>货主</th></tr></thead><tbody>{selectedReceiptDocument.items.map((item) => <tr key={item.barcode}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td>{item.owner_name}</td></tr>)}</tbody></table></div></section>}
+        {recordTab === "outbound" ? (
+          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>订单编号</th><th>客户</th><th>最近出库</th><th>数量</th><th>售后</th><th>状态</th><th /></tr></thead><tbody>
+            {outboundRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配出库订单</td></tr>}
+            {outboundRecords.map((record) => <tr key={record.order_id}><td><strong className="v2-mono">{record.order_no}</strong><small>{formatDateTime(record.created_at)}</small></td><td>{record.receiver_name}</td><td><strong>{record.latest_shipment_no ?? "未出库"}</strong><small>{record.latest_shipped_at ? formatDateTime(record.latest_shipped_at) : ""}</small></td><td>{record.item_count} 件</td><td>{record.returned_count > 0 ? <span className="v2-badge inventory-quarantined">退货 {record.returned_count}</span> : "—"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openOutboundDocument(record.order_id)} title="查看订单详情" aria-label="查看订单详情"><Search size={16} /></button></td></tr>)}
+          </tbody></table></div></div>
+        ) : (
+          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>收货单号</th><th>供应商</th><th>货主</th><th>入库时间</th><th>数量</th><th>质保</th><th>状态</th><th /></tr></thead><tbody>
+            {receiptRecords.length === 0 && !recordLoading && <tr><td colSpan={8} className="v2-table-empty">暂无匹配收货单</td></tr>}
+            {receiptRecords.map((record) => <tr key={record.receipt_id}><td><strong className="v2-mono">{record.receipt_no}</strong><small>{record.source_reference ?? "无来源单号"}</small></td><td>{record.supplier_name ?? "未记录"}</td><td>{record.owner_name}</td><td>{formatDateTime(record.received_at)}</td><td>{record.item_count} 件</td><td>{record.warranty ? record.warranty.label_snapshot : "无质保"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openReceiptDocument(record.receipt_id)} title="查看收货单详情" aria-label="查看收货单详情"><Search size={16} /></button></td></tr>)}
+          </tbody></table></div></div>
+        )}
+        {selectedOutboundDocument && <section className="v2-panel v2-record-detail">
+          <header><div><span className="v2-eyebrow">出库订单详情</span><h3>{selectedOutboundDocument.order_no} · {selectedOutboundDocument.receiver_name}</h3></div><div className="v2-detail-actions">
+            <button className="v2-button danger" type="button" disabled={!selectedOutboundDocument.void_eligibility.can_void || recordLoading} title={selectedOutboundDocument.void_eligibility.blockers.join("；") || "作废出库订单"} onClick={() => openVoidDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length, selectedOutboundDocument.void_eligibility)}><Ban size={16} /> 作废单据</button>
+            <button className="v2-button" type="button" onClick={() => openSnCopyDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length)} disabled={recordLoading}><Copy size={16} /> 复制整单 SN</button>
+            <button className="v2-button" type="button" onClick={() => void exportBusinessDocument("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no)}><Download size={16} /> 导出出库单</button>
+            <button className="v2-icon-button" type="button" onClick={() => setSelectedOutboundDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button>
+          </div></header>
+          <div className="v2-record-detail-meta"><span>订单状态 <strong>{documentStatusLabel(selectedOutboundDocument.status)}</strong></span><span>最近出库 <strong>{selectedOutboundDocument.latest_shipment_no ?? "未出库"}</strong></span><span>客户质保 <strong>{selectedOutboundDocument.items.find((item) => item.warranty)?.warranty?.label_snapshot ?? "无质保"}</strong></span></div>
+          {selectedOutboundDocument.void_info && <div className="v2-void-fact"><Ban size={18} /><div><strong>该出库订单已作废</strong><span>{formatDateTime(selectedOutboundDocument.void_info.voided_at)} · {selectedOutboundDocument.void_info.actor_id}</span><p>{selectedOutboundDocument.void_info.reason}</p></div></div>}
+          {!selectedOutboundDocument.void_eligibility.can_void && !selectedOutboundDocument.void_info && <div className="v2-void-blockers"><ShieldAlert size={18} /><div><strong>当前不能作废</strong>{selectedOutboundDocument.void_eligibility.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div></div>}
+          <div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>库存状态</th><th>出库单</th><th>质保</th><th>售后</th></tr></thead><tbody>{selectedOutboundDocument.items.map((item) => <tr key={`${item.barcode}-${item.shipment_line_id ?? "allocation"}`}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td><td>{item.shipment_no ?? "未出库"}</td><td>{item.warranty ? item.warranty.label_snapshot : "无质保"}</td><td>{item.return_no ? `${item.return_no} · ${formatDateTime(item.returned_at ?? "")}` : "—"}</td></tr>)}</tbody></table></div>
+        </section>}
+        {selectedReceiptDocument && <section className="v2-panel v2-record-detail">
+          <header><div><span className="v2-eyebrow">收货单详情</span><h3>{selectedReceiptDocument.receipt_no} · {selectedReceiptDocument.supplier_name ?? "未记录供应商"}</h3></div><div className="v2-detail-actions">
+            <button className="v2-button danger" type="button" disabled={!selectedReceiptDocument.void_eligibility.can_void || recordLoading} title={selectedReceiptDocument.void_eligibility.blockers.join("；") || "作废收货单"} onClick={() => openVoidDialog("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no, selectedReceiptDocument.items.length, selectedReceiptDocument.void_eligibility)}><Ban size={16} /> 作废单据</button>
+            <button className="v2-button" type="button" onClick={() => openSnCopyDialog("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no, selectedReceiptDocument.items.length)} disabled={recordLoading}><Copy size={16} /> 复制整单 SN</button>
+            <button className="v2-button" type="button" onClick={() => void exportBusinessDocument("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no)}><Download size={16} /> 导出收货单</button>
+            <button className="v2-icon-button" type="button" onClick={() => setSelectedReceiptDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button>
+          </div></header>
+          <div className="v2-record-detail-meta"><span>单据状态 <strong>{documentStatusLabel(selectedReceiptDocument.status)}</strong></span><span>货主 <strong>{selectedReceiptDocument.owner_name}</strong></span><span>入库时间 <strong>{formatDateTime(selectedReceiptDocument.received_at)}</strong></span><span>质保 <strong>{selectedReceiptDocument.warranty ? selectedReceiptDocument.warranty.label_snapshot : "无质保"}</strong></span></div>
+          {selectedReceiptDocument.void_info && <div className="v2-void-fact"><Ban size={18} /><div><strong>该收货单已作废</strong><span>{formatDateTime(selectedReceiptDocument.void_info.voided_at)} · {selectedReceiptDocument.void_info.actor_id}</span><p>{selectedReceiptDocument.void_info.reason}</p></div></div>}
+          {!selectedReceiptDocument.void_eligibility.can_void && !selectedReceiptDocument.void_info && <div className="v2-void-blockers"><ShieldAlert size={18} /><div><strong>当前不能作废</strong>{selectedReceiptDocument.void_eligibility.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div></div>}
+          <div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>库存状态</th><th>货主</th></tr></thead><tbody>{selectedReceiptDocument.items.map((item) => <tr key={item.barcode}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td><td>{item.owner_name}</td></tr>)}</tbody></table></div>
+        </section>}
+        {voidDialog && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeVoidDialog(); }} onKeyDown={(event) => { if (event.key === "Escape") closeVoidDialog(); }}>
+          <section className="v2-catalog-modal v2-void-modal" role="dialog" aria-modal="true" aria-labelledby="v2-void-modal-title">
+            <header><div><span>危险操作</span><h3 id="v2-void-modal-title">作废 {voidDialog.documentNo}</h3></div><button className="v2-icon-button" type="button" onClick={closeVoidDialog} disabled={voidLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>
+            <form className="v2-void-modal-form" onSubmit={(event) => void submitVoidDocument(event)}>
+              <div className="v2-void-impact"><Ban size={21} /><div><strong>此操作不可撤销</strong><span>{voidDialog.kind === "receipt" ? `关联的 ${voidDialog.itemCount} 件库存将标记为已作废。` : "未发货商品会解除预留；已经退回的商品继续保持隔离。"}</span></div></div>
+              <label><span>作废原因 *</span><textarea value={voidReason} onChange={(event) => setVoidReason(event.target.value)} placeholder="填写可供日后审计的具体原因" disabled={voidLoading} autoFocus /></label>
+              <label><span>{mode === "network" ? "当前账号密码" : "危险操作密码"} *</span><input type="password" value={voidPassword} onChange={(event) => setVoidPassword(event.target.value)} autoComplete="current-password" disabled={voidLoading} /></label>
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeVoidDialog} disabled={voidLoading}>取消</button><button className="v2-button danger" type="submit" disabled={voidLoading || !voidReason.trim() || !voidPassword}><Ban size={16} />{voidLoading ? "正在作废…" : "确认作废"}</button></div>
+            </form>
+          </section>
+        </div>}
+        {snCopyDialog && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSnCopyDialog(); }} onKeyDown={(event) => { if (event.key === "Escape") closeSnCopyDialog(); }}>
+          <section className="v2-catalog-modal v2-sn-copy-modal" role="dialog" aria-modal="true" aria-labelledby="v2-sn-copy-modal-title">
+            <header><div><span>敏感信息操作</span><h3 id="v2-sn-copy-modal-title">复制整单 SN</h3></div><button className="v2-icon-button" type="button" onClick={closeSnCopyDialog} disabled={snCopyLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>
+            <form className="v2-void-modal-form" onSubmit={(event) => void submitSnCopy(event)}>
+              <div className="v2-void-impact"><Copy size={21} /><div><strong>需要密码授权</strong><span>将复制 {snCopyDialog.documentNo} 的 {snCopyDialog.itemCount} 件单品 SN，每行一个。复制内容会进入系统剪贴板，请注意粘贴位置。</span></div></div>
+              <label><span>{mode === "network" ? "当前账号密码" : "危险操作密码"} *</span><input type="password" value={snCopyPassword} onChange={(event) => setSnCopyPassword(event.target.value)} autoComplete="current-password" autoFocus disabled={snCopyLoading} /></label>
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeSnCopyDialog} disabled={snCopyLoading}>取消</button><button className="v2-button primary" type="submit" disabled={snCopyLoading || !snCopyPassword}><Copy size={16} />{snCopyLoading ? "正在授权…" : "授权并复制"}</button></div>
+            </form>
+          </section>
+        </div>}
       </section>
     );
   }
@@ -3964,6 +4261,15 @@ export default function InventoryWorkspace({
           <div className="v2-query-settings-actions"><span>默认关闭，避免查询后失去当前检索条件。</span><button className="v2-button" type="button" onClick={resetSearchClearPreferences}>恢复默认</button></div>
         </section>
         <div className="v2-settings-grid">
+          {mode === "offline" && <form className="v2-panel v2-settings-panel v2-operation-password-panel" onSubmit={(event) => void changeOperationPassword(event)}>
+            <div className="v2-settings-heading"><div><h3>危险操作密码</h3><small>用于作废入库单和出库单</small></div><KeyRound size={20} /></div>
+            <div className="v2-rule-hint"><ShieldAlert size={17} /><span>初始密码为 admin。密码只以 Argon2id 哈希保存在本机数据库中。</span></div>
+            <label className="v2-settings-field"><span>当前密码</span><input type="password" value={operationCurrentPassword} onChange={(event) => setOperationCurrentPassword(event.target.value)} autoComplete="current-password" disabled={operationPasswordLoading} /></label>
+            <label className="v2-settings-field"><span>新密码</span><input type="password" value={operationNewPassword} onChange={(event) => setOperationNewPassword(event.target.value)} autoComplete="new-password" minLength={5} maxLength={128} disabled={operationPasswordLoading} /></label>
+            <label className="v2-settings-field"><span>确认新密码</span><input type="password" value={operationConfirmPassword} onChange={(event) => setOperationConfirmPassword(event.target.value)} autoComplete="new-password" minLength={5} maxLength={128} disabled={operationPasswordLoading} /></label>
+            <button className="v2-button primary wide" type="submit" disabled={operationPasswordLoading || !operationCurrentPassword || operationNewPassword.length < 5 || !operationConfirmPassword}>{operationPasswordLoading ? "正在更新…" : "更新操作密码"}</button>
+            {operationPasswordNotice && <div className={`v2-notice ${operationPasswordNotice.type}`}>{operationPasswordNotice.text}</div>}
+          </form>}
           <section className="v2-panel v2-settings-panel">
             <div className="v2-settings-heading"><div><h3>离线 SQLite 备份</h3><small>工作区一致性快照</small></div><Warehouse size={20} /></div>
             <button className="v2-button primary wide" type="button" onClick={() => void createOfflineBackup()} disabled={dataOperationLoading}>创建备份</button>

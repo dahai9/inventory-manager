@@ -55,6 +55,8 @@ impl OfflineDatabase {
             .await
             .map_err(|err| format!("无法升级离线数据库: {err}"))?;
 
+        super::voiding::initialize_offline_operation_password(&pool).await?;
+
         let seed = Self::seed_local_workspace(&pool).await?;
         Ok(Self { pool, seed })
     }

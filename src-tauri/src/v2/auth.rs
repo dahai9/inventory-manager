@@ -490,6 +490,89 @@ pub async fn authenticate_password(
     })
 }
 
+/// Reconfirm the password for the user represented by an already-authorized
+/// session. Privileged business operations use the same failure counter and
+/// lockout policy as interactive login without asking the client to resend a
+/// login name that could identify a different account.
+pub(crate) async fn reauthenticate_user_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    passwords: &PasswordService,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    password: &str,
+    policy: LockoutPolicy,
+) -> Result<(), AuthError> {
+    policy.validate()?;
+    if password.is_empty() {
+        return Err(AuthError::InvalidCredentials);
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT c.password_hash,
+               c.locked_until IS NOT NULL
+                   AND c.locked_until > CURRENT_TIMESTAMP AS is_locked
+          FROM credentials c
+         WHERE c.tenant_id = $1 AND c.user_id = $2
+         FOR UPDATE
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        passwords.verify_dummy(password);
+        return Err(AuthError::InvalidCredentials);
+    };
+    if row.try_get::<bool, _>("is_locked")? {
+        return Err(AuthError::LoginLocked);
+    }
+    let password_hash: String = row.try_get("password_hash")?;
+    if !passwords.verify_password(password, &password_hash)? {
+        let update = sqlx::query(
+            r#"
+            UPDATE credentials
+               SET failed_login_count = failed_login_count + 1,
+                   locked_until = CASE
+                       WHEN failed_login_count + 1 >= $3
+                       THEN CURRENT_TIMESTAMP + make_interval(secs => $4::double precision)
+                       ELSE locked_until
+                   END,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = $1 AND user_id = $2
+         RETURNING locked_until IS NOT NULL
+                       AND locked_until > CURRENT_TIMESTAMP AS is_locked
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(policy.max_failures as i32)
+        .bind(policy.lock_seconds)
+        .fetch_one(&mut **transaction)
+        .await?;
+        return if update.try_get::<bool, _>("is_locked")? {
+            Err(AuthError::LoginLocked)
+        } else {
+            Err(AuthError::InvalidCredentials)
+        };
+    }
+    sqlx::query(
+        r#"
+        UPDATE credentials
+           SET failed_login_count = 0,
+               locked_until = NULL,
+               last_authenticated_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 /// Check all authorization dimensions in one transaction snapshot.  The
 /// caller should invoke this before a business write, using the same
 /// transaction as that write, so a role/license revocation cannot race it.

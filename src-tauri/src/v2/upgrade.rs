@@ -32,7 +32,7 @@ pub const PRODUCT_ID: &str = "inventory-manager";
 pub const PACKAGE_FORMAT_VERSION: u32 = 3;
 const MIN_SUPPORTED_PACKAGE_FORMAT_VERSION: u32 = 1;
 pub const LOGICAL_SCHEMA_VERSION: i64 = 1;
-const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 8;
+const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 10;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const CHECKSUMS_FILE: &str = "checksums.json";
@@ -431,6 +431,10 @@ const OUTBOUND_TABLES: &[TableSpec] = &[
 ];
 
 const AUDIT_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "document_voids",
+        order_by: "id",
+    },
     TableSpec {
         name: "audit_logs",
         order_by: "id",
@@ -1556,6 +1560,8 @@ fn validate_relational_data(
             "inventory_units",
         ),
         ("stock_movements", "inventory_unit_id", "inventory_units"),
+        ("document_voids", "inbound_receipt_id", "inbound_receipts"),
+        ("document_voids", "outbound_order_id", "outbound_orders"),
     ] {
         validate_foreign_key(
             records,
@@ -1564,7 +1570,8 @@ fn validate_relational_data(
             field,
             target,
             (table == "inbound_receipts" && field == "supplier_party_id")
-                || (table == "quality_inspection_results" && field == "quality_label_id"),
+                || (table == "quality_inspection_results" && field == "quality_label_id")
+                || table == "document_voids",
         )?;
     }
     for field in ["from_location_id", "to_location_id"] {
@@ -1572,10 +1579,42 @@ fn validate_relational_data(
     }
 
     validate_quality_label_snapshots(records)?;
+    validate_document_voids(records)?;
     validate_quality_label_name_history(records)?;
     validate_inbound_quantities(records)?;
     validate_outbound_quantities(records)?;
     validate_inventory_projections(records)?;
+    Ok(())
+}
+
+fn validate_document_voids(
+    records: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<(), UpgradeError> {
+    let mut receipts = HashSet::new();
+    let mut orders = HashSet::new();
+    for record in table_records(records, "document_voids") {
+        let kind = required_string(record, "document_voids", "document_kind")?;
+        let receipt_id = record.get("inbound_receipt_id").and_then(Value::as_str);
+        let order_id = record.get("outbound_order_id").and_then(Value::as_str);
+        match (kind, receipt_id, order_id) {
+            ("inbound_receipt", Some(receipt_id), None) if receipts.insert(receipt_id) => {}
+            ("outbound_order", None, Some(order_id)) if orders.insert(order_id) => {}
+            _ => {
+                return Err(UpgradeError::Data(
+                    "document_voids must identify one unique document matching document_kind"
+                        .to_owned(),
+                ));
+            }
+        }
+        if required_string(record, "document_voids", "reason")?
+            .trim()
+            .is_empty()
+        {
+            return Err(UpgradeError::Data(
+                "document_voids.reason must not be empty".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3631,6 +3670,40 @@ impl<'a> PgUpgradeTransaction<'a> {
         actor_id: Uuid,
         records: &BTreeMap<String, Vec<Map<String, Value>>>,
     ) -> Result<(), PgUpgradeError> {
+        for record in records_for(records, "document_voids") {
+            sqlx::query(
+                r#"
+                INSERT INTO document_voids
+                    (tenant_id, id, document_kind, inbound_receipt_id,
+                     outbound_order_id, reason, actor_id, source_actor_id,
+                     voided_at, request_id, idempotency_key, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                        $9::timestamptz, $10, $11, $12::timestamptz)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(uuid_field(record, "document_voids", "id")?)
+            .bind(string_field(record, "document_voids", "document_kind")?)
+            .bind(optional_uuid_field(
+                record,
+                "document_voids",
+                "inbound_receipt_id",
+            )?)
+            .bind(optional_uuid_field(
+                record,
+                "document_voids",
+                "outbound_order_id",
+            )?)
+            .bind(string_field(record, "document_voids", "reason")?)
+            .bind(actor_id)
+            .bind(string_field(record, "document_voids", "actor_id")?)
+            .bind(string_field(record, "document_voids", "voided_at")?)
+            .bind(string_field(record, "document_voids", "request_id")?)
+            .bind(string_field(record, "document_voids", "idempotency_key")?)
+            .bind(string_field(record, "document_voids", "created_at")?)
+            .execute(&mut *self.transaction)
+            .await?;
+        }
         for record in records_for(records, "audit_logs") {
             sqlx::query(
                 r#"
@@ -3764,6 +3837,7 @@ const NETWORK_BUSINESS_TABLES: &[&str] = &[
     "outbound_return_batches",
     "outbound_return_lines",
     "stock_movements",
+    "document_voids",
     "audit_logs",
     "idempotency_records",
     "migration_packages",
@@ -3938,6 +4012,7 @@ mod tests {
         ReturnOutboundShipmentRequest, ShipOutboundRequest,
     };
     use crate::v2::postgres::NetworkDatabaseConfig;
+    use crate::v2::voiding::VoidDocumentRequest;
     use crate::v2::OfflineDatabase;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -4011,6 +4086,16 @@ mod tests {
         ))
         .await
         .expect("create quality label history schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0009_document_warranties.sql"
+        ))
+        .await
+        .expect("create warranty schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0010_document_voids.sql"
+        ))
+        .await
+        .expect("create document void schema");
         pool.execute(
             "CREATE TABLE _sqlx_migrations (version BIGINT NOT NULL, success BOOLEAN NOT NULL)",
         )
@@ -4146,6 +4231,90 @@ mod tests {
         assert!(!audit.contains("must-not-leak"));
         assert!(audit.contains("[REDACTED]"));
         assert!(audit.contains("kept"));
+    }
+
+    #[tokio::test]
+    async fn export_keeps_document_voids_and_excludes_operation_credentials() {
+        let directory = TestDirectory::new();
+        let database = OfflineDatabase::open(&directory.path().join("source.sqlite3"))
+            .await
+            .expect("open offline database");
+        database
+            .create_catalog_product(CreateCatalogProductRequest {
+                code: "RAM-VOID-EXPORT".to_owned(),
+                name: "作废导出测试内存".to_owned(),
+                serial_prefix: None,
+                serial_forbidden_chars: String::new(),
+            })
+            .await
+            .expect("create product");
+        for (display_name, role) in [
+            ("升级测试货主", CatalogPartyRole::GoodsOwner),
+            ("升级测试供应商", CatalogPartyRole::Supplier),
+        ] {
+            database
+                .create_catalog_party(CreateCatalogPartyRequest {
+                    display_name: display_name.to_owned(),
+                    role,
+                })
+                .await
+                .expect("create party");
+        }
+        let receipt = database
+            .post_receipt(PostReceiptRequest {
+                request_id: "receipt-request-void-export".to_owned(),
+                idempotency_key: "receipt-key-void-export".to_owned(),
+                receipt_no: "RK-VOID-EXPORT".to_owned(),
+                owner_name: "升级测试货主".to_owned(),
+                supplier_name: "升级测试供应商".to_owned(),
+                sku_code: "RAM-VOID-EXPORT".to_owned(),
+                sku_name: "作废导出测试内存".to_owned(),
+                source_reference: None,
+                received_at: "2026-08-15T00:00:00Z".to_owned(),
+                actor_id: "upgrade-operator".to_owned(),
+                barcodes: vec!["VOID-EXPORT-001".to_owned()],
+                notes: None,
+                warranty: None,
+            })
+            .await
+            .expect("post receipt");
+        database
+            .void_receipt_document(VoidDocumentRequest {
+                document_id: receipt.receipt_id,
+                reason: "验证升级包保留作废事实".to_owned(),
+                password: "admin".to_owned(),
+                actor_id: Some("upgrade-operator".to_owned()),
+                request_id: "void-request-export".to_owned(),
+                idempotency_key: "void-key-export".to_owned(),
+            })
+            .await
+            .expect("void receipt");
+        let operation_hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM operation_credentials WHERE id=1")
+                .fetch_one(database.pool())
+                .await
+                .expect("read operation password hash");
+
+        let package = OfflineUpgradeExporter::new(database.pool())
+            .export(
+                &directory.path().join("void-export.invpack"),
+                export_request(database.workspace_id().to_owned()),
+            )
+            .await
+            .expect("export package");
+        let validated = validate_package(&package.path).expect("validate package");
+        assert_eq!(validated.entity_counts.get("document_voids"), Some(&1));
+        let audit = fs::read_to_string(package.path.join("audit.jsonl"))
+            .expect("read audit package member");
+        assert!(audit.contains("\"table\":\"document_voids\""));
+        assert!(audit.contains("验证升级包保留作废事实"));
+        for digest in &package.manifest.files {
+            let member = fs::read_to_string(package.path.join(&digest.path))
+                .expect("read package data member");
+            assert!(!member.contains("operation_credentials"));
+            assert!(!member.contains(&operation_hash));
+        }
+        database.pool().close().await;
     }
 
     #[tokio::test]

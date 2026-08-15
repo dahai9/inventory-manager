@@ -2350,6 +2350,56 @@ async fn v2_outbound_order_document(
 }
 
 #[tauri::command]
+async fn v2_void_receipt_document(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::voiding::VoidDocumentRequest,
+) -> Result<v2::voiding::VoidDocumentResponse, String> {
+    activation::require_activated(&app)?;
+    database.void_receipt_document(input).await
+}
+
+#[tauri::command]
+async fn v2_void_outbound_order_document(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::voiding::VoidDocumentRequest,
+) -> Result<v2::voiding::VoidDocumentResponse, String> {
+    activation::require_activated(&app)?;
+    database.void_outbound_order_document(input).await
+}
+
+#[tauri::command]
+async fn v2_copy_receipt_document_sns(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::voiding::CopyDocumentSnRequest,
+) -> Result<v2::voiding::CopyDocumentSnResponse, String> {
+    activation::require_activated(&app)?;
+    database.copy_receipt_document_sns(input).await
+}
+
+#[tauri::command]
+async fn v2_copy_outbound_order_document_sns(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::voiding::CopyDocumentSnRequest,
+) -> Result<v2::voiding::CopyDocumentSnResponse, String> {
+    activation::require_activated(&app)?;
+    database.copy_outbound_order_document_sns(input).await
+}
+
+#[tauri::command]
+async fn v2_change_operation_password(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::voiding::ChangeOperationPasswordRequest,
+) -> Result<(), String> {
+    activation::require_activated(&app)?;
+    database.change_operation_password(input).await
+}
+
+#[tauri::command]
 async fn v2_lookup_return_candidate(
     database: tauri::State<'_, v2::OfflineDatabase>,
     barcode: String,
@@ -2417,6 +2467,50 @@ async fn v2_network_outbound_order_document(
 ) -> Result<v2::records::OutboundOrderDocument, String> {
     client
         .outbound_order_document(&order_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_void_receipt_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::voiding::VoidDocumentRequest,
+) -> Result<v2::voiding::VoidDocumentResponse, String> {
+    client
+        .void_receipt_document(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_void_outbound_order_document(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::voiding::VoidDocumentRequest,
+) -> Result<v2::voiding::VoidDocumentResponse, String> {
+    client
+        .void_outbound_order_document(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_copy_receipt_document_sns(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::voiding::CopyDocumentSnRequest,
+) -> Result<v2::voiding::CopyDocumentSnResponse, String> {
+    client
+        .copy_receipt_document_sns(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_network_copy_outbound_order_document_sns(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::voiding::CopyDocumentSnRequest,
+) -> Result<v2::voiding::CopyDocumentSnResponse, String> {
+    client
+        .copy_outbound_order_document_sns(&input)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2640,6 +2734,11 @@ pub fn run() {
             v2_list_outbound_order_records,
             v2_receipt_document,
             v2_outbound_order_document,
+            v2_void_receipt_document,
+            v2_void_outbound_order_document,
+            v2_copy_receipt_document_sns,
+            v2_copy_outbound_order_document_sns,
+            v2_change_operation_password,
             v2_lookup_return_candidate,
             v2_export_receipt_document,
             v2_export_outbound_order_document,
@@ -2683,6 +2782,10 @@ pub fn run() {
             v2_network_list_outbound_order_records,
             v2_network_receipt_document,
             v2_network_outbound_order_document,
+            v2_network_void_receipt_document,
+            v2_network_void_outbound_order_document,
+            v2_network_copy_receipt_document_sns,
+            v2_network_copy_outbound_order_document_sns,
             v2_network_lookup_return_candidate,
             v2_network_export_receipt_document,
             v2_network_export_outbound_order_document,

@@ -1,4 +1,6 @@
-use super::network::{NetworkResult, NetworkService, PERMISSION_INVENTORY_READ};
+use super::network::{
+    NetworkResult, NetworkService, NetworkServiceError, PERMISSION_INVENTORY_READ,
+};
 use super::sqlite::OfflineDatabase;
 use super::warranty::WarrantyTerms;
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
@@ -44,6 +46,8 @@ pub struct ReceiptDocument {
     #[serde(flatten)]
     pub receipt: ReceiptRecord,
     pub items: Vec<DocumentItem>,
+    pub void_info: Option<DocumentVoidInfo>,
+    pub void_eligibility: DocumentVoidEligibility,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +55,21 @@ pub struct OutboundOrderDocument {
     #[serde(flatten)]
     pub order: OutboundOrderRecord,
     pub items: Vec<DocumentItem>,
+    pub void_info: Option<DocumentVoidInfo>,
+    pub void_eligibility: DocumentVoidEligibility,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DocumentVoidInfo {
+    pub reason: String,
+    pub actor_id: String,
+    pub voided_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DocumentVoidEligibility {
+    pub can_void: bool,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +77,8 @@ pub struct DocumentItem {
     pub sku_code: String,
     pub sku_name: String,
     pub barcode: String,
+    pub inventory_status: String,
+    pub allocation_status: Option<String>,
     pub owner_name: Option<String>,
     pub shipment_id: Option<String>,
     pub shipment_line_id: Option<String>,
@@ -142,7 +163,7 @@ impl OfflineDatabase {
                    (SELECT s.shipped_at FROM outbound_shipments s
                      WHERE s.workspace_id = o.workspace_id AND s.outbound_order_id = o.id
                      ORDER BY s.shipped_at DESC, s.id DESC LIMIT 1) AS latest_shipped_at,
-                   COUNT(DISTINCT sl.id) AS item_count,
+                   COUNT(DISTINCT a.id) AS item_count,
                    COUNT(DISTINCT ret.id) AS returned_count
               FROM outbound_orders o
               JOIN business_parties receiver ON receiver.id = o.upstream_receiver_id
@@ -201,6 +222,7 @@ impl OfflineDatabase {
         let items = sqlx::query(
             r#"
             SELECT sku.code AS sku_code, sku.name AS sku_name, iu.barcode,
+                   iu.inventory_status,
                    owner.display_name AS owner_name
               FROM inbound_receipt_lines rl
               JOIN inventory_units iu ON iu.inbound_receipt_line_id = rl.id
@@ -219,7 +241,15 @@ impl OfflineDatabase {
         .map(document_receipt_item_sqlite)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-        Ok(ReceiptDocument { receipt, items })
+        let void_info = load_receipt_void_sqlite(self, receipt_id).await?;
+        let void_eligibility =
+            receipt_void_eligibility_sqlite(self, receipt_id, &receipt.status).await?;
+        Ok(ReceiptDocument {
+            receipt,
+            items,
+            void_info,
+            void_eligibility,
+        })
     }
 
     pub async fn outbound_order_document(
@@ -236,7 +266,7 @@ impl OfflineDatabase {
                    (SELECT s.shipped_at FROM outbound_shipments s
                      WHERE s.workspace_id = o.workspace_id AND s.outbound_order_id = o.id
                      ORDER BY s.shipped_at DESC, s.id DESC LIMIT 1) AS latest_shipped_at,
-                   COUNT(DISTINCT sl.id) AS item_count,
+                   COUNT(DISTINCT a.id) AS item_count,
                    COUNT(DISTINCT ret.id) AS returned_count
               FROM outbound_orders o
               JOIN business_parties receiver ON receiver.id = o.upstream_receiver_id
@@ -267,7 +297,15 @@ impl OfflineDatabase {
             .map(document_outbound_item_sqlite)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        Ok(OutboundOrderDocument { order, items })
+        let void_info = load_outbound_void_sqlite(self, order_id).await?;
+        let void_eligibility =
+            outbound_void_eligibility_sqlite(self, order_id, &order.status).await?;
+        Ok(OutboundOrderDocument {
+            order,
+            items,
+            void_info,
+            void_eligibility,
+        })
     }
 
     pub async fn lookup_return_candidate(&self, barcode: &str) -> Result<ReturnCandidate, String> {
@@ -369,6 +407,8 @@ fn document_receipt_item_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<Document
         sku_code: row.try_get("sku_code")?,
         sku_name: row.try_get("sku_name")?,
         barcode: row.try_get("barcode")?,
+        inventory_status: row.try_get("inventory_status")?,
+        allocation_status: None,
         owner_name: row.try_get("owner_name")?,
         shipment_id: None,
         shipment_line_id: None,
@@ -385,6 +425,7 @@ fn document_receipt_item_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<Document
 fn outbound_document_sqlite() -> &'static str {
     r#"
     SELECT sku.code AS sku_code, sku.name AS sku_name, iu.barcode,
+           iu.inventory_status, a.status AS allocation_status,
            owner.display_name AS owner_name,
            ship.id AS shipment_id, sl.id AS shipment_line_id,
            ship.shipment_no, ship.shipped_at,
@@ -413,6 +454,8 @@ fn document_outbound_item_sqlite(
         sku_code: row.try_get("sku_code")?,
         sku_name: row.try_get("sku_name")?,
         barcode: row.try_get("barcode")?,
+        inventory_status: row.try_get("inventory_status")?,
+        allocation_status: row.try_get("allocation_status")?,
         owner_name: row.try_get("owner_name")?,
         shipment_id: row.try_get("shipment_id")?,
         shipment_line_id: row.try_get("shipment_line_id")?,
@@ -438,6 +481,137 @@ fn return_candidate_sqlite(row: sqlx::sqlite::SqliteRow) -> Result<ReturnCandida
         order_no: row.try_get("order_no")?,
         receiver_name: row.try_get("receiver_name")?,
         warranty: warranty_from_sqlite(&row)?,
+    })
+}
+
+async fn load_receipt_void_sqlite(
+    database: &OfflineDatabase,
+    receipt_id: &str,
+) -> Result<Option<DocumentVoidInfo>, String> {
+    load_document_void_sqlite(database, "inbound_receipt_id", receipt_id).await
+}
+
+async fn load_outbound_void_sqlite(
+    database: &OfflineDatabase,
+    order_id: &str,
+) -> Result<Option<DocumentVoidInfo>, String> {
+    load_document_void_sqlite(database, "outbound_order_id", order_id).await
+}
+
+async fn load_document_void_sqlite(
+    database: &OfflineDatabase,
+    field: &str,
+    document_id: &str,
+) -> Result<Option<DocumentVoidInfo>, String> {
+    let query = format!(
+        "SELECT reason, actor_id, voided_at FROM document_voids WHERE workspace_id = ?1 AND {field} = ?2"
+    );
+    sqlx::query(&query)
+        .bind(database.workspace_id())
+        .bind(document_id)
+        .fetch_optional(database.pool())
+        .await
+        .map_err(|error| format!("读取单据作废信息失败: {error}"))?
+        .map(|row| {
+            Ok(DocumentVoidInfo {
+                reason: row.try_get("reason")?,
+                actor_id: row.try_get("actor_id")?,
+                voided_at: row.try_get("voided_at")?,
+            })
+        })
+        .transpose()
+        .map_err(|error: sqlx::Error| error.to_string())
+}
+
+async fn receipt_void_eligibility_sqlite(
+    database: &OfflineDatabase,
+    receipt_id: &str,
+    status: &str,
+) -> Result<DocumentVoidEligibility, String> {
+    if status == "voided" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec!["该收货单已经作废".to_owned()],
+        });
+    }
+    if status != "posted" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec![format!("当前单据状态为 {status}")],
+        });
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT iu.barcode, iu.inventory_status,
+               EXISTS (SELECT 1 FROM outbound_allocations oa
+                        WHERE oa.workspace_id=iu.workspace_id AND oa.inventory_unit_id=iu.id) AS has_outbound
+          FROM inbound_receipt_lines rl
+          JOIN inventory_units iu ON iu.inbound_receipt_line_id=rl.id
+         WHERE rl.workspace_id=?1 AND rl.receipt_id=?2 ORDER BY iu.barcode
+        "#,
+    )
+    .bind(database.workspace_id())
+    .bind(receipt_id)
+    .fetch_all(database.pool())
+    .await
+    .map_err(|error| format!("检查收货单作废条件失败: {error}"))?;
+    let mut blockers = Vec::new();
+    for row in rows {
+        let barcode: String = row.try_get("barcode").map_err(|error| error.to_string())?;
+        let unit_status: String = row
+            .try_get("inventory_status")
+            .map_err(|error| error.to_string())?;
+        let has_outbound: bool = row
+            .try_get("has_outbound")
+            .map_err(|error| error.to_string())?;
+        if has_outbound {
+            blockers.push(format!("SN {barcode} 已关联出库业务"));
+        } else if !matches!(
+            unit_status.as_str(),
+            "received" | "available" | "quarantined"
+        ) {
+            blockers.push(format!("SN {barcode} 当前状态为 {unit_status}"));
+        }
+    }
+    Ok(DocumentVoidEligibility {
+        can_void: blockers.is_empty(),
+        blockers,
+    })
+}
+
+async fn outbound_void_eligibility_sqlite(
+    database: &OfflineDatabase,
+    order_id: &str,
+    status: &str,
+) -> Result<DocumentVoidEligibility, String> {
+    if status == "voided" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec!["该出库订单已经作废".to_owned()],
+        });
+    }
+    let barcodes: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT sl.scanned_barcode_snapshot
+          FROM outbound_shipments ship
+          JOIN outbound_shipment_lines sl ON sl.outbound_shipment_id=ship.id
+          LEFT JOIN outbound_return_lines ret ON ret.outbound_shipment_line_id=sl.id
+         WHERE ship.workspace_id=?1 AND ship.outbound_order_id=?2 AND ret.id IS NULL
+         ORDER BY sl.scanned_barcode_snapshot
+        "#,
+    )
+    .bind(database.workspace_id())
+    .bind(order_id)
+    .fetch_all(database.pool())
+    .await
+    .map_err(|error| format!("检查出库单作废条件失败: {error}"))?;
+    let blockers = barcodes
+        .into_iter()
+        .map(|barcode| format!("SN {barcode} 已出库但尚未退回"))
+        .collect::<Vec<_>>();
+    Ok(DocumentVoidEligibility {
+        can_void: blockers.is_empty(),
+        blockers,
     })
 }
 
@@ -496,15 +670,42 @@ pub fn write_receipt_workbook(
         warranty_text(document.receipt.warranty.as_ref()).as_str(),
         &styles,
     )?;
+    write_info(worksheet, 8, "单据状态", &document.receipt.status, &styles)?;
+    let mut next_row = 9;
+    if let Some(void_info) = &document.void_info {
+        write_info(
+            worksheet,
+            next_row,
+            "作废时间",
+            &void_info.voided_at,
+            &styles,
+        )?;
+        write_info(
+            worksheet,
+            next_row + 1,
+            "作废操作人",
+            &void_info.actor_id,
+            &styles,
+        )?;
+        write_info(
+            worksheet,
+            next_row + 2,
+            "作废原因",
+            &void_info.reason,
+            &styles,
+        )?;
+        next_row += 3;
+    }
     write_info(
         worksheet,
-        8,
+        next_row,
         "总数量",
         &document.items.len().to_string(),
         &styles,
     )?;
-    write_item_table(worksheet, 10, &document.items, false, &styles)?;
-    configure_sheet(worksheet, document.items.len() as u32 + 11)?;
+    let table_row = next_row + 2;
+    write_item_table(worksheet, table_row, &document.items, false, &styles)?;
+    configure_sheet(worksheet, document.items.len() as u32 + table_row + 1)?;
     workbook.save(path).map_err(xlsx_error)
 }
 
@@ -518,9 +719,14 @@ pub fn write_outbound_workbook(
         .filter(|item| item.shipment_id.is_some())
         .cloned()
         .collect();
-    if shipped_items.is_empty() {
+    if shipped_items.is_empty() && document.order.status != "voided" {
         return Err("该订单尚无已出库商品，不能导出出库单".to_owned());
     }
+    let export_items = if shipped_items.is_empty() {
+        document.items.clone()
+    } else {
+        shipped_items.clone()
+    };
     let mut workbook = Workbook::new();
     let styles = WorkbookStyles::new();
     let worksheet = workbook.add_worksheet();
@@ -559,15 +765,42 @@ pub fn write_outbound_workbook(
         warranty_text(shipped_items.last().and_then(|item| item.warranty.as_ref())).as_str(),
         &styles,
     )?;
+    write_info(worksheet, 7, "单据状态", &document.order.status, &styles)?;
+    let mut next_row = 8;
+    if let Some(void_info) = &document.void_info {
+        write_info(
+            worksheet,
+            next_row,
+            "作废时间",
+            &void_info.voided_at,
+            &styles,
+        )?;
+        write_info(
+            worksheet,
+            next_row + 1,
+            "作废操作人",
+            &void_info.actor_id,
+            &styles,
+        )?;
+        write_info(
+            worksheet,
+            next_row + 2,
+            "作废原因",
+            &void_info.reason,
+            &styles,
+        )?;
+        next_row += 3;
+    }
     write_info(
         worksheet,
-        7,
+        next_row,
         "总数量",
-        &shipped_items.len().to_string(),
+        &export_items.len().to_string(),
         &styles,
     )?;
-    write_item_table(worksheet, 9, &shipped_items, true, &styles)?;
-    configure_sheet(worksheet, shipped_items.len() as u32 + 10)?;
+    let table_row = next_row + 2;
+    write_item_table(worksheet, table_row, &export_items, true, &styles)?;
+    configure_sheet(worksheet, export_items.len() as u32 + table_row + 1)?;
 
     let returned: Vec<_> = shipped_items
         .iter()
@@ -795,7 +1028,7 @@ impl NetworkService {
                       o.created_at::text AS created_at,
                       (SELECT s.shipment_no FROM outbound_shipments s WHERE s.tenant_id=o.tenant_id AND s.outbound_order_id=o.id ORDER BY s.shipped_at DESC,s.id DESC LIMIT 1) AS latest_shipment_no,
                       (SELECT s.shipped_at::text FROM outbound_shipments s WHERE s.tenant_id=o.tenant_id AND s.outbound_order_id=o.id ORDER BY s.shipped_at DESC,s.id DESC LIMIT 1) AS latest_shipped_at,
-                      COUNT(DISTINCT sl.id) AS item_count, COUNT(DISTINCT ret.id) AS returned_count
+                      COUNT(DISTINCT a.id) AS item_count, COUNT(DISTINCT ret.id) AS returned_count
                  FROM outbound_orders o
                  JOIN business_parties receiver ON receiver.tenant_id=o.tenant_id AND receiver.id=o.upstream_receiver_id
                  LEFT JOIN outbound_order_lines ol ON ol.tenant_id=o.tenant_id AND ol.outbound_order_id=o.id
@@ -843,7 +1076,8 @@ impl NetworkService {
             .ok_or_else(|| super::network::NetworkServiceError::Invalid(format!("unknown receipt {receipt_id}")))?;
         let receipt = receipt_record_postgres(row)?;
         let items = sqlx::query(
-            r#"SELECT sku.code AS sku_code,sku.name AS sku_name,iu.barcode,owner.display_name AS owner_name
+            r#"SELECT sku.code AS sku_code,sku.name AS sku_name,iu.barcode,iu.inventory_status,
+                      owner.display_name AS owner_name
                  FROM inbound_receipt_lines rl
                  JOIN inventory_units iu ON iu.tenant_id=rl.tenant_id AND iu.inbound_receipt_line_id=rl.id
                  JOIN skus sku ON sku.tenant_id=iu.tenant_id AND sku.id=iu.sku_id
@@ -851,8 +1085,17 @@ impl NetworkService {
                 WHERE rl.tenant_id=$1 AND rl.receipt_id=$2 ORDER BY sku.code,iu.barcode"#,
         ).bind(tenant_id).bind(receipt_id).fetch_all(&mut **transaction).await?
             .into_iter().map(document_receipt_item_postgres).collect::<Result<Vec<_>,_>>()?;
+        let void_info = load_receipt_void_postgres(transaction, tenant_id, receipt_id).await?;
+        let void_eligibility =
+            receipt_void_eligibility_postgres(transaction, tenant_id, receipt_id, &receipt.status)
+                .await?;
         authorized.commit().await?;
-        Ok(ReceiptDocument { receipt, items })
+        Ok(ReceiptDocument {
+            receipt,
+            items,
+            void_info,
+            void_eligibility,
+        })
     }
 
     pub async fn outbound_order_document_network(
@@ -870,7 +1113,7 @@ impl NetworkService {
             r#"SELECT o.id,o.order_no,receiver.display_name AS receiver_name,o.status,o.created_at::text AS created_at,
                       (SELECT s.shipment_no FROM outbound_shipments s WHERE s.tenant_id=o.tenant_id AND s.outbound_order_id=o.id ORDER BY s.shipped_at DESC,s.id DESC LIMIT 1) AS latest_shipment_no,
                       (SELECT s.shipped_at::text FROM outbound_shipments s WHERE s.tenant_id=o.tenant_id AND s.outbound_order_id=o.id ORDER BY s.shipped_at DESC,s.id DESC LIMIT 1) AS latest_shipped_at,
-                      COUNT(DISTINCT sl.id) AS item_count,COUNT(DISTINCT ret.id) AS returned_count
+                      COUNT(DISTINCT a.id) AS item_count,COUNT(DISTINCT ret.id) AS returned_count
                  FROM outbound_orders o
                  JOIN business_parties receiver ON receiver.tenant_id=o.tenant_id AND receiver.id=o.upstream_receiver_id
                  LEFT JOIN outbound_order_lines ol ON ol.tenant_id=o.tenant_id AND ol.outbound_order_id=o.id
@@ -889,8 +1132,17 @@ impl NetworkService {
             .into_iter()
             .map(document_outbound_item_postgres)
             .collect::<Result<Vec<_>, _>>()?;
+        let void_info = load_outbound_void_postgres(transaction, tenant_id, order_id).await?;
+        let void_eligibility =
+            outbound_void_eligibility_postgres(transaction, tenant_id, order_id, &order.status)
+                .await?;
         authorized.commit().await?;
-        Ok(OutboundOrderDocument { order, items })
+        Ok(OutboundOrderDocument {
+            order,
+            items,
+            void_info,
+            void_eligibility,
+        })
     }
 
     pub async fn lookup_return_candidate_network(
@@ -945,6 +1197,118 @@ fn warranty_from_postgres(
     }))
 }
 
+async fn load_receipt_void_postgres(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    receipt_id: Uuid,
+) -> NetworkResult<Option<DocumentVoidInfo>> {
+    load_document_void_postgres(transaction, tenant_id, "inbound_receipt_id", receipt_id).await
+}
+
+async fn load_outbound_void_postgres(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    order_id: Uuid,
+) -> NetworkResult<Option<DocumentVoidInfo>> {
+    load_document_void_postgres(transaction, tenant_id, "outbound_order_id", order_id).await
+}
+
+async fn load_document_void_postgres(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    field: &str,
+    document_id: Uuid,
+) -> NetworkResult<Option<DocumentVoidInfo>> {
+    let query = format!(
+        "SELECT reason, actor_id, voided_at::text AS voided_at FROM document_voids WHERE tenant_id=$1 AND {field}=$2"
+    );
+    let row = sqlx::query(&query)
+        .bind(tenant_id)
+        .bind(document_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    row.map(|row| -> Result<DocumentVoidInfo, sqlx::Error> {
+        Ok(DocumentVoidInfo {
+            reason: row.try_get("reason")?,
+            actor_id: row.try_get::<Uuid, _>("actor_id")?.to_string(),
+            voided_at: row.try_get("voided_at")?,
+        })
+    })
+    .transpose()
+    .map_err(NetworkServiceError::from)
+}
+
+async fn receipt_void_eligibility_postgres(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    receipt_id: Uuid,
+    status: &str,
+) -> NetworkResult<DocumentVoidEligibility> {
+    if status == "voided" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec!["该收货单已经作废".to_owned()],
+        });
+    }
+    if status != "posted" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec![format!("当前单据状态为 {status}")],
+        });
+    }
+    let rows = sqlx::query(
+        r#"SELECT iu.barcode,iu.inventory_status,
+                  EXISTS (SELECT 1 FROM outbound_allocations oa WHERE oa.tenant_id=iu.tenant_id AND oa.inventory_unit_id=iu.id) AS has_outbound
+             FROM inbound_receipt_lines rl JOIN inventory_units iu ON iu.tenant_id=rl.tenant_id AND iu.inbound_receipt_line_id=rl.id
+            WHERE rl.tenant_id=$1 AND rl.receipt_id=$2 ORDER BY iu.barcode"#,
+    )
+    .bind(tenant_id)
+    .bind(receipt_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut blockers = Vec::new();
+    for row in rows {
+        let barcode: String = row.try_get("barcode")?;
+        let unit_status: String = row.try_get("inventory_status")?;
+        if row.try_get::<bool, _>("has_outbound")? {
+            blockers.push(format!("SN {barcode} 已关联出库业务"));
+        } else if !matches!(
+            unit_status.as_str(),
+            "received" | "available" | "quarantined"
+        ) {
+            blockers.push(format!("SN {barcode} 当前状态为 {unit_status}"));
+        }
+    }
+    Ok(DocumentVoidEligibility {
+        can_void: blockers.is_empty(),
+        blockers,
+    })
+}
+
+async fn outbound_void_eligibility_postgres(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    order_id: Uuid,
+    status: &str,
+) -> NetworkResult<DocumentVoidEligibility> {
+    if status == "voided" {
+        return Ok(DocumentVoidEligibility {
+            can_void: false,
+            blockers: vec!["该出库订单已经作废".to_owned()],
+        });
+    }
+    let barcodes: Vec<String> = sqlx::query_scalar(r#"SELECT sl.scanned_barcode_snapshot FROM outbound_shipments ship JOIN outbound_shipment_lines sl ON sl.tenant_id=ship.tenant_id AND sl.outbound_shipment_id=ship.id LEFT JOIN outbound_return_lines ret ON ret.tenant_id=sl.tenant_id AND ret.outbound_shipment_line_id=sl.id WHERE ship.tenant_id=$1 AND ship.outbound_order_id=$2 AND ret.id IS NULL ORDER BY sl.scanned_barcode_snapshot"#)
+        .bind(tenant_id).bind(order_id).fetch_all(&mut **transaction).await?;
+    let blockers = barcodes
+        .into_iter()
+        .map(|barcode| format!("SN {barcode} 已出库但尚未退回"))
+        .collect::<Vec<_>>();
+    Ok(DocumentVoidEligibility {
+        can_void: blockers.is_empty(),
+        blockers,
+    })
+}
+
 fn receipt_record_postgres(row: sqlx::postgres::PgRow) -> Result<ReceiptRecord, sqlx::Error> {
     Ok(ReceiptRecord {
         receipt_id: row.try_get::<Uuid, _>("id")?.to_string(),
@@ -980,6 +1344,8 @@ fn document_receipt_item_postgres(row: sqlx::postgres::PgRow) -> Result<Document
         sku_code: row.try_get("sku_code")?,
         sku_name: row.try_get("sku_name")?,
         barcode: row.try_get("barcode")?,
+        inventory_status: row.try_get("inventory_status")?,
+        allocation_status: None,
         owner_name: row.try_get("owner_name")?,
         shipment_id: None,
         shipment_line_id: None,
@@ -994,7 +1360,8 @@ fn document_receipt_item_postgres(row: sqlx::postgres::PgRow) -> Result<Document
 }
 
 fn outbound_document_postgres() -> &'static str {
-    r#"SELECT sku.code AS sku_code,sku.name AS sku_name,iu.barcode,owner.display_name AS owner_name,
+    r#"SELECT sku.code AS sku_code,sku.name AS sku_name,iu.barcode,iu.inventory_status,
+              a.status AS allocation_status,owner.display_name AS owner_name,
               ship.id AS shipment_id,sl.id AS shipment_line_id,ship.shipment_no,ship.shipped_at::text AS shipped_at,
               ship.warranty_duration_days,ship.warranty_label_snapshot,
               ship.warranty_started_at::text AS warranty_started_at,ship.warranty_expires_at::text AS warranty_expires_at,
@@ -1018,6 +1385,8 @@ fn document_outbound_item_postgres(
         sku_code: row.try_get("sku_code")?,
         sku_name: row.try_get("sku_name")?,
         barcode: row.try_get("barcode")?,
+        inventory_status: row.try_get("inventory_status")?,
+        allocation_status: row.try_get("allocation_status")?,
         owner_name: row.try_get("owner_name")?,
         shipment_id: row
             .try_get::<Option<Uuid>, _>("shipment_id")?
@@ -1157,6 +1526,8 @@ mod tests {
                 sku_code: "RAM-32G".to_owned(),
                 sku_name: "32G 内存".to_owned(),
                 barcode: barcode.to_owned(),
+                inventory_status: "delivered".to_owned(),
+                allocation_status: Some("shipped".to_owned()),
                 owner_name: Some("货主甲".to_owned()),
                 shipment_id: Some("shipment-1".to_owned()),
                 shipment_line_id: Some(format!("line-{barcode}")),
@@ -1182,6 +1553,11 @@ mod tests {
                 returned_count: 1,
             },
             items,
+            void_info: None,
+            void_eligibility: DocumentVoidEligibility {
+                can_void: false,
+                blockers: vec!["存在未退回商品".to_owned()],
+            },
         };
         write_outbound_workbook(&path, &document).expect("write outbound workbook");
         let mut workbook: Xlsx<_> = open_workbook(&path).expect("open workbook");

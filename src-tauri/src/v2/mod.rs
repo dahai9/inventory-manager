@@ -13,6 +13,7 @@ pub mod records;
 pub mod sqlite;
 pub mod traceability;
 pub mod upgrade;
+pub mod voiding;
 pub mod warranty;
 
 #[cfg(test)]

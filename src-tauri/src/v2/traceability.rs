@@ -77,6 +77,7 @@ pub struct MovementTrace {
     pub movement_type: String,
     pub source_type: String,
     pub source_id: String,
+    pub source_reference: Option<String>,
     pub occurred_at: String,
 }
 
@@ -214,7 +215,14 @@ impl OfflineDatabase {
         .map_err(|error| error.to_string())?;
 
         let movements = sqlx::query(
-            "SELECT id, movement_type, source_type, source_id, occurred_at FROM stock_movements WHERE workspace_id = ?1 AND inventory_unit_id = ?2 ORDER BY occurred_at, id",
+            r#"SELECT sm.id,sm.movement_type,sm.source_type,sm.source_id,sm.occurred_at,
+                      COALESCE(receipt.receipt_no, orders.order_no) AS source_reference
+                 FROM stock_movements sm
+                 LEFT JOIN document_voids dv ON dv.id=sm.source_id AND sm.source_type='document_void'
+                 LEFT JOIN inbound_receipts receipt ON receipt.id=dv.inbound_receipt_id
+                 LEFT JOIN outbound_orders orders ON orders.id=dv.outbound_order_id
+                WHERE sm.workspace_id=?1 AND sm.inventory_unit_id=?2
+                ORDER BY sm.occurred_at,sm.id"#,
         )
         .bind(self.workspace_id())
         .bind(&inventory_unit_id)
@@ -228,6 +236,7 @@ impl OfflineDatabase {
                 movement_type: row.try_get("movement_type")?,
                 source_type: row.try_get("source_type")?,
                 source_id: row.try_get("source_id")?,
+                source_reference: row.try_get("source_reference")?,
                 occurred_at: row.try_get("occurred_at")?,
             })
         })
@@ -446,7 +455,15 @@ impl NetworkService {
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
         let movements = sqlx::query(
-            "SELECT id, movement_type, source_type, source_id, occurred_at::text AS occurred_at FROM stock_movements WHERE tenant_id = $1 AND inventory_unit_id = $2 ORDER BY occurred_at, id",
+            r#"SELECT sm.id,sm.movement_type,sm.source_type,sm.source_id,
+                      sm.occurred_at::text AS occurred_at,
+                      COALESCE(receipt.receipt_no,orders.order_no) AS source_reference
+                 FROM stock_movements sm
+                 LEFT JOIN document_voids dv ON dv.tenant_id=sm.tenant_id AND dv.id=sm.source_id AND sm.source_type='document_void'
+                 LEFT JOIN inbound_receipts receipt ON receipt.tenant_id=dv.tenant_id AND receipt.id=dv.inbound_receipt_id
+                 LEFT JOIN outbound_orders orders ON orders.tenant_id=dv.tenant_id AND orders.id=dv.outbound_order_id
+                WHERE sm.tenant_id=$1 AND sm.inventory_unit_id=$2
+                ORDER BY sm.occurred_at,sm.id"#,
         )
         .bind(tenant_id)
         .bind(inventory_unit_id)
@@ -459,6 +476,7 @@ impl NetworkService {
                 movement_type: row.try_get("movement_type")?,
                 source_type: row.try_get("source_type")?,
                 source_id: row.try_get::<Uuid, _>("source_id")?.to_string(),
+                source_reference: row.try_get("source_reference")?,
                 occurred_at: row.try_get("occurred_at")?,
             })
         })

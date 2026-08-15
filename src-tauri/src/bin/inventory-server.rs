@@ -24,6 +24,7 @@ use inventory_manager_lib::v2::network_ops::{
 use inventory_manager_lib::v2::postgres::{NetworkDatabase, NetworkDatabaseConfig};
 use inventory_manager_lib::v2::records::RecordSearchQuery;
 use inventory_manager_lib::v2::upgrade::{NetworkUpgradeImportRequest, MAX_NETWORK_REQUEST_BYTES};
+use inventory_manager_lib::v2::voiding::{CopyDocumentSnRequest, VoidDocumentRequest};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -146,11 +147,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/inventory/trace", post(inventory_trace))
         .route("/v1/records/receipts/query", post(list_receipt_records))
         .route("/v1/records/receipts/detail", post(receipt_document))
+        .route("/v1/records/receipts/void", post(void_receipt_document))
+        .route(
+            "/v1/records/receipts/copy-sns",
+            post(copy_receipt_document_sns),
+        )
         .route(
             "/v1/records/outbound/query",
             post(list_outbound_order_records),
         )
         .route("/v1/records/outbound/detail", post(outbound_order_document))
+        .route(
+            "/v1/records/outbound/void",
+            post(void_outbound_order_document),
+        )
+        .route(
+            "/v1/records/outbound/copy-sns",
+            post(copy_outbound_order_document_sns),
+        )
         .route(
             "/v1/records/returns/candidate",
             post(lookup_return_candidate),
@@ -505,6 +519,66 @@ async fn outbound_order_document(
     state
         .service
         .outbound_order_document_network(tenant_id, bearer, request.id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn void_receipt_document(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<VoidDocumentRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .void_receipt_document_network(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn void_outbound_order_document(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<VoidDocumentRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .void_outbound_order_document_network(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn copy_receipt_document_sns(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CopyDocumentSnRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .copy_receipt_document_sns_network(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn copy_outbound_order_document_sns(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CopyDocumentSnRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .copy_outbound_order_document_sns_network(tenant_id, bearer, request)
         .await
         .map(Json)
         .map_err(Into::into)

@@ -55,6 +55,7 @@ GRANT INSERT
     ON TABLE public.stock_movements,
              public.audit_logs,
              public.quality_label_name_history,
+             public.document_voids,
              public.migration_packages
     TO :"runtime_role";
 
