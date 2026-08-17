@@ -71,6 +71,7 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0008_quality_labels.sql
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0009_quality_label_name_history.sql
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0010_document_warranties.sql
+          psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -f src-tauri/migrations/postgres/0011_document_voids.sql
           psql -h 127.0.0.1 -U postgres -d inventory_test -v ON_ERROR_STOP=1 -v runtime_role=inventory_runtime -f src-tauri/deploy/postgres/runtime-role.sql
 
       - name: Test Rust workspace
