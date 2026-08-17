@@ -804,10 +804,30 @@ body:has(.v2-workspace) { min-width: 320px; }
 .v2-detail-actions { display: flex; align-items: center; gap: 8px; }
 .v2-return-confirm { display: grid; gap: 18px; }
 .v2-return-confirm textarea { min-height: 82px; }
+.v2-return-batch { display: grid; gap: 14px; margin-top: 16px; }
+.v2-return-batch-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.v2-return-batch-heading h3 { margin: 4px 0 0; }
+.v2-return-batch-heading > strong { color: #1f5e4c; font-size: 1.55rem; line-height: 1; }
+.v2-return-batch-heading > strong small { margin-left: 3px; color: var(--v2-muted, #68766f); font-size: .75rem; }
+.v2-return-batch-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.v2-return-batch-meta span { display: grid; gap: 3px; }
+.v2-return-batch-meta small { color: var(--v2-muted, #68766f); }
+.v2-return-batch-meta strong { color: var(--v2-ink, #23352d); }
+.v2-return-batch-items { display: grid; max-height: 300px; overflow: auto; border: 1px solid var(--v2-border, #d8e1dc); background: #fff; }
+.v2-return-batch-items.compact { max-height: 210px; }
+.v2-return-batch-item { min-height: 44px; display: grid; grid-template-columns: 30px minmax(0, 1fr) minmax(135px, auto) 32px; align-items: center; gap: 8px; padding: 5px 9px; border-bottom: 1px solid #eaecf0; }
+.v2-return-batch-item:last-child { border-bottom: 0; }
+.v2-return-batch-item > span { color: var(--v2-muted, #68766f); font-size: .78rem; text-align: center; }
+.v2-return-batch-item > strong { min-width: 0; overflow-wrap: anywhere; }
+.v2-return-batch-item > small { color: var(--v2-muted, #68766f); }
+.v2-return-batch-items.compact .v2-return-batch-item { grid-template-columns: 30px minmax(0, 1fr); }
 @media (max-width: 700px) {
   .v2-lifecycle-search, .v2-return-scanner { align-items: stretch; flex-direction: column; }
   .v2-lifecycle-search .v2-button, .v2-return-scanner .v2-button { width: 100%; justify-content: center; }
-  .v2-warranty-heading, .v2-record-detail header, .v2-return-confirm header { align-items: flex-start; flex-direction: column; }
+  .v2-warranty-heading, .v2-record-detail header, .v2-return-confirm header, .v2-return-batch-heading { align-items: flex-start; flex-direction: column; }
   .v2-detail-actions { width: 100%; justify-content: space-between; }
   .v2-warranty-controls > * { width: 100%; }
+  .v2-return-batch-item { grid-template-columns: 26px minmax(0, 1fr) 32px; }
+  .v2-return-batch-item > small { grid-column: 2; }
+  .v2-return-batch-items.compact .v2-return-batch-item { grid-template-columns: 26px minmax(0, 1fr); }
 }

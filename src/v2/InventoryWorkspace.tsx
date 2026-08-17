@@ -55,6 +55,7 @@ type CatalogTab = "products" | "parties";
 type ReceiptStep = 1 | 2 | 3;
 type QualityStep = 1 | 2;
 type OutboundStep = 1 | 2 | 3;
+type ReturnStep = "scan" | "confirm";
 type InventoryStatus =
   | "received"
   | "available"
@@ -763,7 +764,7 @@ const navigationItems: NavigationItem[] = [
   { id: "receipt", label: "入库", description: "扫码收货", icon: PackagePlus, group: "operations" },
   { id: "quality", label: "质检", description: "初检与复检", icon: ClipboardCheck, group: "operations" },
   { id: "outbound", label: "出库", description: "凑单、交货与退回", icon: Truck, group: "operations" },
-  { id: "returns", label: "扫码退货", description: "逐件定位原订单", icon: RotateCcw, group: "operations" },
+  { id: "returns", label: "扫码退货", description: "按批定位原订单", icon: RotateCcw, group: "operations" },
   { id: "inventory", label: "库存查询", description: "单件库存与追溯", icon: Boxes, group: "inventory_data" },
   { id: "lifecycle", label: "生命周期", description: "完整历史与最近订单", icon: History, group: "inventory_data" },
   { id: "records", label: "单据查询", description: "收货单与出库订单", icon: FileSpreadsheet, group: "inventory_data" },
@@ -1254,6 +1255,7 @@ export default function InventoryWorkspace({
   const inventoryStatusRef = useRef(inventoryStatus);
   const qualityStatusRef = useRef(qualityStatus);
   const lifecycleSearchRef = useRef(lifecycleSearch);
+  const returnBarcodeRef = useRef("");
   inventorySearchRef.current = inventorySearch;
   inventoryStatusRef.current = inventoryStatus;
   qualityStatusRef.current = qualityStatus;
@@ -1306,11 +1308,13 @@ export default function InventoryWorkspace({
   const [operationPasswordNotice, setOperationPasswordNotice] = useState<Notice | null>(null);
 
   const [returnBarcode, setReturnBarcode] = useState("");
-  const [returnCandidate, setReturnCandidate] = useState<ReturnCandidate | null>(null);
+  const [returnCandidates, setReturnCandidates] = useState<ReturnCandidate[]>([]);
+  const [returnStep, setReturnStep] = useState<ReturnStep>("scan");
   const [returnReason, setReturnReason] = useState("");
   const [returnLoading, setReturnLoading] = useState(false);
   const [returnNotice, setReturnNotice] = useState<Notice | null>(null);
   const returnScannerRef = useRef<HTMLInputElement>(null);
+  returnBarcodeRef.current = returnBarcode;
 
   const [dataOperationLoading, setDataOperationLoading] = useState(false);
   const dataOperationRef = useRef(false);
@@ -1810,19 +1814,27 @@ export default function InventoryWorkspace({
     }
   }
 
-  async function lookupReturnBarcode(event?: FormEvent<HTMLFormElement>) {
+  async function lookupReturnBarcode(event?: FormEvent<HTMLFormElement>, fromEnter = false) {
     event?.preventDefault();
     const barcode = returnBarcode.trim().toUpperCase();
     if (!barcode) return;
     setReturnLoading(true);
     setReturnNotice(null);
-    setReturnCandidate(null);
     try {
       const command = mode === "network" ? "v2_network_lookup_return_candidate" : "v2_lookup_return_candidate";
       const candidate = await invoke<ReturnCandidate>(command, { barcode });
-      setReturnCandidate(candidate);
-      setReturnBarcode(candidate.barcode);
-      setReturnNotice({ type: "success", text: `已定位 ${candidate.order_no} · ${candidate.receiver_name}` });
+      const currentBatch = returnCandidates;
+      const shouldClearSubmittedBarcode = fromEnter && searchClearPreferences.inventory
+        && returnBarcodeRef.current === barcode;
+      if (currentBatch.some((item) => item.shipment_line_id === candidate.shipment_line_id)) {
+        setReturnNotice({ type: "warning", text: `${candidate.barcode} 已在本批扫描清单中` });
+      } else if (currentBatch.length > 0 && currentBatch[0].shipment_id !== candidate.shipment_id) {
+        setReturnNotice({ type: "error", text: `本批只能退回同一出库单（当前为 ${currentBatch[0].shipment_no}），${candidate.barcode} 属于 ${candidate.shipment_no}` });
+      } else {
+        setReturnCandidates((items) => [...items, candidate]);
+        setReturnNotice({ type: "success", text: `已加入本批：${candidate.barcode} · ${candidate.order_no}` });
+      }
+      if (shouldClearSubmittedBarcode) setReturnBarcode("");
     } catch (error) {
       setReturnNotice({ type: "error", text: `退货扫码已拒绝：${displayError(error)}` });
       await playScannerAlert();
@@ -1833,18 +1845,20 @@ export default function InventoryWorkspace({
   }
 
   async function commitScannedReturn() {
-    if (!returnCandidate || !returnReason.trim()) {
-      setReturnNotice({ type: "error", text: "请先扫描有效 SN 并填写退货原因" });
+    const batch = returnCandidates;
+    if (batch.length === 0 || !returnReason.trim()) {
+      setReturnNotice({ type: "error", text: "请先扫描本批 SN 并填写统一退货原因" });
       return;
     }
     setReturnLoading(true);
     try {
       const operationId = createId();
+      const first = batch[0];
       const common = {
         request_id: operationId,
         idempotency_key: `outbound-return:${operationId}`,
-        shipment_id: returnCandidate.shipment_id,
-        shipment_line_ids: [returnCandidate.shipment_line_id],
+        shipment_id: first.shipment_id,
+        shipment_line_ids: batch.map((candidate) => candidate.shipment_line_id),
         return_no: makeDocumentNumber("TH"),
         returned_at: new Date().toISOString(),
         reason: returnReason.trim(),
@@ -1852,8 +1866,9 @@ export default function InventoryWorkspace({
       const command = mode === "network" ? "v2_network_return_outbound_shipment" : "v2_return_outbound_shipment";
       const input = mode === "network" ? (common satisfies NetworkReturnOutboundShipmentRequest) : { ...common, actor_id: resolvedActorId };
       const response = await invoke<ReturnOutboundShipmentResponse>(command, { input });
-      setReturnNotice({ type: "success", text: `${response.return_no} 已退回 ${returnCandidate.barcode}，商品已进入隔离区` });
-      setReturnCandidate(null);
+      setReturnNotice({ type: "success", text: `${response.return_no} 已批量退回 ${response.quarantined_count} 件，商品已进入隔离区` });
+      setReturnCandidates([]);
+      setReturnStep("scan");
       setReturnBarcode("");
       setReturnReason("");
       void refreshDashboard();
@@ -1861,7 +1876,7 @@ export default function InventoryWorkspace({
       setReturnNotice({ type: "error", text: `登记退货失败：${displayError(error)}` });
     } finally {
       setReturnLoading(false);
-      returnScannerRef.current?.focus();
+      if (returnStep === "scan") returnScannerRef.current?.focus();
     }
   }
 
@@ -1972,13 +1987,13 @@ export default function InventoryWorkspace({
       focusFrame = window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
     } else if (page === "outbound" && outboundStep === 2 && !outboundLoading && !outboundScanChecking && !outboundShipment) {
       focusFrame = window.requestAnimationFrame(() => outboundScannerInputRef.current?.focus());
-    } else if (page === "returns" && !returnLoading) {
+    } else if (page === "returns" && returnStep === "scan" && !returnLoading) {
       focusFrame = window.requestAnimationFrame(() => returnScannerRef.current?.focus());
     }
     return () => {
       if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
     };
-  }, [catalogLoading, page, outboundLoading, outboundScanChecking, outboundShipment, outboundStep, qualityLoading, qualityScanChecking, qualityStep, receiptDetailsReady, receiptLoading, receiptStep, scanChecking]);
+  }, [catalogLoading, page, outboundLoading, outboundScanChecking, outboundShipment, outboundStep, qualityLoading, qualityScanChecking, qualityStep, receiptDetailsReady, receiptLoading, receiptStep, returnLoading, returnStep, scanChecking]);
 
   function toggleNavGroup(groupId: NavigationGroupId) {
     setExpandedNavGroups((current) => {
@@ -4098,12 +4113,17 @@ export default function InventoryWorkspace({
   }
 
   function renderReturns() {
-    const status = returnCandidate?.warranty ? warrantyStatus(returnCandidate.warranty) : null;
+    const firstCandidate = returnCandidates[0] ?? null;
+    const status = firstCandidate?.warranty ? warrantyStatus(firstCandidate.warranty) : null;
     return (
-      <section className="v2-page" aria-labelledby="v2-returns-title"><div className="v2-page-heading"><div><span className="v2-eyebrow">售后处理</span><h2 id="v2-returns-title">扫码退货</h2><p>扫描一个 SN，系统会定位它最近一次尚未退货的订单。</p></div></div>
-        <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onChange={(event) => setReturnBarcode(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "定位原订单"}</button></form>
+      <section className="v2-page" aria-labelledby="v2-returns-title">
+        <div className="v2-page-heading"><div><span className="v2-eyebrow">售后处理</span><h2 id="v2-returns-title">扫码退货</h2><p>先连续扫描同一出库单的退货 SN，结束扫描后为整批填写一次原因。</p></div></div>
+        {returnStep === "scan" && <>
+          <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onChange={(event) => setReturnBarcode(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(undefined, true); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "加入本批"}</button></form>
+          {returnCandidates.length > 0 && <section className="v2-panel v2-return-batch"><header className="v2-return-batch-heading"><div><span className="v2-eyebrow">当前退货批次</span><h3>{firstCandidate?.shipment_no}</h3></div><strong>{returnCandidates.length}<small> 件</small></strong></header><div className="v2-return-batch-meta"><span><small>客户</small><strong>{firstCandidate?.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate?.order_no}</strong></span><span><small>本批规则</small><strong>同一出库单</strong></span></div><div className="v2-return-batch-items">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong><small>{formatDateTime(candidate.shipped_at)}</small><button className="v2-icon-button" type="button" onClick={() => setReturnCandidates((items) => items.filter((item) => item.shipment_line_id !== candidate.shipment_line_id))} disabled={returnLoading} aria-label={`移除 ${candidate.barcode}`} title="从本批移除"><X size={16} /></button></div>)}</div><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => { setReturnNotice(null); setReturnStep("confirm"); }} disabled={returnLoading || returnCandidates.length === 0}>结束扫描，填写统一原因 <ArrowRight size={16} /></button><button className="v2-button" type="button" onClick={() => { setReturnCandidates([]); setReturnBarcode(""); setReturnNotice(null); }} disabled={returnLoading}>清空本批</button></div></section>}
+        </>}
         {returnNotice && <div className={`v2-notice ${returnNotice.type}`}>{returnNotice.text}</div>}
-        {returnCandidate && <section className="v2-panel v2-return-confirm"><header><div><span className="v2-eyebrow">已定位原始出库事实</span><h3 className="v2-mono">{returnCandidate.barcode}</h3></div>{status && <span className={`v2-warranty-status ${status.className}`}>{status.label}</span>}</header><div className="v2-return-context"><span><small>客户</small><strong>{returnCandidate.receiver_name}</strong></span><span><small>订单编号</small><strong>{returnCandidate.order_no}</strong></span><span><small>出库单号</small><strong>{returnCandidate.shipment_no}</strong></span><span><small>出库时间</small><strong>{formatDateTime(returnCandidate.shipped_at)}</strong></span><span><small>客户质保</small><strong>{warrantyDescription(returnCandidate.warranty)}</strong></span></div><label><span>退货原因 *</span><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} placeholder="例如：客户检测后无法点亮" disabled={returnLoading} /></label><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => void commitScannedReturn()} disabled={returnLoading || !returnReason.trim()}>确认退回并隔离</button><button className="v2-button" type="button" onClick={() => { setReturnCandidate(null); setReturnReason(""); returnScannerRef.current?.focus(); }} disabled={returnLoading}>取消</button></div></section>}
+        {returnStep === "confirm" && firstCandidate && <section className="v2-panel v2-return-confirm"><header><div><span className="v2-eyebrow">批量退货确认</span><h3>{firstCandidate.shipment_no} · {returnCandidates.length} 件</h3></div>{status && <span className={`v2-warranty-status ${status.className}`}>{status.label}</span>}</header><div className="v2-return-context"><span><small>客户</small><strong>{firstCandidate.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate.order_no}</strong></span><span><small>出库单号</small><strong>{firstCandidate.shipment_no}</strong></span><span><small>出库时间</small><strong>{formatDateTime(firstCandidate.shipped_at)}</strong></span><span><small>客户质保</small><strong>{warrantyDescription(firstCandidate.warranty)}</strong></span></div><div className="v2-return-batch-items compact">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong></div>)}</div><label><span>本批统一退货原因 *</span><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} placeholder="例如：客户检测后无法点亮" disabled={returnLoading} autoFocus /></label><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => void commitScannedReturn()} disabled={returnLoading || !returnReason.trim()}>{returnLoading ? "正在登记…" : `确认退回并隔离 ${returnCandidates.length} 件`}</button><button className="v2-button" type="button" onClick={() => { setReturnStep("scan"); setReturnReason(""); setReturnNotice(null); }} disabled={returnLoading}>返回继续扫描</button></div></section>}
       </section>
     );
   }
@@ -4252,9 +4272,9 @@ export default function InventoryWorkspace({
           <div><span className="v2-eyebrow">数据安全</span><h2 id="v2-settings-title">备份、恢复与版本升级</h2><p>离线数据恢复和一次性网络升级。</p></div>
         </div>
         <section className="v2-panel v2-query-settings-panel">
-          <div className="v2-settings-heading"><div><h3>查询输入行为</h3><small>设置三个查询页面按回车查询后是否清空输入框，扫码枪连续查询时更方便。</small></div><SlidersHorizontal size={20} /></div>
+          <div className="v2-settings-heading"><div><h3>查询输入行为</h3><small>设置查询页面和退货录入按回车查询后是否清空输入框，扫码枪连续查询时更方便。</small></div><SlidersHorizontal size={20} /></div>
           <div className="v2-query-settings-list">
-            <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.inventory} onChange={(event) => updateSearchClearPreference("inventory", event.target.checked)} /><span><strong>库存查询</strong><small>回车查询完成后清空库存搜索词</small></span></label>
+            <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.inventory} onChange={(event) => updateSearchClearPreference("inventory", event.target.checked)} /><span><strong>库存查询与退货录入</strong><small>回车查询完成后清空库存搜索词或退货 SN</small></span></label>
             <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.lifecycle} onChange={(event) => updateSearchClearPreference("lifecycle", event.target.checked)} /><span><strong>生命周期</strong><small>回车查询完成后清空 SN 输入框</small></span></label>
             <label className="v2-settings-toggle"><input type="checkbox" checked={searchClearPreferences.records} onChange={(event) => updateSearchClearPreference("records", event.target.checked)} /><span><strong>单据查询</strong><small>回车查询完成后清空单据搜索词</small></span></label>
           </div>
