@@ -61,7 +61,7 @@ async fn tenant_administrator_workflow_is_audited_and_tenant_scoped() {
             .fetch_one(&mut *setup)
             .await
             .expect("count seeded permissions");
-    assert_eq!(permission_count, 13);
+    assert_eq!(permission_count, 14);
 
     for (role_id, code, name) in [
         (operator_role_id, "operator", "Operator"),
@@ -228,6 +228,7 @@ async fn tenant_administrator_workflow_is_audited_and_tenant_scoped() {
                 "identity.users.read",
                 "identity.users.write",
                 "inventory.access",
+                "inventory.document.void",
                 "inventory.upgrade.import",
             ],
         ),
@@ -256,6 +257,7 @@ async fn tenant_administrator_workflow_is_audited_and_tenant_scoped() {
                 "inventory.access",
                 "inventory.allocation.write",
                 "inventory.delivery.write",
+                "inventory.document.void",
                 "inventory.order.write",
                 "inventory.quality.write",
                 "inventory.receipt.write",
