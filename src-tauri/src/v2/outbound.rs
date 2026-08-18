@@ -18,6 +18,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const ORDER_SCOPE: &str = "create_outbound_order";
+const RENAME_SCOPE: &str = "rename_outbound_order";
 const ALLOCATION_SCOPE: &str = "allocate_outbound_order";
 const SHIPMENT_SCOPE: &str = "ship_outbound_order";
 const DELIVERY_SCOPE: &str = "confirm_outbound_delivery";
@@ -44,6 +45,23 @@ pub struct CreateOutboundOrderResponse {
     pub upstream_receiver_id: String,
     pub sku_id: String,
     pub required_quantity: u32,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameOutboundOrderRequest {
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub order_id: String,
+    pub upstream_receiver_name: String,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameOutboundOrderResponse {
+    pub order_id: String,
+    pub order_no: String,
+    pub receiver_name: String,
     pub idempotent_replay: bool,
 }
 
@@ -307,6 +325,114 @@ impl OfflineDatabase {
             &mut tx,
             &workspace_id,
             ORDER_SCOPE,
+            &request.idempotency_key,
+            &digest,
+            &response,
+            &now,
+        )
+        .await?;
+        tx.commit().await.map_err(commit_error)?;
+        Ok(response)
+    }
+
+    pub async fn rename_outbound_order(
+        &self,
+        request: RenameOutboundOrderRequest,
+    ) -> OutboundResult<RenameOutboundOrderResponse> {
+        let request = normalize_rename_order(request)?;
+        let digest = request_digest(&request)?;
+        let workspace_id = self.workspace_id().to_owned();
+        let now = now_utc().map_err(OutboundError::Storage)?;
+        let mut tx = begin_write(self, &workspace_id).await?;
+        if let Some(mut response) = load_idempotent::<RenameOutboundOrderResponse>(
+            &mut tx,
+            &workspace_id,
+            RENAME_SCOPE,
+            &request.idempotency_key,
+            &digest,
+        )
+        .await?
+        {
+            response.idempotent_replay = true;
+            tx.commit().await.map_err(commit_error)?;
+            return Ok(response);
+        }
+
+        let order = sqlx::query(
+            r#"
+            SELECT o.order_no, o.status, receiver.display_name AS receiver_name
+              FROM outbound_orders o
+              JOIN business_parties receiver
+                ON receiver.workspace_id = o.workspace_id
+               AND receiver.id = o.upstream_receiver_id
+             WHERE o.workspace_id = ?1 AND o.id = ?2
+             "#,
+        )
+        .bind(&workspace_id)
+        .bind(&request.order_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| storage("load outbound order for rename", error))?
+        .ok_or_else(|| OutboundError::NotFound(request.order_id.clone()))?;
+        let order_no: String = order.try_get("order_no").map_err(row_error)?;
+        let status: String = order.try_get("status").map_err(row_error)?;
+        let old_name: String = order.try_get("receiver_name").map_err(row_error)?;
+        if status == "voided" {
+            return Err(OutboundError::Conflict(
+                "voided outbound order cannot be renamed".to_owned(),
+            ));
+        }
+        if old_name == request.upstream_receiver_name {
+            return Err(OutboundError::Conflict(
+                "new receiver name is the same as the current name".to_owned(),
+            ));
+        }
+
+        let receiver_id = upsert_party(
+            &mut tx,
+            &workspace_id,
+            &request.upstream_receiver_name,
+            "upstream_receiver",
+            &now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE outbound_orders SET upstream_receiver_id = ?1 WHERE workspace_id = ?2 AND id = ?3",
+        )
+        .bind(&receiver_id)
+        .bind(&workspace_id)
+        .bind(&request.order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| storage("rename outbound order", error))?;
+
+        let response = RenameOutboundOrderResponse {
+            order_id: request.order_id.clone(),
+            order_no: order_no.clone(),
+            receiver_name: request.upstream_receiver_name.clone(),
+            idempotent_replay: false,
+        };
+        write_audit(
+            &mut tx,
+            &workspace_id,
+            &request.actor_id,
+            "outbound_order.renamed",
+            "outbound_order",
+            &request.order_id,
+            &request.request_id,
+            json!({
+                "order_no": order_no,
+                "old_receiver_name": old_name,
+                "new_receiver_name": request.upstream_receiver_name,
+                "status": status,
+            }),
+            &now,
+        )
+        .await?;
+        save_idempotent(
+            &mut tx,
+            &workspace_id,
+            RENAME_SCOPE,
             &request.idempotency_key,
             &digest,
             &response,
@@ -1453,6 +1579,18 @@ fn normalize_create_order(
     }
     Ok(request)
 }
+
+fn normalize_rename_order(
+    mut request: RenameOutboundOrderRequest,
+) -> OutboundResult<RenameOutboundOrderRequest> {
+    request.request_id = required_text("request_id", request.request_id)?;
+    request.idempotency_key = required_text("idempotency_key", request.idempotency_key)?;
+    request.order_id = required_text("order_id", request.order_id)?;
+    request.upstream_receiver_name =
+        required_text("upstream_receiver_name", request.upstream_receiver_name)?;
+    request.actor_id = required_text("actor_id", request.actor_id)?;
+    Ok(request)
+}
 fn normalize_allocate(
     mut request: AllocateOutboundRequest,
 ) -> OutboundResult<AllocateOutboundRequest> {
@@ -1917,6 +2055,86 @@ mod tests {
             repeated_trace.outbound[1].shipment_no.as_deref(),
             Some("S-2")
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rename_outbound_order_reassigns_only_that_order_and_audits_the_change() {
+        let path = std::env::temp_dir().join(format!(
+            "inventory-outbound-rename-test-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        let database = OfflineDatabase::open(&path).await.expect("open database");
+        let order = database
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "create-order".to_owned(),
+                idempotency_key: "create-order-key".to_owned(),
+                order_no: "RENAME-1".to_owned(),
+                upstream_receiver_name: "Incorrect Customer".to_owned(),
+                sku_code: "SKU-X".to_owned(),
+                sku_name: "Model X".to_owned(),
+                required_quantity: 1,
+                required_at: None,
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("create outbound order");
+        let other_order = database
+            .create_outbound_order(CreateOutboundOrderRequest {
+                request_id: "create-other-order".to_owned(),
+                idempotency_key: "create-other-order-key".to_owned(),
+                order_no: "RENAME-2".to_owned(),
+                upstream_receiver_name: "Incorrect Customer".to_owned(),
+                sku_code: "SKU-X".to_owned(),
+                sku_name: "Model X".to_owned(),
+                required_quantity: 1,
+                required_at: None,
+                actor_id: "operator".to_owned(),
+            })
+            .await
+            .expect("create second outbound order");
+        let request = RenameOutboundOrderRequest {
+            request_id: "rename-order".to_owned(),
+            idempotency_key: "rename-order-key".to_owned(),
+            order_id: order.order_id.clone(),
+            upstream_receiver_name: "Correct Customer".to_owned(),
+            actor_id: "supervisor".to_owned(),
+        };
+        let renamed = database
+            .rename_outbound_order(request.clone())
+            .await
+            .expect("rename outbound order");
+        assert_eq!(renamed.order_no, "RENAME-1");
+        assert_eq!(renamed.receiver_name, "Correct Customer");
+        assert!(!renamed.idempotent_replay);
+
+        let replay = database
+            .rename_outbound_order(request)
+            .await
+            .expect("replay outbound rename");
+        assert!(replay.idempotent_replay);
+        let details = database
+            .outbound_order_details(&order.order_id)
+            .await
+            .expect("load renamed order");
+        assert_eq!(details.receiver_name, "Correct Customer");
+        let other_details = database
+            .outbound_order_details(&other_order.order_id)
+            .await
+            .expect("load untouched order");
+        assert_eq!(other_details.receiver_name, "Incorrect Customer");
+
+        let audit: String = sqlx::query_scalar(
+            "SELECT details_json FROM audit_logs WHERE workspace_id = ?1 AND action = 'outbound_order.renamed' AND entity_id = ?2",
+        )
+        .bind(database.workspace_id())
+        .bind(&order.order_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("load outbound rename audit");
+        let audit: serde_json::Value = serde_json::from_str(&audit).expect("decode audit");
+        assert_eq!(audit["old_receiver_name"], "Incorrect Customer");
+        assert_eq!(audit["new_receiver_name"], "Correct Customer");
         let _ = std::fs::remove_file(path);
     }
 }

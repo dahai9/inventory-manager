@@ -2124,6 +2124,17 @@ async fn v2_network_create_outbound_order(
 }
 
 #[tauri::command]
+async fn v2_network_rename_outbound_order(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    input: v2::network_ops::NetworkRenameOutboundOrderRequest,
+) -> Result<v2::outbound::RenameOutboundOrderResponse, String> {
+    client
+        .rename_outbound_order(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn v2_network_allocate_outbound_order(
     client: tauri::State<'_, v2::network_client::NetworkClient>,
     input: v2::network_ops::NetworkAllocateOutboundRequest,
@@ -2250,6 +2261,19 @@ async fn v2_create_outbound_order(
     activation::require_activated(&app)?;
     database
         .create_outbound_order(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn v2_rename_outbound_order(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    input: v2::outbound::RenameOutboundOrderRequest,
+) -> Result<v2::outbound::RenameOutboundOrderResponse, String> {
+    activation::require_activated(&app)?;
+    database
+        .rename_outbound_order(input)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2725,6 +2749,7 @@ pub fn run() {
             v2_inventory_trace,
             v2_get_dashboard,
             v2_create_outbound_order,
+            v2_rename_outbound_order,
             v2_allocate_outbound_order,
             v2_ship_outbound_order,
             v2_confirm_outbound_delivery,
@@ -2774,6 +2799,7 @@ pub fn run() {
             v2_network_inventory_trace,
             v2_network_get_dashboard,
             v2_network_create_outbound_order,
+            v2_network_rename_outbound_order,
             v2_network_allocate_outbound_order,
             v2_network_ship_outbound_order,
             v2_network_confirm_outbound_delivery,

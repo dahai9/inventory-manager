@@ -19,7 +19,8 @@ use inventory_manager_lib::v2::network::{
 use inventory_manager_lib::v2::network_ops::{
     NetworkAllocateOutboundRequest, NetworkCompleteInspectionRequest,
     NetworkConfirmOutboundDeliveryRequest, NetworkCreateOutboundOrderRequest,
-    NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
+    NetworkRenameOutboundOrderRequest, NetworkReturnOutboundShipmentRequest,
+    NetworkShipOutboundRequest,
 };
 use inventory_manager_lib::v2::postgres::{NetworkDatabase, NetworkDatabaseConfig};
 use inventory_manager_lib::v2::records::RecordSearchQuery;
@@ -184,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/quality/inspections", post(complete_quality_inspection))
         .route("/v1/outbound/orders", post(create_outbound_order))
+        .route("/v1/outbound/orders/rename", post(rename_outbound_order))
         .route("/v1/outbound/allocations", post(allocate_outbound_order))
         .route("/v1/outbound/shipments", post(ship_outbound_order))
         .route("/v1/outbound/deliveries", post(confirm_outbound_delivery))
@@ -741,6 +743,21 @@ async fn create_outbound_order(
     state
         .service
         .create_outbound_order(tenant_id, bearer, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn rename_outbound_order(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkRenameOutboundOrderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tenant_id = tenant_id(&headers)?;
+    let bearer = bearer_token(&headers)?;
+    state
+        .service
+        .rename_outbound_order(tenant_id, bearer, request)
         .await
         .map(Json)
         .map_err(Into::into)

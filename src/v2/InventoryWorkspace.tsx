@@ -440,6 +440,21 @@ interface NetworkCreateOutboundOrderRequest {
   required_at: string | null;
 }
 
+interface RenameOutboundOrderRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_id: string;
+  upstream_receiver_name: string;
+  actor_id: string;
+}
+
+interface NetworkRenameOutboundOrderRequest {
+  request_id: string;
+  idempotency_key: string;
+  order_id: string;
+  upstream_receiver_name: string;
+}
+
 interface NetworkAllocateOutboundRequest {
   request_id: string;
   idempotency_key: string;
@@ -487,6 +502,13 @@ interface CreateOutboundOrderResponse {
   upstream_receiver_id: string;
   sku_id: string;
   required_quantity: number;
+  idempotent_replay: boolean;
+}
+
+interface RenameOutboundOrderResponse {
+  order_id: string;
+  order_no: string;
+  receiver_name: string;
   idempotent_replay: boolean;
 }
 
@@ -634,6 +656,12 @@ interface OutboundOrderDocument {
   items: DocumentItem[];
   void_info: DocumentVoidInfo | null;
   void_eligibility: DocumentVoidEligibility;
+}
+
+interface RenameOutboundDialogState {
+  orderId: string;
+  orderNo: string;
+  currentName: string;
 }
 
 interface VoidDocumentResponse {
@@ -1294,6 +1322,9 @@ export default function InventoryWorkspace({
   const [recordNotice, setRecordNotice] = useState<Notice | null>(null);
   const [selectedReceiptDocument, setSelectedReceiptDocument] = useState<ReceiptDocument | null>(null);
   const [selectedOutboundDocument, setSelectedOutboundDocument] = useState<OutboundOrderDocument | null>(null);
+  const [renameOutboundDialog, setRenameOutboundDialog] = useState<RenameOutboundDialogState | null>(null);
+  const [renameOutboundName, setRenameOutboundName] = useState("");
+  const [renameOutboundLoading, setRenameOutboundLoading] = useState(false);
   const [voidDialog, setVoidDialog] = useState<VoidDialogState | null>(null);
   const [voidReason, setVoidReason] = useState("");
   const [voidPassword, setVoidPassword] = useState("");
@@ -1651,6 +1682,62 @@ export default function InventoryWorkspace({
       setRecordNotice({ type: "error", text: `读取出库订单详情失败：${displayError(error)}` });
     } finally {
       setRecordLoading(false);
+    }
+  }
+
+  function openRenameOutboundDialog(document: OutboundOrderDocument) {
+    if (document.status === "voided") {
+      setRecordNotice({ type: "warning", text: "已作废的出库单不能修改客户名称。" });
+      return;
+    }
+    setRenameOutboundDialog({
+      orderId: document.order_id,
+      orderNo: document.order_no,
+      currentName: document.receiver_name,
+    });
+    setRenameOutboundName(document.receiver_name);
+    setRecordNotice(null);
+  }
+
+  function closeRenameOutboundDialog() {
+    if (renameOutboundLoading) return;
+    setRenameOutboundDialog(null);
+    setRenameOutboundName("");
+  }
+
+  async function submitRenameOutbound(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!renameOutboundDialog || renameOutboundLoading) return;
+    const receiverName = renameOutboundName.trim();
+    if (!receiverName) return;
+    if (receiverName === renameOutboundDialog.currentName) {
+      setRecordNotice({ type: "warning", text: "新客户名称与当前名称相同。" });
+      return;
+    }
+    setRenameOutboundLoading(true);
+    setRecordNotice(null);
+    try {
+      const operationId = createId();
+      const common = {
+        request_id: operationId,
+        idempotency_key: `outbound-rename:${operationId}`,
+        order_id: renameOutboundDialog.orderId,
+        upstream_receiver_name: receiverName,
+      };
+      const command = mode === "network" ? "v2_network_rename_outbound_order" : "v2_rename_outbound_order";
+      const input = mode === "network"
+        ? (common satisfies NetworkRenameOutboundOrderRequest)
+        : ({ ...common, actor_id: resolvedActorId } satisfies RenameOutboundOrderRequest);
+      const response = await invoke<RenameOutboundOrderResponse>(command, { input });
+      setRenameOutboundDialog(null);
+      setRenameOutboundName("");
+      await refreshRecords();
+      await openOutboundDocument(response.order_id);
+      setRecordNotice({ type: "success", text: `${response.order_no} 的客户名称已修改为“${response.receiver_name}”。` });
+    } catch (error) {
+      setRecordNotice({ type: "error", text: `修改客户名称失败：${displayError(error)}` });
+    } finally {
+      setRenameOutboundLoading(false);
     }
   }
 
@@ -2324,6 +2411,9 @@ export default function InventoryWorkspace({
     setRecordNotice(null);
     setSelectedReceiptDocument(null);
     setSelectedOutboundDocument(null);
+    setRenameOutboundDialog(null);
+    setRenameOutboundName("");
+    setRenameOutboundLoading(false);
     setVoidDialog(null);
     setVoidReason("");
     setVoidPassword("");
@@ -2356,6 +2446,7 @@ export default function InventoryWorkspace({
       || outboundLoading
       || catalogLoading
       || recordLoading
+      || renameOutboundLoading
       || voidLoading
       || snCopyLoading
       || operationPasswordLoading
@@ -4046,6 +4137,7 @@ export default function InventoryWorkspace({
   }
 
   function renderRecords() {
+    const mutationDisabled = mode === "offline" && !offlineActivated;
     return (
       <section className="v2-page" aria-labelledby="v2-records-title">
         <div className="v2-page-heading"><div><span className="v2-eyebrow">库存与数据</span><h2 id="v2-records-title">单据查询</h2><p>按订单号、客户、供应商或 SN 查询历史单据。</p></div><button className="v2-button" type="button" onClick={() => void refreshRecords()} disabled={recordLoading}><RefreshCw size={16} className={recordLoading ? "v2-spin" : ""} /> 刷新</button></div>
@@ -4065,6 +4157,7 @@ export default function InventoryWorkspace({
         )}
         {selectedOutboundDocument && <section className="v2-panel v2-record-detail">
           <header><div><span className="v2-eyebrow">出库订单详情</span><h3>{selectedOutboundDocument.order_no} · {selectedOutboundDocument.receiver_name}</h3></div><div className="v2-detail-actions">
+            {selectedOutboundDocument.status !== "voided" && <button className="v2-button" type="button" onClick={() => openRenameOutboundDialog(selectedOutboundDocument)} disabled={recordLoading || mutationDisabled}><Pencil size={16} /> 修改客户名称</button>}
             <button className="v2-button danger" type="button" disabled={!selectedOutboundDocument.void_eligibility.can_void || recordLoading} title={selectedOutboundDocument.void_eligibility.blockers.join("；") || "作废出库订单"} onClick={() => openVoidDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length, selectedOutboundDocument.void_eligibility)}><Ban size={16} /> 作废单据</button>
             <button className="v2-button" type="button" onClick={() => openSnCopyDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length)} disabled={recordLoading}><Copy size={16} /> 复制整单 SN</button>
             <button className="v2-button" type="button" onClick={() => void exportBusinessDocument("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no)}><Download size={16} /> 导出出库单</button>
@@ -4087,6 +4180,16 @@ export default function InventoryWorkspace({
           {!selectedReceiptDocument.void_eligibility.can_void && !selectedReceiptDocument.void_info && <div className="v2-void-blockers"><ShieldAlert size={18} /><div><strong>当前不能作废</strong>{selectedReceiptDocument.void_eligibility.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div></div>}
           <div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>库存状态</th><th>货主</th></tr></thead><tbody>{selectedReceiptDocument.items.map((item) => <tr key={item.barcode}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td><td>{item.owner_name}</td></tr>)}</tbody></table></div>
         </section>}
+        {renameOutboundDialog && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeRenameOutboundDialog(); }} onKeyDown={(event) => { if (event.key === "Escape") closeRenameOutboundDialog(); }}>
+          <section className="v2-catalog-modal v2-rename-outbound-modal" role="dialog" aria-modal="true" aria-labelledby="v2-rename-outbound-modal-title">
+            <header><div><span>单据更正</span><h3 id="v2-rename-outbound-modal-title">修改 {renameOutboundDialog.orderNo} 的客户名称</h3></div><button className="v2-icon-button" type="button" onClick={closeRenameOutboundDialog} disabled={renameOutboundLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>
+            <form className="v2-void-modal-form" onSubmit={(event) => void submitRenameOutbound(event)}>
+              <div className="v2-void-impact"><Pencil size={21} /><div><strong>仅更正本张出库单</strong><span>不会重命名历史客户，也不会改变商品、SN、出库、交货或售后记录。</span></div></div>
+              <label><span>客户名称 *</span><input value={renameOutboundName} onChange={(event) => setRenameOutboundName(event.target.value)} maxLength={200} autoFocus disabled={renameOutboundLoading} /></label>
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeRenameOutboundDialog} disabled={renameOutboundLoading}>取消</button><button className="v2-button primary" type="submit" disabled={renameOutboundLoading || !renameOutboundName.trim() || renameOutboundName.trim() === renameOutboundDialog.currentName}><Pencil size={16} />{renameOutboundLoading ? "正在修改…" : "确认修改"}</button></div>
+            </form>
+          </section>
+        </div>}
         {voidDialog && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeVoidDialog(); }} onKeyDown={(event) => { if (event.key === "Escape") closeVoidDialog(); }}>
           <section className="v2-catalog-modal v2-void-modal" role="dialog" aria-modal="true" aria-labelledby="v2-void-modal-title">
             <header><div><span>危险操作</span><h3 id="v2-void-modal-title">作废 {voidDialog.documentNo}</h3></div><button className="v2-icon-button" type="button" onClick={closeVoidDialog} disabled={voidLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>

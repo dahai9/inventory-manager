@@ -23,7 +23,8 @@ use super::network::{
 use super::network_ops::{
     NetworkAllocateOutboundRequest, NetworkCompleteInspectionRequest,
     NetworkConfirmOutboundDeliveryRequest, NetworkCreateOutboundOrderRequest,
-    NetworkReturnOutboundShipmentRequest, NetworkShipOutboundRequest,
+    NetworkRenameOutboundOrderRequest, NetworkReturnOutboundShipmentRequest,
+    NetworkShipOutboundRequest,
 };
 use super::records::{
     OutboundOrderDocument, OutboundOrderRecord, ReceiptDocument, ReceiptRecord, RecordSearchQuery,
@@ -445,6 +446,14 @@ impl NetworkClient {
         request: &NetworkCreateOutboundOrderRequest,
     ) -> Result<super::outbound::CreateOutboundOrderResponse, NetworkClientError> {
         self.authorized_json(Method::POST, "/v1/outbound/orders", request)
+            .await
+    }
+
+    pub async fn rename_outbound_order(
+        &self,
+        request: &NetworkRenameOutboundOrderRequest,
+    ) -> Result<super::outbound::RenameOutboundOrderResponse, NetworkClientError> {
+        self.authorized_json(Method::POST, "/v1/outbound/orders/rename", request)
             .await
     }
 

@@ -38,6 +38,7 @@ pub const PERMISSION_RETURN_WRITE: &str = "inventory.return.write";
 
 const INSPECTION_SCOPE: &str = "complete_quality_inspection";
 const ORDER_SCOPE: &str = "create_outbound_order";
+const RENAME_SCOPE: &str = "rename_outbound_order";
 const ALLOCATION_SCOPE: &str = "allocate_outbound_order";
 const SHIPMENT_SCOPE: &str = "ship_outbound_order";
 const DELIVERY_SCOPE: &str = "confirm_outbound_delivery";
@@ -79,6 +80,14 @@ pub struct NetworkCreateOutboundOrderRequest {
     pub sku_name: String,
     pub required_quantity: u32,
     pub required_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkRenameOutboundOrderRequest {
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub order_id: Uuid,
+    pub upstream_receiver_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,6 +557,126 @@ impl NetworkService {
             transaction,
             tenant_id,
             ORDER_SCOPE,
+            &request.idempotency_key,
+            &response,
+        )
+        .await?;
+        authorized.commit().await?;
+        Ok(response)
+    }
+
+    pub async fn rename_outbound_order(
+        &self,
+        tenant_id: Uuid,
+        session_token: &str,
+        request: NetworkRenameOutboundOrderRequest,
+    ) -> NetworkResult<super::outbound::RenameOutboundOrderResponse> {
+        let request = normalize_rename_order(request)?;
+        let digest = request_digest(&request)?;
+        let mut authorized = self
+            .database()
+            .begin_authorized_request(tenant_id, session_token, PERMISSION_ORDER_WRITE)
+            .await?;
+        let identity = authorized.session();
+        let actor_id = identity.identity.user_id;
+        let membership_id = identity.identity.membership_id;
+        let device_id = identity.device_id;
+        let session_id = identity.session_id;
+        let transaction = authorized.sqlx_transaction();
+        if let Some(mut replay) = claim_idempotency::<super::outbound::RenameOutboundOrderResponse>(
+            transaction,
+            tenant_id,
+            RENAME_SCOPE,
+            &request.idempotency_key,
+            &digest,
+        )
+        .await?
+        {
+            replay.idempotent_replay = true;
+            authorized.commit().await?;
+            return Ok(replay);
+        }
+
+        let order = sqlx::query(
+            r#"
+            SELECT o.order_no, o.status, receiver.display_name AS receiver_name
+              FROM outbound_orders o
+              JOIN business_parties receiver
+                ON receiver.tenant_id = o.tenant_id
+               AND receiver.id = o.upstream_receiver_id
+             WHERE o.tenant_id = $1 AND o.id = $2
+             FOR UPDATE OF o
+             "#,
+        )
+        .bind(tenant_id)
+        .bind(request.order_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| NetworkServiceError::Conflict {
+            entity: "outbound_order".to_owned(),
+            key: request.order_id.to_string(),
+        })?;
+        let order_no: String = order.try_get("order_no")?;
+        let status: String = order.try_get("status")?;
+        let old_name: String = order.try_get("receiver_name")?;
+        if status == "voided" {
+            return Err(NetworkServiceError::Conflict {
+                entity: "outbound_order_status".to_owned(),
+                key: status,
+            });
+        }
+        if old_name == request.upstream_receiver_name {
+            return Err(NetworkServiceError::Conflict {
+                entity: "outbound_order_receiver".to_owned(),
+                key: "unchanged".to_owned(),
+            });
+        }
+
+        let receiver_id = associate_party_without_renaming(
+            transaction,
+            tenant_id,
+            &request.upstream_receiver_name,
+            "upstream_receiver",
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE outbound_orders SET upstream_receiver_id = $1 WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(receiver_id)
+        .bind(tenant_id)
+        .bind(request.order_id)
+        .execute(&mut **transaction)
+        .await?;
+
+        let response = super::outbound::RenameOutboundOrderResponse {
+            order_id: request.order_id.to_string(),
+            order_no: order_no.clone(),
+            receiver_name: request.upstream_receiver_name.clone(),
+            idempotent_replay: false,
+        };
+        insert_audit(
+            transaction,
+            tenant_id,
+            actor_id,
+            membership_id,
+            device_id,
+            session_id,
+            "outbound_order.renamed",
+            request.order_id,
+            &request.request_id,
+            serde_json::json!({
+                "order_no": order_no,
+                "old_receiver_name": old_name,
+                "new_receiver_name": request.upstream_receiver_name,
+                "status": status,
+            }),
+            &UtcNow::value(),
+        )
+        .await?;
+        finish_idempotency(
+            transaction,
+            tenant_id,
+            RENAME_SCOPE,
             &request.idempotency_key,
             &response,
         )
@@ -1690,6 +1819,16 @@ fn normalize_create_order(
     Ok(request)
 }
 
+fn normalize_rename_order(
+    mut request: NetworkRenameOutboundOrderRequest,
+) -> NetworkResult<NetworkRenameOutboundOrderRequest> {
+    request.request_id = required("request_id", request.request_id)?;
+    request.idempotency_key = required("idempotency_key", request.idempotency_key)?;
+    request.upstream_receiver_name =
+        normalized_name("upstream_receiver_name", request.upstream_receiver_name)?;
+    Ok(request)
+}
+
 fn normalize_allocate(
     mut request: NetworkAllocateOutboundRequest,
 ) -> NetworkResult<NetworkAllocateOutboundRequest> {
@@ -1801,6 +1940,41 @@ async fn upsert_party(
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (tenant_id, normalized_name) DO UPDATE
             SET display_name = EXCLUDED.display_name
+        RETURNING id
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(Uuid::now_v7())
+    .bind(normalized)
+    .bind(display_name)
+    .fetch_one(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO party_roles (tenant_id, party_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant_id)
+    .bind(id)
+    .bind(role)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(id)
+}
+
+/// Return an existing party or add a new one without changing the display name
+/// of an existing party referenced by other business documents.
+async fn associate_party_without_renaming(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    display_name: &str,
+    role: &str,
+) -> NetworkResult<Uuid> {
+    let normalized = display_name.to_lowercase();
+    let id = sqlx::query_scalar(
+        r#"
+        INSERT INTO business_parties (tenant_id, id, normalized_name, display_name)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (tenant_id, normalized_name) DO UPDATE
+            SET normalized_name = EXCLUDED.normalized_name
         RETURNING id
         "#,
     )
@@ -2508,6 +2682,18 @@ mod tests {
         }))
         .expect("request should deserialize without actor");
         assert_eq!(request.required_quantity, 2);
+    }
+
+    #[test]
+    fn network_rename_normalizes_the_replacement_receiver() {
+        let request = normalize_rename_order(NetworkRenameOutboundOrderRequest {
+            request_id: "req".to_owned(),
+            idempotency_key: "idem".to_owned(),
+            order_id: Uuid::now_v7(),
+            upstream_receiver_name: "  Correct   Customer  ".to_owned(),
+        })
+        .expect("rename request should normalize");
+        assert_eq!(request.upstream_receiver_name, "Correct Customer");
     }
 
     #[test]
