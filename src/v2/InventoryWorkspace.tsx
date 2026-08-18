@@ -8,6 +8,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { writeClipboardText } from "../clipboard";
 import {
   ArrowLeft,
   ArrowRight,
@@ -1792,10 +1793,7 @@ export default function InventoryWorkspace({
           request_id: createId(),
         },
       });
-      if (!navigator.clipboard?.writeText) {
-        throw new Error("当前环境不支持写入剪贴板");
-      }
-      await navigator.clipboard.writeText(response.barcodes.join("\n"));
+      await writeClipboardText(response.barcodes.join("\n"));
       const count = response.barcodes.length;
       setSnCopyDialog(null);
       setSnCopyPassword("");

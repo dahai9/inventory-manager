@@ -1,6 +1,6 @@
 [package]
 name = "inventory-manager"
-version = "0.3.5"
+version = "0.3.6"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -29,6 +29,7 @@ anyhow = "1.0.102"
 argon2 = "0.5"
 axum = "0.8"
 tauri-plugin-dialog = "2.7.1"
+tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-fs = "2.5.1"
 rodio = { version = "0.22.2", features = ["playback"] }
 base64 = "0.22.1"

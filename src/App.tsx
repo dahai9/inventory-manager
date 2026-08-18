@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { writeClipboardText } from "./clipboard";
 import { open, save, message } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
@@ -254,7 +255,7 @@ function App() {
     if (!machineCode || machineCode === "读取失败") return;
 
     try {
-      await navigator.clipboard.writeText(machineCode);
+      await writeClipboardText(machineCode);
       setActivationMessage({ msg: "机器码已复制", type: "success" });
     } catch (err) {
       setActivationMessage({ msg: "复制失败: " + err, type: "error" });
