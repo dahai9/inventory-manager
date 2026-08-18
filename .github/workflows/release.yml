@@ -23,17 +23,14 @@ jobs:
         with:
           script: |
             const tagName = context.ref_name;
-            let release;
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            let release = releases.find((candidate) => candidate.tag_name === tagName);
 
-            try {
-              ({ data: release } = await github.rest.repos.getReleaseByTag({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                tag: tagName,
-              }));
-            } catch (error) {
-              if (error.status !== 404) throw error;
-
+            if (!release) {
               ({ data: release } = await github.rest.repos.createRelease({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
