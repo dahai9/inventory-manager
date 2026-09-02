@@ -522,7 +522,7 @@ impl OfflineDatabase {
             let mut rows = Vec::with_capacity(request.barcodes.len());
             for barcode in &request.barcodes {
                 let row = sqlx::query(
-                    "SELECT id, barcode, owner_party_id, sku_id, inbound_receipt_line_id, location_id, version, received_at, quality_status FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2",
+                    "SELECT id, barcode, owner_party_id, sku_id, inbound_receipt_line_id, location_id, version, received_at, quality_status FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2 AND inventory_status <> 'voided' ORDER BY received_at DESC, id DESC LIMIT 1",
                 )
                 .bind(&workspace_id)
                 .bind(barcode)

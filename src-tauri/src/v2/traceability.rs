@@ -88,7 +88,7 @@ impl OfflineDatabase {
     ) -> Result<InventoryBarcodeExistsResponse, String> {
         let barcode = normalized_barcode(barcode)?;
         let exists = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2 AND inventory_status <> 'voided')",
         )
         .bind(self.workspace_id())
         .bind(&barcode)
@@ -120,6 +120,9 @@ impl OfflineDatabase {
               JOIN inbound_receipts receipt ON receipt.id = line.receipt_id
               LEFT JOIN business_parties supplier ON supplier.id = receipt.supplier_party_id
              WHERE iu.workspace_id = ?1 AND iu.barcode = ?2
+             ORDER BY CASE WHEN iu.inventory_status = 'voided' THEN 1 ELSE 0 END,
+                      iu.received_at DESC, iu.id DESC
+             LIMIT 1
             "#,
         )
         .bind(self.workspace_id())
@@ -301,7 +304,7 @@ impl NetworkService {
             .begin_authorized_request(tenant_id, session_token, PERMISSION_INVENTORY_READ)
             .await?;
         let exists = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE tenant_id = $1 AND barcode = $2)",
+            "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE tenant_id = $1 AND barcode = $2 AND inventory_status <> 'voided')",
         )
         .bind(tenant_id)
         .bind(&barcode)
@@ -348,6 +351,9 @@ impl NetworkService {
               LEFT JOIN business_parties supplier
                 ON supplier.tenant_id = receipt.tenant_id AND supplier.id = receipt.supplier_party_id
              WHERE iu.tenant_id = $1 AND iu.barcode = $2
+             ORDER BY CASE WHEN iu.inventory_status = 'voided' THEN 1 ELSE 0 END,
+                      iu.received_at DESC, iu.id DESC
+             LIMIT 1
             "#,
         )
         .bind(tenant_id)
@@ -711,6 +717,53 @@ mod tests {
                 exists: false,
             }
         );
+
+        let original_unit_id: String = sqlx::query_scalar(
+            "SELECT id FROM inventory_units WHERE workspace_id = ?1 AND barcode = 'SN-EXACT-001'",
+        )
+        .bind(database.workspace_id())
+        .fetch_one(database.pool())
+        .await
+        .expect("read original unit");
+        sqlx::query("UPDATE inventory_units SET inventory_status = 'voided' WHERE id = ?1")
+            .bind(&original_unit_id)
+            .execute(database.pool())
+            .await
+            .expect("void original unit");
+        assert_eq!(
+            database
+                .inventory_barcode_exists("SN-EXACT-001")
+                .await
+                .expect("voided barcode lookup")
+                .exists,
+            false
+        );
+
+        database
+            .post_receipt(PostReceiptRequest {
+                request_id: "barcode-replacement-request".to_owned(),
+                idempotency_key: "barcode-replacement-key".to_owned(),
+                receipt_no: "RK-BARCODE-REPLACEMENT".to_owned(),
+                owner_name: "Owner A".to_owned(),
+                supplier_name: "Supplier A".to_owned(),
+                sku_code: "SKU-EXACT".to_owned(),
+                sku_name: "Exact Lookup Product".to_owned(),
+                source_reference: None,
+                received_at: "2026-08-08T02:00:00Z".to_owned(),
+                actor_id: "operator-2".to_owned(),
+                barcodes: vec!["SN-EXACT-001".to_owned()],
+                notes: None,
+                warranty: None,
+            })
+            .await
+            .expect("receive replacement barcode");
+        let trace = database
+            .inventory_trace("SN-EXACT-001")
+            .await
+            .expect("trace replacement barcode");
+        assert_ne!(trace.inventory_unit_id, original_unit_id);
+        assert_eq!(trace.inventory_status, "received");
+        assert_eq!(trace.receipt_no, "RK-BARCODE-REPLACEMENT");
 
         remove_test_database(database, &path).await;
     }

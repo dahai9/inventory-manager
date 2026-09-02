@@ -1603,6 +1603,27 @@ mod tests {
         assert_eq!(unit_status, "voided");
         let movements: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_movements WHERE inventory_unit_id=?1 AND movement_type='voided'").bind(&receipt.units[0].inventory_unit_id).fetch_one(database.pool()).await.expect("void movement");
         assert_eq!(movements, 1);
+
+        let replacement = database
+            .post_receipt(receipt_request(
+                "reuse-after-void",
+                &receipt.units[0].barcode,
+            ))
+            .await
+            .expect("a voided barcode can be received again");
+        assert_ne!(
+            replacement.units[0].inventory_unit_id,
+            receipt.units[0].inventory_unit_id
+        );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inventory_units WHERE workspace_id=?1 AND barcode=?2",
+        )
+        .bind(database.workspace_id())
+        .bind(&receipt.units[0].barcode)
+        .fetch_one(database.pool())
+        .await
+        .expect("barcode history");
+        assert_eq!(history_count, 2);
         close_database(database, path).await;
     }
 

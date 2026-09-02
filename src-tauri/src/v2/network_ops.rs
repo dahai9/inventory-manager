@@ -261,7 +261,9 @@ impl NetworkService {
                 r#"
                 SELECT id, barcode, location_id, inventory_status, quality_status, version
                   FROM inventory_units
-                 WHERE tenant_id = $1 AND barcode = $2
+                 WHERE tenant_id = $1 AND barcode = $2 AND inventory_status <> 'voided'
+                 ORDER BY received_at DESC, id DESC
+                 LIMIT 1
                  FOR UPDATE
                 "#,
             )

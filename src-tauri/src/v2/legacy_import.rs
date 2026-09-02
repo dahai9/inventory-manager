@@ -695,7 +695,7 @@ async fn load_existing_barcodes_transaction<'a>(
             "SELECT barcode, id FROM inventory_units WHERE workspace_id = ",
         );
         query.push_bind(workspace_id);
-        query.push(" AND barcode IN (");
+        query.push(" AND inventory_status <> 'voided' AND barcode IN (");
         let mut separated = query.separated(", ");
         for barcode in chunk {
             separated.push_bind(barcode);
@@ -1733,7 +1733,7 @@ async fn load_existing_barcodes_pool<'a>(
             "SELECT barcode, id FROM inventory_units WHERE workspace_id = ",
         );
         query.push_bind(database.workspace_id());
-        query.push(" AND barcode IN (");
+        query.push(" AND inventory_status <> 'voided' AND barcode IN (");
         let mut separated = query.separated(", ");
         for barcode in chunk {
             separated.push_bind(barcode);

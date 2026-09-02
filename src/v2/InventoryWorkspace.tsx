@@ -1912,8 +1912,10 @@ export default function InventoryWorkspace({
       const shouldClearSubmittedBarcode = fromEnter && searchClearPreferences.inventory
         && returnBarcodeRef.current === barcode;
       if (currentBatch.some((item) => item.shipment_line_id === candidate.shipment_line_id)) {
+        setReturnBarcode("");
         setReturnNotice({ type: "warning", text: `${candidate.barcode} 已在本批扫描清单中` });
       } else if (currentBatch.length > 0 && currentBatch[0].shipment_id !== candidate.shipment_id) {
+        setReturnBarcode("");
         setReturnNotice({ type: "error", text: `本批只能退回同一出库单（当前为 ${currentBatch[0].shipment_no}），${candidate.barcode} 属于 ${candidate.shipment_no}` });
       } else {
         setReturnCandidates((items) => [...items, candidate]);
@@ -1921,6 +1923,7 @@ export default function InventoryWorkspace({
       }
       if (shouldClearSubmittedBarcode) setReturnBarcode("");
     } catch (error) {
+      setReturnBarcode("");
       setReturnNotice({ type: "error", text: `退货扫码已拒绝：${displayError(error)}` });
       await playScannerAlert();
     } finally {
@@ -2066,11 +2069,11 @@ export default function InventoryWorkspace({
 
   useEffect(() => {
     let focusFrame: number | null = null;
-    if (page === "receipt" && receiptStep === 2 && receiptDetailsReady && !catalogLoading && !receiptLoading && !scanChecking) {
+    if (page === "receipt" && receiptStep === 1 && !catalogLoading && !receiptLoading && !scanChecking) {
       focusFrame = window.requestAnimationFrame(() => scannerInputRef.current?.focus());
     } else if (page === "quality" && qualityStep === 1 && !qualityLoading && !qualityScanChecking) {
       focusFrame = window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
-    } else if (page === "outbound" && outboundStep === 2 && !outboundLoading && !outboundScanChecking && !outboundShipment) {
+    } else if (page === "outbound" && outboundStep === 1 && !outboundLoading && !outboundScanChecking && !outboundShipment) {
       focusFrame = window.requestAnimationFrame(() => outboundScannerInputRef.current?.focus());
     } else if (page === "returns" && returnStep === "scan" && !returnLoading) {
       focusFrame = window.requestAnimationFrame(() => returnScannerRef.current?.focus());
@@ -2185,7 +2188,7 @@ export default function InventoryWorkspace({
   function canOpenOutboundStep(step: OutboundStep): boolean {
     if (step === 1) return true;
     if (step === 2) {
-      return Boolean(outboundReceiver.trim());
+      return outboundScannedItems.length > 0;
     }
     return Boolean(outboundShipment);
   }
@@ -2198,7 +2201,7 @@ export default function InventoryWorkspace({
   function canOpenReceiptStep(step: ReceiptStep): boolean {
     if (receiptCompleted) return step === 3;
     if (step === 1) return true;
-    if (step === 2) return receiptDetailsReady;
+    if (step === 2) return barcodes.length > 0;
     return receiptDetailsReady && barcodes.length > 0;
   }
 
@@ -2252,6 +2255,27 @@ export default function InventoryWorkspace({
   function updateReceiptSupplierInput(value: string) {
     setSupplierName(value);
     setReceiptSupplierSuggestionsOpen(true);
+  }
+
+  function validateReceiptProductRules(): boolean {
+    if (!selectedProduct) {
+      setReceiptNotice({ type: "error", text: "请选择商品后再继续确认入库。" });
+      return false;
+    }
+    const prefix = selectedProduct.serial_prefix?.trim().toUpperCase();
+    const forbidden = parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars);
+    for (const barcode of barcodes) {
+      if (prefix && !barcode.startsWith(prefix)) {
+        setReceiptNotice({ type: "error", text: `SN ${barcode} 不符合商品 ${selectedProduct.code} 的前缀规则。` });
+        return false;
+      }
+      const forbiddenToken = forbidden.find((token) => barcode.includes(token));
+      if (forbiddenToken) {
+        setReceiptNotice({ type: "error", text: `SN ${barcode} 含有商品设置的禁用字符或片段 ${forbiddenToken === " " ? "空格" : forbiddenToken}。` });
+        return false;
+      }
+    }
+    return true;
   }
 
   function canOpenQualityStep(step: QualityStep): boolean {
@@ -2643,16 +2667,7 @@ export default function InventoryWorkspace({
   async function validateReceiptBarcode(value: string, knownBarcodes: Set<string>): Promise<string> {
     const barcode = value.trim().toUpperCase();
     if (!barcode) throw new Error("SN 不能为空。");
-    if (!selectedProduct) throw new Error("请先选择商品；未绑定商品的 SN 不允许入库。");
     if (knownBarcodes.has(barcode)) throw new Error(`SN ${barcode} 已在当前入库批次中。`);
-    if (selectedProduct.serial_prefix && !barcode.startsWith(selectedProduct.serial_prefix.toUpperCase())) {
-      throw new Error(`SN ${barcode} 不符合商品 ${selectedProduct.code} 的前缀规则。`);
-    }
-    const forbidden = parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars);
-    const forbiddenToken = forbidden.find((token) => barcode.includes(token));
-    if (forbiddenToken) {
-      throw new Error(`SN ${barcode} 含有商品设置的禁用字符或片段 ${forbiddenToken === " " ? "空格" : forbiddenToken}。`);
-    }
 
     const command = mode === "network"
       ? "v2_network_inventory_barcode_exists"
@@ -2664,7 +2679,7 @@ export default function InventoryWorkspace({
 
   async function addScannedBarcode() {
     const rawBarcode = scannerInput;
-    if (!receiptDetailsReady || !rawBarcode.trim() || scanCheckingRef.current) return;
+    if (!rawBarcode.trim() || scanCheckingRef.current) return;
     scanCheckingRef.current = true;
     setScanChecking(true);
     try {
@@ -2683,7 +2698,7 @@ export default function InventoryWorkspace({
 
   async function importReceiptBarcodes() {
     const candidates = parseBarcodeLines(receiptBulkInput);
-    if (!receiptDetailsReady || candidates.length === 0 || scanCheckingRef.current) return;
+    if (candidates.length === 0 || scanCheckingRef.current) return;
     scanCheckingRef.current = true;
     setScanChecking(true);
     try {
@@ -2790,7 +2805,8 @@ export default function InventoryWorkspace({
       setReceiptStep(3);
       void refreshDashboard();
     } catch (error) {
-      await rejectScan(`入库失败：${displayError(error)}`);
+      setReceiptNotice({ type: "error", text: `入库失败：${displayError(error)}` });
+      await playScannerAlert();
     } finally {
       setReceiptLoading(false);
       window.requestAnimationFrame(() => scannerInputRef.current?.focus());
@@ -2995,23 +3011,13 @@ export default function InventoryWorkspace({
     void refreshDashboard();
   }
 
-  function beginOutboundScan(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setOutboundNotice(null);
-    if (!outboundReceiver.trim()) {
-      setOutboundNotice({ type: "error", text: "请填写上游收货方。" });
+  function finishOutboundScan() {
+    if (outboundLoading || outboundScanChecking || outboundShipment) return;
+    if (outboundScannedItems.length === 0) {
+      setOutboundScanNotice({ type: "error", text: "请至少扫描一个实际出货 SN，再进入下一步。" });
       return;
     }
-    setOutboundOrder(null);
-    setOutboundAllocation(null);
-    setOutboundShipment(null);
-    setOutboundResolved(false);
-    setOutboundScannedItems([]);
-    setOutboundReceiverSuggestionsOpen(false);
-    setOutboundScannerInput("");
-    setOutboundBulkInput("");
-    setOutboundShipmentNo("");
-    setOutboundScanNotice({ type: "success", text: "已进入扫码出库，请扫描实际出货单件；结束扫码时以实际件数确定需求数量。" });
+    setOutboundNotice(null);
     setOutboundStep(2);
   }
 
@@ -3727,7 +3733,6 @@ export default function InventoryWorkspace({
   function renderReceipt() {
     const products = catalog?.products ?? [];
     const suppliers = catalog?.suppliers ?? [];
-    const productLocked = scannedBarcodes.length > 0;
     const mutationDisabled = mode === "offline" && !offlineActivated;
     const missingCatalogEntries = [
       products.length === 0 ? "商品" : null,
@@ -3737,8 +3742,8 @@ export default function InventoryWorkspace({
       ? "products"
       : "parties";
     const receiptReady = receiptDetailsReady && barcodes.length > 0;
-    const stepOneState = receiptStep === 1 ? "active" : receiptDetailsReady ? "complete" : "pending";
-    const stepTwoState = receiptStep === 2 ? "active" : barcodes.length > 0 ? "complete" : "pending";
+    const stepOneState = receiptStep === 1 ? "active" : barcodes.length > 0 ? "complete" : "pending";
+    const stepTwoState = receiptStep === 2 ? "active" : receiptDetailsReady ? "complete" : "pending";
     const stepThreeState = receiptStep === 3 ? "active" : "pending";
     const forbiddenTokens = selectedProduct ? parseForbiddenSerialTokens(selectedProduct.serial_forbidden_chars) : [];
 
@@ -3753,14 +3758,14 @@ export default function InventoryWorkspace({
 
         <form className="v2-panel v2-form v2-receipt-form" onSubmit={submitReceipt}>
           <ol className="v2-receipt-progress" aria-label="入库步骤">
-            <li className={stepOneState}><span>1</span><div><strong>选择资料</strong><small>{receiptDetailsReady ? "已就绪" : "待选择"}</small></div></li>
-            <li className={stepTwoState}><span>2</span><div><strong>扫描 SN</strong><small>{barcodes.length > 0 ? `${barcodes.length} 件` : "待扫描"}</small></div></li>
+            <li className={stepOneState}><span>1</span><div><strong>扫描 SN</strong><small>{barcodes.length > 0 ? `${barcodes.length} 件` : "待扫描"}</small></div></li>
+            <li className={stepTwoState}><span>2</span><div><strong>选择资料</strong><small>{receiptDetailsReady ? "已就绪" : "待选择"}</small></div></li>
             <li className={stepThreeState}><span>3</span><div><strong>确认入库</strong><small>{receiptCompleted ? "已完成" : receiptReady ? "可提交" : "待完成"}</small></div></li>
           </ol>
 
-          {receiptStep === 1 && <section className="v2-receipt-details-step" aria-labelledby="v2-receipt-details-title">
-            <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{receiptDetailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
-            {!catalogLoading && catalog && missingCatalogEntries.length > 0 && <div className="v2-notice warning v2-receipt-prerequisite" role="alert"><span>缺少基础资料：{missingCatalogEntries.join("、")}。请先新增后再扫码。</span><button className="v2-button" type="button" onClick={() => openCatalogCreateFromReceipt(firstMissingCatalogTab)}><Plus size={16} /> 新增{missingCatalogEntries[0]}</button></div>}
+          {receiptStep === 2 && <section className="v2-receipt-details-step" aria-labelledby="v2-receipt-details-title">
+            <div className="v2-receipt-section-heading"><span>2</span><div><h3 id="v2-receipt-details-title">选择资料</h3><small>{receiptDetailsReady ? "资料已完整" : "完成必填项"}</small></div></div>
+            {!catalogLoading && catalog && missingCatalogEntries.length > 0 && <div className="v2-notice warning v2-receipt-prerequisite" role="alert"><span>缺少基础资料：{missingCatalogEntries.join("、")}。新增后返回本步骤继续。</span><button className="v2-button" type="button" onClick={() => openCatalogCreateFromReceipt(firstMissingCatalogTab)}><Plus size={16} /> 新增{missingCatalogEntries[0]}</button></div>}
             <div className="v2-form-grid">
             <label className="v2-receipt-autocomplete"><span>商品 *</span><div className="v2-receipt-autocomplete-control">
               <input value={receiptProductInput} onChange={(event) => updateReceiptProductInput(event.target.value)} onFocus={() => setReceiptProductSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptProductSuggestionsOpen(false), 120)} onKeyDown={(event) => {
@@ -3769,12 +3774,12 @@ export default function InventoryWorkspace({
                   event.preventDefault();
                   chooseReceiptProduct(receiptProductSuggestions[0]);
                 }
-              }} placeholder={catalogLoading ? "正在读取商品…" : "输入编码或名称查找"} required disabled={catalogLoading || scanChecking || productLocked || products.length === 0} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={receiptProductSuggestionsOpen} aria-controls="v2-receipt-product-suggestions" />
-              {receiptProductSuggestionsOpen && !productLocked && <div id="v2-receipt-product-suggestions" className="v2-receipt-autocomplete-suggestions" role="listbox">
+              }} placeholder={catalogLoading ? "正在读取商品…" : "输入编码或名称查找"} required disabled={catalogLoading || scanChecking || products.length === 0} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={receiptProductSuggestionsOpen} aria-controls="v2-receipt-product-suggestions" />
+              {receiptProductSuggestionsOpen && <div id="v2-receipt-product-suggestions" className="v2-receipt-autocomplete-suggestions" role="listbox">
                 {receiptProductSuggestions.map((product) => <button key={product.sku_id} type="button" role="option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReceiptProduct(product)}><strong>{product.code}</strong><small>{product.name}</small></button>)}
                 {!catalogLoading && receiptProductSuggestions.length === 0 && <div className="v2-receipt-autocomplete-empty">没有匹配的商品</div>}
               </div>}
-            </div>{productLocked && <small>当前批次已有 SN，商品已锁定。</small>}{!productLocked && selectedProduct && <small>已绑定目录商品：{selectedProduct.code} · {selectedProduct.name}</small>}</label>
+            </div>{selectedProduct && <small>已绑定目录商品：{selectedProduct.code} · {selectedProduct.name}</small>}</label>
             <label className="v2-receipt-autocomplete"><span>供应商 *</span><div className="v2-receipt-autocomplete-control">
               <input value={supplierName} onChange={(event) => updateReceiptSupplierInput(event.target.value)} onFocus={() => setReceiptSupplierSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptSupplierSuggestionsOpen(false), 120)} onKeyDown={(event) => {
                 if (event.key === "Escape") setReceiptSupplierSuggestionsOpen(false);
@@ -3810,17 +3815,17 @@ export default function InventoryWorkspace({
               </div>
             </div>
             </div>
-            <div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => navigateReceiptStep(2)} disabled={!receiptDetailsReady || catalogLoading || scanChecking}>下一步：扫描 SN <ArrowRight size={16} /></button></div>
+            <div className="v2-workflow-actions"><button className="v2-button" type="button" onClick={() => navigateReceiptStep(1)} disabled={scanChecking || receiptLoading}>上一步：修改扫码</button><button className="v2-button primary" type="button" onClick={() => { if (validateReceiptProductRules()) navigateReceiptStep(3); }} disabled={!receiptDetailsReady || barcodes.length === 0 || catalogLoading || scanChecking}>下一步：确认入库 <ArrowRight size={16} /></button></div>
           </section>}
 
-          {receiptStep === 2 && <section className="v2-scanner-section" aria-labelledby="v2-scanner-title">
+          {receiptStep === 1 && <section className="v2-scanner-section" aria-labelledby="v2-scanner-title">
             <div className="v2-scanner-heading">
-              <div className="v2-receipt-section-heading"><span>2</span><div><h3 id="v2-scanner-title">扫描 SN</h3><small>{receiptDetailsReady ? "逐件校验" : "等待资料完整"}</small></div></div>
+              <div className="v2-receipt-section-heading"><span>1</span><div><h3 id="v2-scanner-title">扫描 SN</h3><small>逐件校验，之后再选择商品和供应商</small></div></div>
               <strong>{barcodes.length}<small>件</small></strong>
             </div>
 
             <div className="v2-scan-rule-bar">
-              <span><strong>商品</strong>{selectedProduct ? `${selectedProduct.code} · ${selectedProduct.name}` : "未选择"}</span>
+              <span><strong>商品</strong>{selectedProduct ? `${selectedProduct.code} · ${selectedProduct.name}` : "稍后选择"}</span>
               <span><strong>前缀</strong>{selectedProduct?.serial_prefix || "不限"}</span>
               <span><strong>禁用</strong>{forbiddenTokens.length > 0 ? forbiddenTokens.map((token) => token === " " ? "空格" : token).join("、") : "无"}</span>
             </div>
@@ -3834,8 +3839,8 @@ export default function InventoryWorkspace({
                     event.preventDefault();
                     void addScannedBarcode();
                   }
-                }} placeholder={receiptDetailsReady ? "请扫描 SN（扫码枪自动回车）" : "请先完成入库资料"} autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={!receiptDetailsReady || scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
-                <button className="v2-button" type="button" onClick={() => void addScannedBarcode()} disabled={!receiptDetailsReady || !scannerInput.trim() || scanChecking || receiptLoading || mutationDisabled}>{scanChecking ? "正在校验…" : "手动加入"}</button>
+                }} placeholder="请扫描 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
+                <button className="v2-button" type="button" onClick={() => void addScannedBarcode()} disabled={!scannerInput.trim() || scanChecking || receiptLoading || mutationDisabled}>{scanChecking ? "正在校验…" : "手动加入"}</button>
               </div>
               <small>扫描后会自动回到输入框；每个 SN 即时精确查重，提交时数据库再次校验唯一性。</small>
             </label>
@@ -3859,13 +3864,12 @@ export default function InventoryWorkspace({
             <details className="v2-alternative-entry">
               <summary><span>备用录入</span><small>批量粘贴 SN，仅在扫码枪不可用时使用</small><ChevronDown size={16} /></summary>
               <div className="v2-alternative-content">
-                <label><span>每行一个 SN</span><textarea value={receiptBulkInput} onChange={(event) => setReceiptBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={!receiptDetailsReady || scanChecking || receiptLoading || mutationDisabled} /></label>
-                <button className="v2-button" type="button" onClick={() => void importReceiptBarcodes()} disabled={!receiptDetailsReady || !receiptBulkInput.trim() || scanChecking || receiptLoading || mutationDisabled}>校验并加入批次</button>
+                <label><span>每行一个 SN</span><textarea value={receiptBulkInput} onChange={(event) => setReceiptBulkInput(event.target.value)} placeholder={"SN0001\nSN0002\nSN0003"} disabled={scanChecking || receiptLoading || mutationDisabled} /></label>
+                <button className="v2-button" type="button" onClick={() => void importReceiptBarcodes()} disabled={!receiptBulkInput.trim() || scanChecking || receiptLoading || mutationDisabled}>校验并加入批次</button>
               </div>
             </details>
             <div className="v2-workflow-actions">
-              <button className="v2-button" type="button" onClick={() => navigateReceiptStep(1)} disabled={scanChecking || receiptLoading}>上一步</button>
-              <button className="v2-button primary" type="button" onClick={() => navigateReceiptStep(3)} disabled={!receiptReady || scanChecking || receiptLoading}>下一步：确认入库 <ArrowRight size={16} /></button>
+              <button className="v2-button primary" type="button" onClick={() => navigateReceiptStep(2)} disabled={!receiptReady || scanChecking || receiptLoading}>下一步：选择资料 <ArrowRight size={16} /></button>
             </div>
           </section>}
 
@@ -4231,8 +4235,8 @@ export default function InventoryWorkspace({
 
   function renderOutbound() {
     const mutationDisabled = mode === "offline" && !offlineActivated;
-    const orderStepState = outboundStep === 1 ? "active" : canOpenOutboundStep(2) ? "complete" : "pending";
-    const scanStepState = outboundStep === 2 ? "active" : outboundShipment ? "complete" : "pending";
+    const scanStepState = outboundStep === 1 ? "active" : outboundHasScannedItems ? "complete" : "pending";
+    const orderStepState = outboundStep === 2 ? "active" : outboundShipment ? "complete" : "pending";
     const deliveryStepState = outboundStep === 3 ? "active" : outboundResolved ? "complete" : "pending";
     const finishOutboundLabel = outboundOrder || outboundAllocation || outboundNotice?.type === "error"
       ? "重试归类并出库"
@@ -4244,13 +4248,13 @@ export default function InventoryWorkspace({
         </div>
         <div className="v2-panel v2-outbound-workbench">
           <ol className="v2-workflow-progress v2-workflow-progress-three" aria-label="出库进度">
-            <li className={orderStepState} aria-current={outboundStep === 1 ? "step" : undefined}><span>1</span><div><strong>选择客户</strong><small>{outboundOrder?.order_no ?? (outboundReceiver || "待填写")}</small></div></li>
-            <li className={scanStepState} aria-current={outboundStep === 2 ? "step" : undefined}><span>2</span><div><strong>优先扫码</strong><small>{outboundHasScannedItems ? `${outboundScannedItems.length} 件已扫描` : "待扫码"}</small></div></li>
+            <li className={scanStepState} aria-current={outboundStep === 1 ? "step" : undefined}><span>1</span><div><strong>优先扫码</strong><small>{outboundHasScannedItems ? `${outboundScannedItems.length} 件已扫描` : "待扫码"}</small></div></li>
+            <li className={orderStepState} aria-current={outboundStep === 2 ? "step" : undefined}><span>2</span><div><strong>选择客户并确认</strong><small>{outboundOrder?.order_no ?? (outboundReceiver || "待填写")}</small></div></li>
             <li className={deliveryStepState} aria-current={outboundStep === 3 ? "step" : undefined}><span>3</span><div><strong>交货处理</strong><small>{outboundShipment?.shipment_no ?? "待出库"}</small></div></li>
           </ol>
 
-          {outboundStep === 1 && <form className="v2-outbound-step" onSubmit={beginOutboundScan}>
-            <div className="v2-receipt-section-heading"><span>1</span><div><h3>选择上游客户</h3><small>输入历史客户名称可直接选择，新客户会在确认出库时自动创建</small></div></div>
+          {outboundStep === 2 && <form className="v2-outbound-step" onSubmit={(event) => { event.preventDefault(); void completeOutboundScanAndShip(); }}>
+            <div className="v2-receipt-section-heading"><span>2</span><div><h3>选择上游客户并确认出库</h3><small>输入历史客户名称可直接选择，新客户会在确认出库时自动创建</small></div></div>
             <div>
               <div className="v2-form-grid">
                 <label className="v2-span-two v2-outbound-receiver-field"><span>上游收货方 *</span><div className="v2-outbound-receiver-input-wrap">
@@ -4262,14 +4266,30 @@ export default function InventoryWorkspace({
                   </div>}
                 </div><small>输入关键字会筛选历史上曾经出货过的客户。</small></label>
               </div>
-              <div className="v2-rule-hint"><ShieldAlert size={17} /><span>订单号由系统自动生成；需求数量以第二步结束时实际扫描的件数确定。本单可以包含不同品牌、不同型号。</span></div>
-              <div className="v2-form-actions"><button className="v2-button primary" type="submit" disabled={outboundLoading || mutationDisabled}>进入扫码出库 <ArrowRight size={16} /></button></div>
+              <div className="v2-rule-hint"><ShieldAlert size={17} /><span>需求数量以第一步实际扫描的件数确定。本单可以包含不同品牌、不同型号，系统会按扫描结果自动归类。</span></div>
+              <div className="v2-outbound-group-summary"><strong>本批扫描结果</strong>{outboundScanGroups.map((group) => <span key={group.skuId}><b>{group.skuCode}</b><small>{group.skuName} · {group.count} 件</small></span>)}</div>
+              <div className="v2-warranty-editor">
+                <div className="v2-warranty-heading"><span>客户质保（可选）</span><small>保存到本次出库的全部 SN</small></div>
+                <div className="v2-warranty-controls">
+                  <select value={outboundWarrantyPreset} onChange={(event) => setOutboundWarrantyPreset(event.target.value)} aria-label="客户质保期限">
+                    <option value="">无质保</option><option value="7">一个星期（7天）</option><option value="15">半个月（15天）</option><option value="30">一个月（30天）</option><option value="365">一年（365天）</option><option value="custom">自定义天数</option>
+                  </select>
+                  {outboundWarrantyPreset === "custom" && <input type="number" min="1" max="36500" value={outboundWarrantyCustomDays} onChange={(event) => setOutboundWarrantyCustomDays(event.target.value)} placeholder="天数" aria-label="自定义客户质保天数" />}
+                  <label className="v2-inline-check"><input type="checkbox" checked={outboundWarrantyManualStart} onChange={(event) => setOutboundWarrantyManualStart(event.target.checked)} /><span>手动指定起算</span></label>
+                  {outboundWarrantyManualStart && <input type="datetime-local" step="1" value={outboundWarrantyStartsAt} onChange={(event) => setOutboundWarrantyStartsAt(event.target.value)} aria-label="客户质保起算时间" />}
+                </div>
+              </div>
+              <div className="v2-outbound-submit-row">
+                <label><span>出库批次号（可选）</span><input value={outboundShipmentNo} onChange={(event) => setOutboundShipmentNo(event.target.value)} placeholder="留空自动生成" disabled={outboundScanChecking || outboundLoading || mutationDisabled} /></label>
+                <button className="v2-button primary" type="submit" disabled={outboundLoading || outboundScanChecking || mutationDisabled}>{outboundLoading ? "正在归类并出库…" : finishOutboundLabel}</button>
+              </div>
+              <div className="v2-workflow-actions"><button className="v2-button" type="button" onClick={() => navigateOutboundStep(1)} disabled={outboundLoading || outboundScanChecking}>上一步：修改扫码</button></div>
             </div>
           </form>}
 
-          {outboundStep === 2 && <section className="v2-outbound-step v2-outbound-scan-step">
+          {outboundStep === 1 && <section className="v2-outbound-step v2-outbound-scan-step">
             <div className="v2-scanner-heading">
-              <div className="v2-receipt-section-heading"><span>2</span><div><h3>优先扫码实际出货单件</h3><small>{outboundReceiver} · 订单号确认出库时自动生成</small></div></div>
+              <div className="v2-receipt-section-heading"><span>1</span><div><h3>优先扫码实际出货单件</h3><small>扫描完成后再选择客户并确认出库</small></div></div>
               <strong>{outboundScannedItems.length}<small> 件已扫描</small></strong>
             </div>
             <div className="v2-scan-context"><span><strong>扫描原则</strong>只按实际 SN 出货</span><span><strong>数量确定</strong>结束扫码时以当前件数为准</span></div>
@@ -4304,20 +4324,6 @@ export default function InventoryWorkspace({
                 </div>)}
               </div>
 
-              {outboundScannedItems.length > 0 && <div className="v2-outbound-group-summary"><strong>自动归类预览</strong>{outboundScanGroups.map((group) => <span key={group.skuId}><b>{group.skuCode}</b><small>{group.skuName} · {group.count} 件</small></span>)}</div>}
-
-              {!outboundShipment && outboundScannedItems.length > 0 && <div className="v2-warranty-editor">
-                <div className="v2-warranty-heading"><span>客户质保（可选）</span><small>保存到本次出库的全部 SN</small></div>
-                <div className="v2-warranty-controls">
-                  <select value={outboundWarrantyPreset} onChange={(event) => setOutboundWarrantyPreset(event.target.value)} aria-label="客户质保期限">
-                    <option value="">无质保</option><option value="7">一个星期（7天）</option><option value="15">半个月（15天）</option><option value="30">一个月（30天）</option><option value="365">一年（365天）</option><option value="custom">自定义天数</option>
-                  </select>
-                  {outboundWarrantyPreset === "custom" && <input type="number" min="1" max="36500" value={outboundWarrantyCustomDays} onChange={(event) => setOutboundWarrantyCustomDays(event.target.value)} placeholder="天数" aria-label="自定义客户质保天数" />}
-                  <label className="v2-inline-check"><input type="checkbox" checked={outboundWarrantyManualStart} onChange={(event) => setOutboundWarrantyManualStart(event.target.checked)} /><span>手动指定起算</span></label>
-                  {outboundWarrantyManualStart && <input type="datetime-local" step="1" value={outboundWarrantyStartsAt} onChange={(event) => setOutboundWarrantyStartsAt(event.target.value)} aria-label="客户质保起算时间" />}
-                </div>
-              </div>}
-
               {!outboundShipment && <>
                 <details className="v2-alternative-entry">
                   <summary><span>备用录入</span><small>批量粘贴实际出货 SN</small><ChevronDown size={16} /></summary>
@@ -4327,19 +4333,13 @@ export default function InventoryWorkspace({
                   </div>
                 </details>
 
-                <div className="v2-outbound-submit-row">
-                  <label><span>出库批次号（可选）</span><input value={outboundShipmentNo} onChange={(event) => setOutboundShipmentNo(event.target.value)} placeholder="留空自动生成" disabled={outboundScanChecking || outboundLoading || mutationDisabled} /></label>
-                  {outboundHasScannedItems && !outboundLoading && <button className="v2-button primary" type="button" onClick={() => void completeOutboundScanAndShip()} disabled={outboundScanChecking || mutationDisabled}>{finishOutboundLabel}</button>}
-                </div>
+                {outboundHasScannedItems && !outboundLoading && <button className="v2-button primary" type="button" onClick={finishOutboundScan} disabled={outboundScanChecking || mutationDisabled}>下一步：选择客户并确认 <ArrowRight size={16} /></button>}
               </>}
-              <div className="v2-workflow-actions">
-                <button className="v2-button" type="button" onClick={() => navigateOutboundStep(1)} disabled={outboundLoading || outboundScanChecking}>上一步</button>
-              </div>
           </section>}
 
           {outboundStep === 3 && <section className="v2-outbound-step">
             <div className="v2-receipt-section-heading"><span>3</span><div><h3>交货确认或退回</h3><small>{outboundShipment ? outboundShipment.shipment_no : "完成自动出库后可用"}</small></div></div>
-            {!outboundShipment && <div className="v2-step-blocked">请先完成第 2 步，扫码并自动出库。</div>}
+            {!outboundShipment && <div className="v2-step-blocked">请先完成第 2 步，选择客户并确认出库。</div>}
             {outboundShipment && <>
               <div className="v2-step-summary"><span><small>出库批次</small><strong>{outboundShipment.shipment_no}</strong></span><span><small>出库数量</small><strong>{outboundShipment.shipped_count} 件</strong></span><span><small>订单</small><strong>{outboundOrder?.order_no ?? "—"}</strong></span><span><small>品牌/型号</small><strong>{outboundScanGroups.length} 组</strong></span></div>
               <div className="v2-outbound-group-summary"><strong>本单自动归类结果</strong>{outboundScanGroups.map((group) => <span key={group.skuId}><b>{group.skuCode}</b><small>{group.skuName} · {group.count} 件</small></span>)}</div>

@@ -32,7 +32,7 @@ pub const PRODUCT_ID: &str = "inventory-manager";
 pub const PACKAGE_FORMAT_VERSION: u32 = 3;
 const MIN_SUPPORTED_PACKAGE_FORMAT_VERSION: u32 = 1;
 pub const LOGICAL_SCHEMA_VERSION: i64 = 1;
-const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 10;
+const REQUIRED_SQLITE_MIGRATION_VERSION: i64 = 11;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const CHECKSUMS_FILE: &str = "checksums.json";
@@ -1415,7 +1415,6 @@ fn validate_relational_data(
         ("locations", &["workspace_id", "warehouse_id", "code"]),
         ("inbound_receipts", &["workspace_id", "receipt_no"]),
         ("inbound_receipts", &["workspace_id", "idempotency_key"]),
-        ("inventory_units", &["workspace_id", "barcode"]),
         ("quality_labels", &["workspace_id", "normalized_name"]),
         ("quality_inspections", &["workspace_id", "inspection_no"]),
         ("quality_inspections", &["workspace_id", "idempotency_key"]),
@@ -1452,6 +1451,7 @@ fn validate_relational_data(
     ] {
         validate_unique_fields(records, table, fields)?;
     }
+    validate_active_inventory_barcode_uniqueness(records)?;
     validate_active_allocation_uniqueness(records)?;
     validate_active_shipment_line_uniqueness(records)?;
 
@@ -1782,6 +1782,24 @@ fn validate_unique_fields(
             return Err(UpgradeError::Data(format!(
                 "{table} has duplicate unique fields {}",
                 fields.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_active_inventory_barcode_uniqueness(
+    records: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<(), UpgradeError> {
+    let mut barcodes = HashSet::new();
+    for record in table_records(records, "inventory_units") {
+        if required_string(record, "inventory_units", "inventory_status")? == "voided" {
+            continue;
+        }
+        let barcode = required_string(record, "inventory_units", "barcode")?;
+        if !barcodes.insert(barcode) {
+            return Err(UpgradeError::Data(format!(
+                "inventory_units has duplicate active barcode {barcode}"
             )));
         }
     }
@@ -4096,6 +4114,11 @@ mod tests {
         ))
         .await
         .expect("create document void schema");
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0011_reusable_voided_barcodes.sql"
+        ))
+        .await
+        .expect("create reusable barcode schema");
         pool.execute(
             "CREATE TABLE _sqlx_migrations (version BIGINT NOT NULL, success BOOLEAN NOT NULL)",
         )
@@ -4123,6 +4146,212 @@ mod tests {
         .await
         .expect("seed workspace");
         (pool, workspace_id, source_instance_id)
+    }
+
+    #[tokio::test]
+    async fn reusable_barcode_migration_preserves_all_inventory_references() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open SQLite migration fixture");
+        for migration in [
+            include_str!("../../migrations/sqlite/0001_inventory_v2_core.sql"),
+            include_str!("../../migrations/sqlite/0002_upgrade_result_reports.sql"),
+            include_str!("../../migrations/sqlite/0003_repeat_outbound_after_return.sql"),
+            include_str!("../../migrations/sqlite/0004_legacy_excel_import.sql"),
+            include_str!("../../migrations/sqlite/0005_inbound_supplier_and_sku_scan_rules.sql"),
+            include_str!("../../migrations/sqlite/0006_business_party_contact_details.sql"),
+            include_str!("../../migrations/sqlite/0007_quality_labels.sql"),
+            include_str!("../../migrations/sqlite/0008_quality_label_name_history.sql"),
+            include_str!("../../migrations/sqlite/0009_document_warranties.sql"),
+            include_str!("../../migrations/sqlite/0010_document_voids.sql"),
+        ] {
+            pool.execute(migration)
+                .await
+                .expect("apply pre-reusable-barcode migration");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO workspaces (id, name, timezone, source_instance_id, created_at)
+            VALUES ('w', '迁移夹具', 'Asia/Shanghai', 'source', '2026-08-01T00:00:00Z');
+            INSERT INTO business_parties (id, workspace_id, normalized_name, display_name, created_at)
+            VALUES
+                ('owner', 'w', 'owner', '货主', '2026-08-01T00:00:00Z'),
+                ('receiver', 'w', 'receiver', '客户', '2026-08-01T00:00:00Z'),
+                ('supplier', 'w', 'supplier', '供应商', '2026-08-01T00:00:00Z');
+            INSERT INTO party_roles (workspace_id, party_id, role, created_at)
+            VALUES
+                ('w', 'owner', 'goods_owner', '2026-08-01T00:00:00Z'),
+                ('w', 'receiver', 'upstream_receiver', '2026-08-01T00:00:00Z'),
+                ('w', 'supplier', 'supplier', '2026-08-01T00:00:00Z');
+            INSERT INTO skus (id, workspace_id, code, name, tracking_mode, active, created_at, serial_prefix, serial_forbidden_chars)
+            VALUES ('sku', 'w', 'SKU-1', '型号 1', 'serial', 1, '2026-08-01T00:00:00Z', NULL, '');
+            INSERT INTO warehouses (id, workspace_id, code, name, created_at)
+            VALUES ('wh', 'w', 'WH-1', '仓库', '2026-08-01T00:00:00Z');
+            INSERT INTO locations (id, workspace_id, warehouse_id, code, name, kind, created_at)
+            VALUES
+                ('receiving', 'w', 'wh', 'RECV', '收货区', 'receiving', '2026-08-01T00:00:00Z'),
+                ('storage', 'w', 'wh', 'STOR', '存储区', 'storage', '2026-08-01T00:00:00Z'),
+                ('quarantine', 'w', 'wh', 'QUAR', '隔离区', 'quarantine', '2026-08-01T00:00:00Z'),
+                ('shipping', 'w', 'wh', 'SHIP', '发货区', 'shipping', '2026-08-01T00:00:00Z');
+            INSERT INTO inbound_receipts
+                (id, workspace_id, receipt_no, owner_party_id, warehouse_id, source_reference,
+                 received_at, status, actor_id, idempotency_key, request_id, created_at,
+                 supplier_party_id, warranty_duration_days, warranty_label_snapshot,
+                 warranty_started_at, warranty_expires_at)
+            VALUES ('receipt', 'w', 'R-1', 'owner', 'wh', 'source', '2026-08-01T00:01:00Z',
+                    'voided', 'operator', 'receipt-key', 'receipt-request', '2026-08-01T00:01:00Z',
+                    'supplier', NULL, NULL, NULL, NULL);
+            INSERT INTO inbound_receipt_lines
+                (id, workspace_id, receipt_id, sku_id, declared_quantity, scanned_quantity, notes, created_at)
+            VALUES ('receipt-line', 'w', 'receipt', 'sku', 1, 1, NULL, '2026-08-01T00:01:00Z');
+            INSERT INTO inventory_units
+                (id, workspace_id, barcode, inbound_receipt_line_id, owner_party_id, sku_id,
+                 location_id, inventory_status, quality_status, version, received_at, updated_at)
+            VALUES ('unit', 'w', 'REUSED-SN', 'receipt-line', 'owner', 'sku', 'storage',
+                    'voided', 'passed', 2, '2026-08-01T00:01:00Z', '2026-08-01T00:02:00Z');
+            INSERT INTO quality_inspections
+                (id, workspace_id, inspection_no, inspection_type, status, inspector_id,
+                 inspected_at, idempotency_key, request_id, created_at)
+            VALUES ('inspection', 'w', 'Q-1', 'initial', 'completed', 'inspector',
+                    '2026-08-01T00:03:00Z', 'inspection-key', 'inspection-request', '2026-08-01T00:03:00Z');
+            INSERT INTO quality_inspection_results
+                (id, workspace_id, inspection_id, inventory_unit_id, result, defect_code,
+                 measurements_json, notes, created_at, quality_label_id, quality_label_snapshot)
+            VALUES ('inspection-result', 'w', 'inspection', 'unit', 'passed', NULL, '{}', NULL,
+                    '2026-08-01T00:03:00Z', NULL, NULL);
+            INSERT INTO quality_waivers
+                (id, workspace_id, inventory_unit_id, reason, authorized_by, authorized_at, revoked_at)
+            VALUES ('waiver', 'w', 'unit', '历史豁免', 'admin', '2026-08-01T00:04:00Z', NULL);
+            INSERT INTO outbound_orders
+                (id, workspace_id, order_no, upstream_receiver_id, required_at, status,
+                 actor_id, idempotency_key, request_id, created_at)
+            VALUES ('order', 'w', 'O-1', 'receiver', NULL, 'completed', 'operator',
+                    'order-key', 'order-request', '2026-08-01T00:05:00Z');
+            INSERT INTO outbound_order_lines
+                (id, workspace_id, outbound_order_id, sku_id, required_quantity,
+                 allocated_quantity, shipped_quantity, delivered_quantity, created_at)
+            VALUES ('order-line', 'w', 'order', 'sku', 1, 1, 1, 1, '2026-08-01T00:05:00Z');
+            INSERT INTO outbound_allocations
+                (id, workspace_id, outbound_order_line_id, inventory_unit_id, status,
+                 allocated_by, allocated_at, released_at)
+            VALUES ('allocation', 'w', 'order-line', 'unit', 'voided', 'operator',
+                    '2026-08-01T00:06:00Z', '2026-08-01T00:07:00Z');
+            INSERT INTO outbound_shipments
+                (id, workspace_id, shipment_no, outbound_order_id, status, shipped_at,
+                 actor_id, idempotency_key, request_id, created_at, warranty_duration_days,
+                 warranty_label_snapshot, warranty_started_at, warranty_expires_at)
+            VALUES ('shipment', 'w', 'S-1', 'order', 'delivered', '2026-08-01T00:08:00Z',
+                    'operator', 'shipment-key', 'shipment-request', '2026-08-01T00:08:00Z',
+                    NULL, NULL, NULL, NULL);
+            INSERT INTO outbound_shipment_lines
+                (id, workspace_id, outbound_shipment_id, outbound_allocation_id, inventory_unit_id,
+                 scanned_barcode_snapshot, created_at)
+            VALUES ('shipment-line', 'w', 'shipment', 'allocation', 'unit', 'REUSED-SN', '2026-08-01T00:08:00Z');
+            INSERT INTO delivery_confirmations
+                (id, workspace_id, outbound_shipment_id, confirmation_code, confirmed_by,
+                 confirmed_at, notes, idempotency_key, request_id, created_at)
+            VALUES ('delivery', 'w', 'shipment', 'D-1', 'receiver', '2026-08-01T00:09:00Z',
+                    NULL, 'delivery-key', 'delivery-request', '2026-08-01T00:09:00Z');
+            INSERT INTO delivery_confirmation_lines
+                (id, workspace_id, delivery_confirmation_id, outbound_shipment_line_id, result,
+                 exception_notes, created_at)
+            VALUES ('delivery-line', 'w', 'delivery', 'shipment-line', 'accepted', NULL, '2026-08-01T00:09:00Z');
+            INSERT INTO outbound_return_batches
+                (id, workspace_id, return_no, returned_at, actor_id, idempotency_key, request_id, created_at)
+            VALUES ('return', 'w', 'RT-1', '2026-08-01T00:10:00Z', 'operator', 'return-key', 'return-request', '2026-08-01T00:10:00Z');
+            INSERT INTO outbound_return_lines
+                (id, workspace_id, return_batch_id, outbound_shipment_line_id, inventory_unit_id,
+                 reason, disposition, created_at)
+            VALUES ('return-line', 'w', 'return', 'shipment-line', 'unit', '客户退回', 'quarantine', '2026-08-01T00:10:00Z');
+            INSERT INTO stock_movements
+                (id, workspace_id, inventory_unit_id, movement_type, from_location_id, to_location_id,
+                 source_type, source_id, actor_id, occurred_at, created_at)
+            VALUES ('movement', 'w', 'unit', 'voided', 'storage', NULL, 'inbound_receipt', 'receipt',
+                    'operator', '2026-08-01T00:11:00Z', '2026-08-01T00:11:00Z');
+            INSERT INTO legacy_import_batches
+                (id, workspace_id, source_file_name, source_file_sha256, source_file_bytes, sheet_name,
+                 preview_id, mapping_json, selected_rows_json, request_hash, response_json, status,
+                 source_kind, actor_id, request_id, idempotency_key, imported_shipments, imported_returns,
+                 skipped_rows, error_rows, created_at, committed_at)
+            VALUES ('legacy-batch', 'w', 'import.xlsx',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, 'Sheet1',
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}', '[]', 'hash',
+                    '{}', 'committed', 'legacy_migration', 'operator', 'legacy-request', 'legacy-key', 1, 0,
+                    0, 0, '2026-08-01T00:12:00Z', '2026-08-01T00:12:00Z');
+            INSERT INTO legacy_import_rows
+                (id, workspace_id, batch_id, source_row, row_status, raw_values_json, issues_json,
+                 shipment_barcode, return_barcode, counterparty_raw, shipment_time_raw, return_time_raw,
+                 shipment_time_normalized, return_time_normalized, shipment_time_fact, return_time_fact,
+                 source_kind, received_at_fact, owner_fact, sku_fact, quality_fact, quality_status_snapshot,
+                 counterparty_semantics, shipment_inventory_unit_id, outbound_shipment_line_id,
+                 returned_inventory_unit_id, outbound_return_line_id, created_at)
+            VALUES ('legacy-row', 'w', 'legacy-batch', 2, 'imported', '{}', '{}', 'REUSED-SN', NULL,
+                    '客户', '2026-08-01T00:08:00Z', NULL, '2026-08-01T00:08:00Z', NULL, 'known', 'not_applicable',
+                    'legacy_migration', 'unknown', 'unknown', 'unknown', 'unknown', 'untested', 'unknown',
+                    'unit', 'shipment-line', NULL, NULL, '2026-08-01T00:12:00Z');
+            INSERT INTO document_voids
+                (id, workspace_id, document_kind, inbound_receipt_id, outbound_order_id, reason,
+                 actor_id, voided_at, request_id, idempotency_key, created_at)
+            VALUES ('void', 'w', 'inbound_receipt', 'receipt', NULL, '供应商更换货物', 'admin',
+                    '2026-08-01T00:13:00Z', 'void-request', 'void-key', '2026-08-01T00:13:00Z');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed migration references");
+
+        pool.execute(include_str!(
+            "../../migrations/sqlite/0011_reusable_voided_barcodes.sql"
+        ))
+        .await
+        .expect("apply reusable barcode migration with references");
+
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .expect("run foreign key check");
+        assert!(
+            violations.is_empty(),
+            "foreign key violations: {violations:?}"
+        );
+        let preserved: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT inventory_status, (SELECT COUNT(*) FROM quality_inspection_results), (SELECT COUNT(*) FROM outbound_return_lines), (SELECT COUNT(*) FROM legacy_import_rows) FROM inventory_units WHERE id = 'unit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read preserved inventory history");
+        assert_eq!(preserved, ("voided".to_owned(), 1, 1, 1));
+
+        sqlx::query(
+            r#"
+            INSERT INTO inventory_units
+                (id, workspace_id, barcode, inbound_receipt_line_id, owner_party_id, sku_id,
+                 location_id, inventory_status, quality_status, version, received_at, updated_at)
+            VALUES ('replacement-unit', 'w', 'REUSED-SN', 'receipt-line', 'owner', 'sku', 'storage',
+                    'available', 'passed', 1, '2026-08-02T00:00:00Z', '2026-08-02T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert active replacement barcode");
+        let duplicate = sqlx::query(
+            r#"
+            INSERT INTO inventory_units
+                (id, workspace_id, barcode, inbound_receipt_line_id, owner_party_id, sku_id,
+                 location_id, inventory_status, quality_status, version, received_at, updated_at)
+            VALUES ('second-active-unit', 'w', 'REUSED-SN', 'receipt-line', 'owner', 'sku', 'storage',
+                    'received', 'untested', 1, '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "two active barcodes must violate the partial index"
+        );
     }
 
     fn export_request(workspace_id: String) -> ExportRequest {
@@ -4457,6 +4686,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("more than one active shipment line"));
+    }
+
+    #[test]
+    fn package_validation_allows_voided_and_active_barcode_history_but_not_two_active_units() {
+        let inventory_record = |id: &str, status: &str| {
+            serde_json::json!({
+                "id": id,
+                "barcode": "REUSED-SN",
+                "inventory_status": status,
+            })
+            .as_object()
+            .expect("inventory unit object")
+            .clone()
+        };
+        let mut records = BTreeMap::from([(
+            "inventory_units".to_owned(),
+            vec![inventory_record("voided-unit", "voided")],
+        )]);
+        records
+            .get_mut("inventory_units")
+            .expect("inventory records")
+            .push(inventory_record("active-unit", "available"));
+        validate_active_inventory_barcode_uniqueness(&records)
+            .expect("voided history may share a barcode with the active replacement");
+
+        records
+            .get_mut("inventory_units")
+            .expect("inventory records")
+            .push(inventory_record("second-active-unit", "received"));
+        let error = validate_active_inventory_barcode_uniqueness(&records)
+            .expect_err("two active units may not share a barcode");
+        assert!(error
+            .to_string()
+            .contains("duplicate active barcode REUSED-SN"));
     }
 
     #[derive(Debug)]

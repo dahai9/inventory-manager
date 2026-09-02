@@ -453,7 +453,7 @@ impl OfflineDatabase {
 
         for barcode in &request.barcodes {
             let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2)",
+                "SELECT EXISTS(SELECT 1 FROM inventory_units WHERE workspace_id = ?1 AND barcode = ?2 AND inventory_status <> 'voided')",
             )
             .bind(workspace_id)
             .bind(barcode)
@@ -2334,6 +2334,9 @@ async fn load_inventory_unit(
             ) AS latest_shipment_line_id
         FROM inventory_units iu
         WHERE iu.workspace_id = ?1 AND iu.barcode = ?2
+        ORDER BY CASE WHEN iu.inventory_status = 'voided' THEN 1 ELSE 0 END,
+                 iu.received_at DESC, iu.id DESC
+        LIMIT 1
         "#,
     )
     .bind(workspace_id)
@@ -3474,6 +3477,170 @@ mod tests {
         assert_eq!(catalog_owner_count, 1);
         assert_eq!(catalog_supplier_count, 1);
         assert_eq!(catalog_sku_count, 1);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn voided_barcode_can_be_received_again_but_active_barcode_cannot() {
+        let (database, path) = test_database_with_default_catalog().await;
+        let first = database
+            .post_receipt(receipt_request(
+                "reuse-request-1",
+                "reuse-key-1",
+                "REUSE-1",
+                &["REUSE-SN"],
+            ))
+            .await
+            .expect("seed barcode");
+
+        sqlx::query("UPDATE inventory_units SET inventory_status = 'voided' WHERE id = ?1")
+            .bind(&first.units[0].inventory_unit_id)
+            .execute(database.pool())
+            .await
+            .expect("void first inventory unit");
+        assert!(
+            !database
+                .inventory_barcode_exists("reuse-sn")
+                .await
+                .expect("check voided barcode")
+                .exists
+        );
+
+        let second = database
+            .post_receipt(receipt_request(
+                "reuse-request-2",
+                "reuse-key-2",
+                "REUSE-2",
+                &["reuse-sn"],
+            ))
+            .await
+            .expect("receive barcode after voiding prior unit");
+        assert_ne!(
+            first.units[0].inventory_unit_id,
+            second.units[0].inventory_unit_id
+        );
+        assert!(
+            database
+                .inventory_barcode_exists("REUSE-SN")
+                .await
+                .expect("check active replacement barcode")
+                .exists
+        );
+
+        let duplicate = database
+            .post_receipt(receipt_request(
+                "reuse-request-3",
+                "reuse-key-3",
+                "REUSE-3",
+                &["REUSE-SN"],
+            ))
+            .await
+            .expect_err("a second active barcode must be rejected");
+        assert!(matches!(
+            duplicate,
+            ApplicationError::Conflict { entity, key, .. }
+                if entity == "inventory_barcode" && key == "REUSE-SN"
+        ));
+
+        let statuses: Vec<(String, String)> = sqlx::query_as(
+            "SELECT inventory_status, barcode FROM inventory_units WHERE barcode = 'REUSE-SN' ORDER BY CASE WHEN inventory_status = 'voided' THEN 0 ELSE 1 END, id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("read barcode history");
+        assert_eq!(
+            statuses,
+            vec![
+                ("voided".to_owned(), "REUSE-SN".to_owned()),
+                ("received".to_owned(), "REUSE-SN".to_owned()),
+            ]
+        );
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn quality_and_outbound_barcode_workflows_select_active_replacement() {
+        let (database, path) = test_database_with_default_catalog().await;
+        let first = database
+            .post_receipt(receipt_request(
+                "active-selection-request-1",
+                "active-selection-key-1",
+                "ACTIVE-SELECTION-1",
+                &["ACTIVE-SN"],
+            ))
+            .await
+            .expect("seed original inventory unit");
+        sqlx::query("UPDATE inventory_units SET inventory_status = 'voided' WHERE id = ?1")
+            .bind(&first.units[0].inventory_unit_id)
+            .execute(database.pool())
+            .await
+            .expect("void original inventory unit");
+        let replacement = database
+            .post_receipt(receipt_request(
+                "active-selection-request-2",
+                "active-selection-key-2",
+                "ACTIVE-SELECTION-2",
+                &["ACTIVE-SN"],
+            ))
+            .await
+            .expect("seed active replacement unit");
+
+        let inspection = database
+            .complete_inspection(inspection_request(
+                "active-selection-inspection-request",
+                "active-selection-inspection-key",
+                "ACTIVE-SELECTION-Q",
+                InspectionKind::Initial,
+                vec![("ACTIVE-SN", QualityOutcome::Passed)],
+            ))
+            .await
+            .expect("inspect active replacement unit");
+        assert_eq!(
+            inspection.units[0].inventory_unit_id,
+            replacement.units[0].inventory_unit_id
+        );
+
+        create_test_party(
+            &database,
+            "客户 Active Selection",
+            CatalogPartyRole::UpstreamReceiver,
+        )
+        .await;
+        let order = database
+            .create_outbound_order(crate::v2::outbound::CreateOutboundOrderRequest {
+                request_id: "active-selection-order-request".to_owned(),
+                idempotency_key: "active-selection-order-key".to_owned(),
+                order_no: "ACTIVE-SELECTION-O".to_owned(),
+                upstream_receiver_name: "客户 Active Selection".to_owned(),
+                sku_code: "MODEL-X".to_owned(),
+                sku_name: "型号 X".to_owned(),
+                required_quantity: 1,
+                required_at: None,
+                actor_id: "operator-1".to_owned(),
+            })
+            .await
+            .expect("create active selection outbound order");
+        database
+            .allocate_outbound_order(crate::v2::outbound::AllocateOutboundRequest {
+                request_id: "active-selection-allocation-request".to_owned(),
+                idempotency_key: "active-selection-allocation-key".to_owned(),
+                order_id: order.order_id.clone(),
+                order_line_id: order.order_line_id.clone(),
+                barcodes: vec!["ACTIVE-SN".to_owned()],
+                allow_mixed_skus: false,
+                actor_id: "operator-1".to_owned(),
+            })
+            .await
+            .expect("allocate active replacement unit");
+        let allocated_unit_id: String = sqlx::query_scalar(
+            "SELECT inventory_unit_id FROM outbound_allocations WHERE workspace_id = ?1 AND outbound_order_line_id = ?2",
+        )
+        .bind(database.workspace_id())
+        .bind(&order.order_line_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("read allocated active replacement unit");
+        assert_eq!(allocated_unit_id, replacement.units[0].inventory_unit_id);
         close_and_remove(database, path).await;
     }
 
