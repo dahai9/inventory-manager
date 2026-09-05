@@ -2451,6 +2451,70 @@ async fn v2_export_outbound_order_document(
     v2::records::write_outbound_workbook(path, &document)
 }
 
+fn validate_document_export_selections(
+    documents: Vec<v2::records::DocumentExportSelection>,
+) -> Result<Vec<v2::records::DocumentExportSelection>, String> {
+    if documents.is_empty() {
+        return Err("请至少选择一张要导出的单据".to_owned());
+    }
+    if documents.len() > 200 {
+        return Err("单次最多批量导出 200 张单据".to_owned());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::with_capacity(documents.len());
+    for mut document in documents {
+        document.document_id = document.document_id.trim().to_owned();
+        document.document_no = document.document_no.trim().to_owned();
+        if document.document_id.is_empty() || document.document_no.is_empty() {
+            return Err("批量导出包含无效的单据编号".to_owned());
+        }
+        if !seen.insert(document.document_id.clone()) {
+            return Err(format!("单据 {} 被重复选择", document.document_no));
+        }
+        normalized.push(document);
+    }
+    Ok(normalized)
+}
+
+#[tauri::command]
+async fn v2_export_receipt_documents(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    documents: Vec<v2::records::DocumentExportSelection>,
+    path: String,
+) -> Result<v2::records::BatchDocumentExportResult, String> {
+    let selections = validate_document_export_selections(documents)?;
+    let mut loaded = Vec::with_capacity(selections.len());
+    for selection in selections {
+        loaded.push(
+            database
+                .receipt_document(&selection.document_id)
+                .await
+                .map_err(|error| format!("读取收货单 {} 失败：{error}", selection.document_no))?,
+        );
+    }
+    v2::records::write_receipt_batch_workbook(path, &loaded)
+}
+
+#[tauri::command]
+async fn v2_export_outbound_order_documents(
+    database: tauri::State<'_, v2::OfflineDatabase>,
+    documents: Vec<v2::records::DocumentExportSelection>,
+    path: String,
+    include_after_sales: bool,
+) -> Result<v2::records::BatchDocumentExportResult, String> {
+    let selections = validate_document_export_selections(documents)?;
+    let mut loaded = Vec::with_capacity(selections.len());
+    for selection in selections {
+        loaded.push(
+            database
+                .outbound_order_document(&selection.document_id)
+                .await
+                .map_err(|error| format!("读取出库订单 {} 失败：{error}", selection.document_no))?,
+        );
+    }
+    v2::records::write_outbound_batch_workbook(path, &loaded, include_after_sales)
+}
+
 #[tauri::command]
 async fn v2_network_list_receipt_records(
     client: tauri::State<'_, v2::network_client::NetworkClient>,
@@ -2574,6 +2638,45 @@ async fn v2_network_export_outbound_order_document(
         .await
         .map_err(|error| error.to_string())?;
     v2::records::write_outbound_workbook(path, &document)
+}
+
+#[tauri::command]
+async fn v2_network_export_receipt_documents(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    documents: Vec<v2::records::DocumentExportSelection>,
+    path: String,
+) -> Result<v2::records::BatchDocumentExportResult, String> {
+    let selections = validate_document_export_selections(documents)?;
+    let mut loaded = Vec::with_capacity(selections.len());
+    for selection in selections {
+        loaded.push(
+            client
+                .receipt_document(&selection.document_id)
+                .await
+                .map_err(|error| format!("读取收货单 {} 失败：{error}", selection.document_no))?,
+        );
+    }
+    v2::records::write_receipt_batch_workbook(path, &loaded)
+}
+
+#[tauri::command]
+async fn v2_network_export_outbound_order_documents(
+    client: tauri::State<'_, v2::network_client::NetworkClient>,
+    documents: Vec<v2::records::DocumentExportSelection>,
+    path: String,
+    include_after_sales: bool,
+) -> Result<v2::records::BatchDocumentExportResult, String> {
+    let selections = validate_document_export_selections(documents)?;
+    let mut loaded = Vec::with_capacity(selections.len());
+    for selection in selections {
+        loaded.push(
+            client
+                .outbound_order_document(&selection.document_id)
+                .await
+                .map_err(|error| format!("读取出库订单 {} 失败：{error}", selection.document_no))?,
+        );
+    }
+    v2::records::write_outbound_batch_workbook(path, &loaded, include_after_sales)
 }
 
 #[derive(serde::Deserialize)]
@@ -2768,6 +2871,8 @@ pub fn run() {
             v2_lookup_return_candidate,
             v2_export_receipt_document,
             v2_export_outbound_order_document,
+            v2_export_receipt_documents,
+            v2_export_outbound_order_documents,
             v2_create_offline_backup,
             v2_verify_offline_backup,
             v2_restore_offline_backup,
@@ -2816,6 +2921,8 @@ pub fn run() {
             v2_network_lookup_return_candidate,
             v2_network_export_receipt_document,
             v2_network_export_outbound_order_document,
+            v2_network_export_receipt_documents,
+            v2_network_export_outbound_order_documents,
             play_beep
         ])
         .run(tauri::generate_context!())

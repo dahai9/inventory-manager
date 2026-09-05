@@ -3,10 +3,10 @@ use super::network::{
 };
 use super::sqlite::OfflineDatabase;
 use super::warranty::WarrantyTerms;
-use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet, XlsxError};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -103,6 +103,19 @@ pub struct ReturnCandidate {
     pub order_no: String,
     pub receiver_name: String,
     pub warranty: Option<WarrantyTerms>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DocumentExportSelection {
+    pub document_id: String,
+    pub document_no: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BatchDocumentExportResult {
+    pub document_count: u32,
+    pub item_count: u32,
+    pub after_sales_count: u32,
 }
 
 impl OfflineDatabase {
@@ -623,6 +636,47 @@ pub fn write_receipt_workbook(
     let worksheet = workbook.add_worksheet();
     worksheet.set_name("收货单").map_err(xlsx_error)?;
     let styles = WorkbookStyles::new();
+    write_receipt_worksheet(worksheet, document, &styles)?;
+    workbook.save(path).map_err(xlsx_error)
+}
+
+pub fn write_receipt_batch_workbook(
+    path: impl AsRef<Path>,
+    documents: &[ReceiptDocument],
+) -> Result<BatchDocumentExportResult, String> {
+    validate_batch_document_count(documents.len())?;
+    let mut workbook = Workbook::new();
+    let styles = WorkbookStyles::new();
+    let mut used_sheet_names = HashSet::new();
+    let mut item_count = 0usize;
+
+    for (index, document) in documents.iter().enumerate() {
+        let worksheet = workbook.add_worksheet();
+        let sheet_name = unique_sheet_name(
+            &document.receipt.receipt_no,
+            &format!("收货单-{}", index + 1),
+            &mut used_sheet_names,
+        );
+        worksheet.set_name(&sheet_name).map_err(xlsx_error)?;
+        write_receipt_worksheet(worksheet, document, &styles)?;
+        item_count = item_count
+            .checked_add(document.items.len())
+            .ok_or_else(|| "批量导出商品数量过大".to_owned())?;
+    }
+
+    workbook.save(path).map_err(xlsx_error)?;
+    Ok(BatchDocumentExportResult {
+        document_count: checked_export_count("单据", documents.len())?,
+        item_count: checked_export_count("商品", item_count)?,
+        after_sales_count: 0,
+    })
+}
+
+fn write_receipt_worksheet(
+    worksheet: &mut Worksheet,
+    document: &ReceiptDocument,
+    styles: &WorkbookStyles,
+) -> Result<(), String> {
     worksheet
         .merge_range(0, 0, 0, 5, "收货单", &styles.title)
         .map_err(xlsx_error)?;
@@ -705,14 +759,76 @@ pub fn write_receipt_workbook(
     )?;
     let table_row = next_row + 2;
     write_item_table(worksheet, table_row, &document.items, false, &styles)?;
-    configure_sheet(worksheet, document.items.len() as u32 + table_row + 1)?;
-    workbook.save(path).map_err(xlsx_error)
+    configure_sheet(
+        worksheet,
+        checked_export_count("商品", document.items.len())? + table_row + 1,
+    )
 }
 
 pub fn write_outbound_workbook(
     path: impl AsRef<Path>,
     document: &OutboundOrderDocument,
 ) -> Result<(), String> {
+    let mut workbook = Workbook::new();
+    let styles = WorkbookStyles::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("出库单").map_err(xlsx_error)?;
+    write_outbound_worksheet(worksheet, document, false, &styles)?;
+
+    let returned = returned_outbound_items(document);
+    if !returned.is_empty() {
+        let after_sales = workbook.add_worksheet();
+        after_sales.set_name("售后记录").map_err(xlsx_error)?;
+        write_after_sales_table(after_sales, 0, &returned, &styles)?;
+        configure_after_sales_columns(after_sales)?;
+    }
+    workbook.save(path).map_err(xlsx_error)
+}
+
+pub fn write_outbound_batch_workbook(
+    path: impl AsRef<Path>,
+    documents: &[OutboundOrderDocument],
+    include_after_sales: bool,
+) -> Result<BatchDocumentExportResult, String> {
+    validate_batch_document_count(documents.len())?;
+    let mut workbook = Workbook::new();
+    let styles = WorkbookStyles::new();
+    let mut used_sheet_names = HashSet::new();
+    let mut item_count = 0usize;
+    let mut after_sales_count = 0usize;
+
+    for (index, document) in documents.iter().enumerate() {
+        let worksheet = workbook.add_worksheet();
+        let sheet_name = unique_sheet_name(
+            &document.order.order_no,
+            &format!("出库单-{}", index + 1),
+            &mut used_sheet_names,
+        );
+        worksheet.set_name(&sheet_name).map_err(xlsx_error)?;
+        let (document_item_count, document_after_sales_count) =
+            write_outbound_worksheet(worksheet, document, include_after_sales, &styles)?;
+        item_count = item_count
+            .checked_add(document_item_count)
+            .ok_or_else(|| "批量导出商品数量过大".to_owned())?;
+        after_sales_count = after_sales_count
+            .checked_add(document_after_sales_count)
+            .ok_or_else(|| "批量导出售后数量过大".to_owned())?;
+    }
+
+    workbook.save(path).map_err(xlsx_error)?;
+    Ok(BatchDocumentExportResult {
+        document_count: checked_export_count("单据", documents.len())?,
+        item_count: checked_export_count("商品", item_count)?,
+        after_sales_count: checked_export_count("售后", after_sales_count)?,
+    })
+}
+
+fn write_outbound_worksheet(
+    worksheet: &mut Worksheet,
+    document: &OutboundOrderDocument,
+    include_after_sales: bool,
+    styles: &WorkbookStyles,
+) -> Result<(usize, usize), String> {
     let shipped_items: Vec<_> = document
         .items
         .iter()
@@ -720,17 +836,16 @@ pub fn write_outbound_workbook(
         .cloned()
         .collect();
     if shipped_items.is_empty() && document.order.status != "voided" {
-        return Err("该订单尚无已出库商品，不能导出出库单".to_owned());
+        return Err(format!(
+            "出库订单 {} 尚无已出库商品，不能导出出库单",
+            document.order.order_no
+        ));
     }
     let export_items = if shipped_items.is_empty() {
         document.items.clone()
     } else {
         shipped_items.clone()
     };
-    let mut workbook = Workbook::new();
-    let styles = WorkbookStyles::new();
-    let worksheet = workbook.add_worksheet();
-    worksheet.set_name("出库单").map_err(xlsx_error)?;
     worksheet
         .merge_range(0, 0, 0, 5, "出库单", &styles.title)
         .map_err(xlsx_error)?;
@@ -800,45 +915,122 @@ pub fn write_outbound_workbook(
     )?;
     let table_row = next_row + 2;
     write_item_table(worksheet, table_row, &export_items, true, &styles)?;
-    configure_sheet(worksheet, export_items.len() as u32 + table_row + 1)?;
+    let export_item_count = checked_export_count("商品", export_items.len())?;
+    let mut last_row = export_item_count + table_row + 1;
+    let returned = returned_outbound_items(document);
+    let included_after_sales_count = if include_after_sales && !returned.is_empty() {
+        let section_row = table_row + export_item_count + 3;
+        worksheet
+            .merge_range(section_row, 0, section_row, 5, "售后记录", &styles.label)
+            .map_err(xlsx_error)?;
+        write_after_sales_table(worksheet, section_row + 1, &returned, styles)?;
+        configure_after_sales_columns(worksheet)?;
+        last_row = section_row + checked_export_count("售后", returned.len())? + 2;
+        returned.len()
+    } else {
+        0
+    };
+    configure_sheet(worksheet, last_row)?;
+    Ok((export_items.len(), included_after_sales_count))
+}
 
-    let returned: Vec<_> = shipped_items
+fn returned_outbound_items(document: &OutboundOrderDocument) -> Vec<&DocumentItem> {
+    document
+        .items
         .iter()
-        .filter(|item| item.return_no.is_some())
-        .collect();
-    if !returned.is_empty() {
-        let after_sales = workbook.add_worksheet();
-        after_sales.set_name("售后记录").map_err(xlsx_error)?;
-        let headers = ["SN", "退货单号", "退货时间", "退货原因", "处置状态"];
-        for (column, header) in headers.iter().enumerate() {
-            after_sales
-                .write_with_format(0, column as u16, *header, &styles.header)
+        .filter(|item| item.shipment_id.is_some() && item.return_no.is_some())
+        .collect()
+}
+
+fn write_after_sales_table(
+    worksheet: &mut Worksheet,
+    start_row: u32,
+    returned: &[&DocumentItem],
+    styles: &WorkbookStyles,
+) -> Result<(), String> {
+    let headers = ["SN", "退货单号", "退货时间", "退货原因", "处置状态"];
+    for (column, header) in headers.iter().enumerate() {
+        worksheet
+            .write_with_format(start_row, column as u16, *header, &styles.header)
+            .map_err(xlsx_error)?;
+    }
+    for (index, item) in returned.iter().enumerate() {
+        let row = start_row + checked_export_count("售后", index + 1)?;
+        for (column, value) in [
+            item.barcode.as_str(),
+            item.return_no.as_deref().unwrap_or(""),
+            item.returned_at.as_deref().unwrap_or(""),
+            item.return_reason.as_deref().unwrap_or(""),
+            item.return_disposition.as_deref().unwrap_or(""),
+        ]
+        .iter()
+        .enumerate()
+        {
+            worksheet
+                .write_with_format(row, column as u16, *value, &styles.cell)
                 .map_err(xlsx_error)?;
         }
-        for (index, item) in returned.iter().enumerate() {
-            let row = index as u32 + 1;
-            for (column, value) in [
-                item.barcode.as_str(),
-                item.return_no.as_deref().unwrap_or(""),
-                item.returned_at.as_deref().unwrap_or(""),
-                item.return_reason.as_deref().unwrap_or(""),
-                item.return_disposition.as_deref().unwrap_or(""),
-            ]
-            .iter()
-            .enumerate()
-            {
-                after_sales
-                    .write_with_format(row, column as u16, *value, &styles.cell)
-                    .map_err(xlsx_error)?;
-            }
-        }
-        after_sales.set_column_width(0, 24).map_err(xlsx_error)?;
-        after_sales.set_column_width(1, 20).map_err(xlsx_error)?;
-        after_sales.set_column_width(2, 22).map_err(xlsx_error)?;
-        after_sales.set_column_width(3, 34).map_err(xlsx_error)?;
-        after_sales.set_column_width(4, 18).map_err(xlsx_error)?;
     }
-    workbook.save(path).map_err(xlsx_error)
+    Ok(())
+}
+
+fn configure_after_sales_columns(worksheet: &mut Worksheet) -> Result<(), String> {
+    for (column, width) in [24.0, 20.0, 22.0, 34.0, 18.0].into_iter().enumerate() {
+        worksheet
+            .set_column_width(column as u16, width)
+            .map_err(xlsx_error)?;
+    }
+    Ok(())
+}
+
+fn validate_batch_document_count(count: usize) -> Result<(), String> {
+    if count == 0 {
+        return Err("请至少选择一张要导出的单据".to_owned());
+    }
+    if count > 200 {
+        return Err("单次最多批量导出 200 张单据".to_owned());
+    }
+    Ok(())
+}
+
+fn checked_export_count(label: &str, count: usize) -> Result<u32, String> {
+    u32::try_from(count).map_err(|_| format!("批量导出{label}数量过大"))
+}
+
+fn unique_sheet_name(raw: &str, fallback: &str, used: &mut HashSet<String>) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| match ch {
+            ':' | '\\' | '/' | '?' | '*' | '[' | ']' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let trimmed = sanitized.trim().trim_matches('\'');
+    let base = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    let base = truncate_sheet_name(base, 31);
+
+    for sequence in 1u32.. {
+        let candidate = if sequence == 1 {
+            base.clone()
+        } else {
+            let suffix = format!(" ({sequence})");
+            let prefix = truncate_sheet_name(&base, 31usize.saturating_sub(suffix.chars().count()));
+            format!("{prefix}{suffix}")
+        };
+        if used.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("worksheet sequence is unbounded")
+}
+
+fn truncate_sheet_name(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 struct WorkbookStyles {
@@ -1509,6 +1701,240 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(candidate);
         }
+    }
+
+    fn test_receipt_document(receipt_no: &str, barcode: &str) -> ReceiptDocument {
+        ReceiptDocument {
+            receipt: ReceiptRecord {
+                receipt_id: format!("receipt-{barcode}"),
+                receipt_no: receipt_no.to_owned(),
+                supplier_name: Some(format!("供应商-{barcode}")),
+                owner_name: "货主甲".to_owned(),
+                source_reference: Some(format!("SOURCE-{barcode}")),
+                received_at: "2026-09-04T01:00:00Z".to_owned(),
+                status: "posted".to_owned(),
+                item_count: 1,
+                warranty: None,
+            },
+            items: vec![DocumentItem {
+                sku_code: format!("SKU-{barcode}"),
+                sku_name: format!("商品-{barcode}"),
+                barcode: barcode.to_owned(),
+                inventory_status: "available".to_owned(),
+                allocation_status: None,
+                owner_name: Some("货主甲".to_owned()),
+                shipment_id: None,
+                shipment_line_id: None,
+                shipment_no: None,
+                shipped_at: None,
+                warranty: None,
+                return_no: None,
+                returned_at: None,
+                return_reason: None,
+                return_disposition: None,
+            }],
+            void_info: None,
+            void_eligibility: DocumentVoidEligibility {
+                can_void: true,
+                blockers: Vec::new(),
+            },
+        }
+    }
+
+    fn test_outbound_document(
+        order_no: &str,
+        barcode: &str,
+        returned: bool,
+    ) -> OutboundOrderDocument {
+        OutboundOrderDocument {
+            order: OutboundOrderRecord {
+                order_id: format!("order-{barcode}"),
+                order_no: order_no.to_owned(),
+                receiver_name: format!("客户-{barcode}"),
+                status: "completed".to_owned(),
+                created_at: "2026-09-04T00:50:00Z".to_owned(),
+                latest_shipment_no: Some(format!("CK-{barcode}")),
+                latest_shipped_at: Some("2026-09-04T01:00:00Z".to_owned()),
+                item_count: 1,
+                returned_count: u32::from(returned),
+            },
+            items: vec![DocumentItem {
+                sku_code: format!("SKU-{barcode}"),
+                sku_name: format!("商品-{barcode}"),
+                barcode: barcode.to_owned(),
+                inventory_status: if returned { "quarantined" } else { "delivered" }.to_owned(),
+                allocation_status: Some("shipped".to_owned()),
+                owner_name: Some("货主甲".to_owned()),
+                shipment_id: Some(format!("shipment-{barcode}")),
+                shipment_line_id: Some(format!("line-{barcode}")),
+                shipment_no: Some(format!("CK-{barcode}")),
+                shipped_at: Some("2026-09-04T01:00:00Z".to_owned()),
+                warranty: None,
+                return_no: returned.then(|| format!("TH-{barcode}")),
+                returned_at: returned.then(|| "2026-09-05T01:00:00Z".to_owned()),
+                return_reason: returned.then(|| format!("退货原因-{barcode}")),
+                return_disposition: returned.then(|| "quarantine".to_owned()),
+            }],
+            void_info: None,
+            void_eligibility: DocumentVoidEligibility {
+                can_void: false,
+                blockers: vec!["存在未退回商品".to_owned()],
+            },
+        }
+    }
+
+    fn worksheet_text(range: &calamine::Range<calamine::Data>) -> String {
+        range
+            .rows()
+            .flat_map(|row| row.iter())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn receipt_batch_workbook_keeps_sheet_order_isolation_and_safe_names() {
+        let path = std::env::temp_dir().join(format!("receipt-batch-{}.xlsx", Uuid::now_v7()));
+        let long_name = "这是一个超过三十一字符长度而且包含[非法]字符的收货单编号-ABCDEF";
+        let documents = vec![
+            test_receipt_document("Same/Name", "SN-R1"),
+            test_receipt_document("same/name", "SN-R2"),
+            test_receipt_document(long_name, "SN-R3"),
+        ];
+
+        let result = write_receipt_batch_workbook(&path, &documents).expect("write receipt batch");
+        assert_eq!(result.document_count, 3);
+        assert_eq!(result.item_count, 3);
+        assert_eq!(result.after_sales_count, 0);
+
+        let mut workbook: Xlsx<_> = open_workbook(&path).expect("open receipt batch");
+        let sheet_names = workbook.sheet_names();
+        assert_eq!(sheet_names[0], "Same_Name");
+        assert_eq!(sheet_names[1], "same_name (2)");
+        assert_eq!(sheet_names.len(), 3);
+        for name in &sheet_names {
+            assert!(name.chars().count() <= 31, "sheet name is too long: {name}");
+            assert!(
+                !name
+                    .chars()
+                    .any(|ch| matches!(ch, ':' | '\\' | '/' | '?' | '*' | '[' | ']')),
+                "sheet name contains an illegal character: {name}"
+            );
+        }
+
+        for (index, own_barcode) in ["SN-R1", "SN-R2", "SN-R3"].into_iter().enumerate() {
+            let text = worksheet_text(
+                &workbook
+                    .worksheet_range(&sheet_names[index])
+                    .expect("receipt worksheet"),
+            );
+            assert!(text.contains(own_barcode));
+            for other_barcode in ["SN-R1", "SN-R2", "SN-R3"] {
+                if other_barcode != own_barcode {
+                    assert!(!text.contains(other_barcode));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn outbound_batch_after_sales_is_optional_and_stays_with_its_order() {
+        let without_path = std::env::temp_dir().join(format!(
+            "outbound-batch-without-after-sales-{}.xlsx",
+            Uuid::now_v7()
+        ));
+        let with_path = std::env::temp_dir().join(format!(
+            "outbound-batch-with-after-sales-{}.xlsx",
+            Uuid::now_v7()
+        ));
+        let documents = vec![
+            test_outbound_document("DD-001", "SN-O1", true),
+            test_outbound_document("DD-002", "SN-O2", false),
+        ];
+
+        let without = write_outbound_batch_workbook(&without_path, &documents, false)
+            .expect("write outbound batch without after-sales");
+        assert_eq!(without.document_count, 2);
+        assert_eq!(without.item_count, 2);
+        assert_eq!(without.after_sales_count, 0);
+        let mut workbook: Xlsx<_> = open_workbook(&without_path).expect("open outbound batch");
+        assert_eq!(workbook.sheet_names(), vec!["DD-001", "DD-002"]);
+        let first_text = worksheet_text(
+            &workbook
+                .worksheet_range("DD-001")
+                .expect("first outbound worksheet"),
+        );
+        let second_text = worksheet_text(
+            &workbook
+                .worksheet_range("DD-002")
+                .expect("second outbound worksheet"),
+        );
+        assert!(first_text.contains("SN-O1"));
+        assert!(!first_text.contains("SN-O2"));
+        assert!(!first_text.contains("售后记录"));
+        assert!(!first_text.contains("TH-SN-O1"));
+        assert!(second_text.contains("SN-O2"));
+        assert!(!second_text.contains("SN-O1"));
+
+        let with = write_outbound_batch_workbook(&with_path, &documents, true)
+            .expect("write outbound batch with after-sales");
+        assert_eq!(with.document_count, 2);
+        assert_eq!(with.item_count, 2);
+        assert_eq!(with.after_sales_count, 1);
+        let mut workbook: Xlsx<_> = open_workbook(&with_path).expect("open outbound batch");
+        assert_eq!(workbook.sheet_names(), vec!["DD-001", "DD-002"]);
+        let first_text = worksheet_text(
+            &workbook
+                .worksheet_range("DD-001")
+                .expect("first outbound worksheet"),
+        );
+        let second_text = worksheet_text(
+            &workbook
+                .worksheet_range("DD-002")
+                .expect("second outbound worksheet"),
+        );
+        assert!(first_text.contains("售后记录"));
+        assert!(first_text.contains("TH-SN-O1"));
+        assert!(first_text.contains("退货原因-SN-O1"));
+        assert!(!second_text.contains("TH-SN-O1"));
+        assert!(!second_text.contains("售后记录"));
+
+        let _ = std::fs::remove_file(without_path);
+        let _ = std::fs::remove_file(with_path);
+    }
+
+    #[test]
+    fn batch_export_rejects_empty_oversized_and_unshipped_orders_before_saving() {
+        let empty_path = std::env::temp_dir().join(format!("empty-batch-{}.xlsx", Uuid::now_v7()));
+        let empty_error = write_receipt_batch_workbook(&empty_path, &[])
+            .expect_err("empty batch must be rejected");
+        assert!(empty_error.contains("至少选择一张"));
+        assert!(!empty_path.exists());
+
+        let oversized_path =
+            std::env::temp_dir().join(format!("oversized-batch-{}.xlsx", Uuid::now_v7()));
+        let oversized = vec![test_receipt_document("RK-OVER", "SN-OVER"); 201];
+        let oversized_error = write_receipt_batch_workbook(&oversized_path, &oversized)
+            .expect_err("oversized batch must be rejected");
+        assert!(oversized_error.contains("最多批量导出 200 张"));
+        assert!(!oversized_path.exists());
+
+        let unshipped_path =
+            std::env::temp_dir().join(format!("unshipped-batch-{}.xlsx", Uuid::now_v7()));
+        let mut unshipped = test_outbound_document("DD-NOT-SHIPPED", "SN-WAIT", false);
+        unshipped.order.status = "open".to_owned();
+        unshipped.order.latest_shipment_no = None;
+        unshipped.order.latest_shipped_at = None;
+        unshipped.items[0].shipment_id = None;
+        unshipped.items[0].shipment_line_id = None;
+        unshipped.items[0].shipment_no = None;
+        unshipped.items[0].shipped_at = None;
+        let unshipped_error = write_outbound_batch_workbook(&unshipped_path, &[unshipped], false)
+            .expect_err("unshipped order must be rejected");
+        assert!(unshipped_error.contains("DD-NOT-SHIPPED"));
+        assert!(unshipped_error.contains("尚无已出库商品"));
+        assert!(!unshipped_path.exists());
     }
 
     #[test]

@@ -418,6 +418,23 @@ interface DashboardDto {
   products: InventoryProductStockSummary[];
 }
 
+type OverviewGrouping = "product" | "supplier";
+
+interface OverviewSupplierGroup {
+  key: string;
+  supplier_party_id: string | null;
+  supplier_name: string;
+  on_hand_units: number;
+  inventory: InventoryStatusSummary;
+  products: Array<{
+    sku_id: string;
+    sku_code: string;
+    sku_name: string;
+    on_hand_units: number;
+    inventory: InventoryStatusSummary;
+  }>;
+}
+
 interface CreateOutboundOrderRequest {
   request_id: string;
   idempotency_key: string;
@@ -659,6 +676,12 @@ interface OutboundOrderDocument {
   void_eligibility: DocumentVoidEligibility;
 }
 
+interface BatchDocumentExportResult {
+  document_count: number;
+  item_count: number;
+  after_sales_count: number;
+}
+
 interface RenameOutboundDialogState {
   orderId: string;
   orderNo: string;
@@ -881,6 +904,74 @@ function displayError(error: unknown): string {
 function formatDateTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function emptyInventoryStatusSummary(): InventoryStatusSummary {
+  return {
+    received: 0,
+    available: 0,
+    reserved: 0,
+    shipped: 0,
+    delivered: 0,
+    quarantined: 0,
+    scrapped: 0,
+    returned_to_owner: 0,
+    voided: 0,
+  };
+}
+
+function addInventoryStatusSummary(target: InventoryStatusSummary, source: InventoryStatusSummary) {
+  target.received += source.received;
+  target.available += source.available;
+  target.reserved += source.reserved;
+  target.shipped += source.shipped;
+  target.delivered += source.delivered;
+  target.quarantined += source.quarantined;
+  target.scrapped += source.scrapped;
+  target.returned_to_owner += source.returned_to_owner;
+  target.voided += source.voided;
+}
+
+function buildOverviewSupplierGroups(products: InventoryProductStockSummary[]): OverviewSupplierGroup[] {
+  const groups = new Map<string, OverviewSupplierGroup>();
+  for (const product of products) {
+    for (const supplier of product.suppliers) {
+      const key = supplier.supplier_party_id ?? `name:${supplier.supplier_name}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = {
+          key,
+          supplier_party_id: supplier.supplier_party_id,
+          supplier_name: supplier.supplier_name,
+          on_hand_units: 0,
+          inventory: emptyInventoryStatusSummary(),
+          products: [],
+        };
+        groups.set(key, group);
+      }
+      group.on_hand_units += supplier.on_hand_units;
+      addInventoryStatusSummary(group.inventory, supplier.inventory);
+      const existingProduct = group.products.find((item) => item.sku_id === product.sku_id);
+      if (existingProduct) {
+        existingProduct.on_hand_units += supplier.on_hand_units;
+        addInventoryStatusSummary(existingProduct.inventory, supplier.inventory);
+      } else {
+        group.products.push({
+          sku_id: product.sku_id,
+          sku_code: product.sku_code,
+          sku_name: product.sku_name,
+          on_hand_units: supplier.on_hand_units,
+          inventory: { ...supplier.inventory },
+        });
+      }
+    }
+  }
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      products: group.products.sort((left, right) => right.on_hand_units - left.on_hand_units || left.sku_code.localeCompare(right.sku_code)),
+    }))
+    .sort((left, right) => right.on_hand_units - left.on_hand_units || left.supplier_name.localeCompare(right.supplier_name));
 }
 
 const warrantyPresetLabels: Record<string, string> = {
@@ -1192,7 +1283,9 @@ export default function InventoryWorkspace({
   const [dashboard, setDashboard] = useState<DashboardDto | null>(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [overviewGrouping, setOverviewGrouping] = useState<OverviewGrouping>("product");
   const [selectedOverviewSkuId, setSelectedOverviewSkuId] = useState("");
+  const [selectedOverviewSupplierKey, setSelectedOverviewSupplierKey] = useState("");
   const [overviewShortcutPreferences, setOverviewShortcutPreferences] = useState<Record<WorkspaceMode, WorkspacePage[]>>(() => ({
     offline: getStoredOverviewShortcuts("offline"),
     network: getStoredOverviewShortcuts("network"),
@@ -1320,6 +1413,10 @@ export default function InventoryWorkspace({
   const [receiptRecords, setReceiptRecords] = useState<ReceiptRecord[]>([]);
   const [outboundRecords, setOutboundRecords] = useState<OutboundOrderRecord[]>([]);
   const [recordLoading, setRecordLoading] = useState(false);
+  const [recordExportLoading, setRecordExportLoading] = useState(false);
+  const [selectedReceiptRecordIds, setSelectedReceiptRecordIds] = useState<Set<string>>(() => new Set());
+  const [selectedOutboundRecordIds, setSelectedOutboundRecordIds] = useState<Set<string>>(() => new Set());
+  const [includeBatchAfterSales, setIncludeBatchAfterSales] = useState(false);
   const [recordNotice, setRecordNotice] = useState<Notice | null>(null);
   const [selectedReceiptDocument, setSelectedReceiptDocument] = useState<ReceiptDocument | null>(null);
   const [selectedOutboundDocument, setSelectedOutboundDocument] = useState<OutboundOrderDocument | null>(null);
@@ -1492,11 +1589,17 @@ export default function InventoryWorkspace({
       const response = await invoke<DashboardDto>(command, { query: { owner_party_id: null, sku_id: null } });
       if (context === workspaceContextRef.current) {
         const products = response.products ?? [];
+        const suppliers = buildOverviewSupplierGroups(products);
         setDashboard({ ...response, products });
         setSelectedOverviewSkuId((current) => (
           products.some((product) => product.sku_id === current)
             ? current
             : (products[0]?.sku_id ?? "")
+        ));
+        setSelectedOverviewSupplierKey((current) => (
+          suppliers.some((supplier) => supplier.key === current)
+            ? current
+            : (suppliers[0]?.key ?? "")
         ));
       }
     } catch (error) {
@@ -1628,10 +1731,16 @@ export default function InventoryWorkspace({
       const query = { search: recordSearchRef.current.trim() || null, limit: 200 };
       if (recordTab === "receipt") {
         const command = mode === "network" ? "v2_network_list_receipt_records" : "v2_list_receipt_records";
-        setReceiptRecords(await invoke<ReceiptRecord[]>(command, { query }));
+        const records = await invoke<ReceiptRecord[]>(command, { query });
+        const visibleIds = new Set(records.map((record) => record.receipt_id));
+        setReceiptRecords(records);
+        setSelectedReceiptRecordIds((current) => new Set([...current].filter((id) => visibleIds.has(id))));
       } else {
         const command = mode === "network" ? "v2_network_list_outbound_order_records" : "v2_list_outbound_order_records";
-        setOutboundRecords(await invoke<OutboundOrderRecord[]>(command, { query }));
+        const records = await invoke<OutboundOrderRecord[]>(command, { query });
+        const visibleIds = new Set(records.map((record) => record.order_id));
+        setOutboundRecords(records);
+        setSelectedOutboundRecordIds((current) => new Set([...current].filter((id) => visibleIds.has(id))));
       }
       return true;
     } catch (error) {
@@ -1739,6 +1848,72 @@ export default function InventoryWorkspace({
       setRecordNotice({ type: "error", text: `修改客户名称失败：${displayError(error)}` });
     } finally {
       setRenameOutboundLoading(false);
+    }
+  }
+
+  function canExportOutboundRecord(record: OutboundOrderRecord): boolean {
+    return record.status === "voided" || Boolean(record.latest_shipment_no);
+  }
+
+  function toggleRecordSelection(kind: "receipt" | "outbound", id: string, checked: boolean) {
+    const update = (current: Set<string>) => {
+      const next = new Set(current);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    };
+    if (kind === "receipt") setSelectedReceiptRecordIds(update);
+    else setSelectedOutboundRecordIds(update);
+  }
+
+  function toggleAllVisibleRecords(checked: boolean) {
+    if (recordTab === "receipt") {
+      setSelectedReceiptRecordIds(checked ? new Set(receiptRecords.map((record) => record.receipt_id)) : new Set());
+      return;
+    }
+    setSelectedOutboundRecordIds(checked
+      ? new Set(outboundRecords.filter(canExportOutboundRecord).map((record) => record.order_id))
+      : new Set());
+  }
+
+  async function exportSelectedBusinessDocuments() {
+    const records = recordTab === "receipt"
+      ? receiptRecords
+        .filter((record) => selectedReceiptRecordIds.has(record.receipt_id))
+        .map((record) => ({ document_id: record.receipt_id, document_no: record.receipt_no }))
+      : outboundRecords
+        .filter((record) => selectedOutboundRecordIds.has(record.order_id) && canExportOutboundRecord(record))
+        .map((record) => ({ document_id: record.order_id, document_no: record.order_no }));
+    if (records.length === 0) {
+      setRecordNotice({ type: "warning", text: "请先勾选要导出的单据" });
+      return;
+    }
+    const timestamp = getLocalDateTimeValue().replace(/[-:T]/g, "").slice(0, 12);
+    const path = await save({
+      filters: [{ name: "Excel", extensions: ["xlsx"] }],
+      defaultPath: `批量${recordTab === "receipt" ? "收货单" : "出库单"}_${timestamp}.xlsx`,
+    });
+    if (!path) return;
+
+    setRecordExportLoading(true);
+    setRecordNotice(null);
+    try {
+      const prefix = mode === "network" ? "v2_network" : "v2";
+      const command = `${prefix}_export_${recordTab === "receipt" ? "receipt_documents" : "outbound_order_documents"}`;
+      const response = await invoke<BatchDocumentExportResult>(command, recordTab === "receipt"
+        ? { documents: records, path }
+        : { documents: records, path, includeAfterSales: includeBatchAfterSales });
+      const afterSalesText = recordTab === "outbound" && includeBatchAfterSales
+        ? `，包含 ${response.after_sales_count} 条售后记录`
+        : "";
+      setRecordNotice({
+        type: "success",
+        text: `已导出 ${response.document_count} 张单据、${response.item_count} 件商品${afterSalesText}：${path}`,
+      });
+    } catch (error) {
+      setRecordNotice({ type: "error", text: `批量导出失败：${displayError(error)}` });
+    } finally {
+      setRecordExportLoading(false);
     }
   }
 
@@ -2370,7 +2545,9 @@ export default function InventoryWorkspace({
     setDashboard(null);
     setDashboardLoading(false);
     setDashboardError(null);
+    setOverviewGrouping("product");
     setSelectedOverviewSkuId("");
+    setSelectedOverviewSupplierKey("");
     setOverviewShortcutEditorOpen(false);
     setOverviewShortcutDraft([]);
 
@@ -2430,6 +2607,10 @@ export default function InventoryWorkspace({
     setReceiptRecords([]);
     setOutboundRecords([]);
     setRecordLoading(false);
+    setRecordExportLoading(false);
+    setSelectedReceiptRecordIds(new Set());
+    setSelectedOutboundRecordIds(new Set());
+    setIncludeBatchAfterSales(false);
     setRecordNotice(null);
     setSelectedReceiptDocument(null);
     setSelectedOutboundDocument(null);
@@ -3491,8 +3672,10 @@ export default function InventoryWorkspace({
     const inventory = dashboard?.inventory;
     const quality = dashboard?.quality;
     const products = dashboard?.products ?? [];
+    const supplierGroups = buildOverviewSupplierGroups(products);
     const onHandUnits = products.reduce((total, product) => total + product.on_hand_units, 0);
     const selectedProduct = products.find((product) => product.sku_id === selectedOverviewSkuId) ?? products[0] ?? null;
+    const overviewSelectedSupplier = supplierGroups.find((supplier) => supplier.key === selectedOverviewSupplierKey) ?? supplierGroups[0] ?? null;
     const availableShortcutIds = availableOverviewShortcutIds(mode);
     const shortcutItems = overviewShortcutPreferences[mode]
       .filter((pageId) => availableShortcutIds.has(pageId))
@@ -3540,35 +3723,70 @@ export default function InventoryWorkspace({
         </div>
         <section className="v2-panel v2-overview-stock" aria-labelledby="v2-overview-stock-title">
           <header className="v2-overview-stock-heading">
-            <div><h3 id="v2-overview-stock-title">在库商品</h3><small>待检、可用、预留和隔离中的实物</small></div>
-            <span>{products.length} 种 · {onHandUnits} 件</span>
-          </header>
-          <div className="v2-overview-stock-layout">
-            <div className="v2-overview-product-table-wrap">
-              <table className="v2-overview-product-table">
-                <thead><tr><th>商品</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead>
-                <tbody>
-                  {!dashboardLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={6}>当前没有在库商品</td></tr>}
-                  {products.map((product) => <tr className={selectedProduct?.sku_id === product.sku_id ? "selected" : ""} key={product.sku_id}>
-                    <td><button className="v2-overview-product-select" type="button" onClick={() => setSelectedOverviewSkuId(product.sku_id)} aria-pressed={selectedProduct?.sku_id === product.sku_id}><strong>{product.sku_code}</strong><span>{product.sku_name}</span></button></td>
-                    <td><strong>{product.on_hand_units}</strong></td>
-                    <td>{product.inventory.available}</td>
-                    <td>{product.inventory.received}</td>
-                    <td>{product.inventory.reserved}</td>
-                    <td>{product.inventory.quarantined}</td>
-                  </tr>)}
-                </tbody>
-              </table>
+            <div><h3 id="v2-overview-stock-title">在库汇总</h3><small>按商品或供应商查看待检、可用、预留和隔离中的实物</small></div>
+            <div className="v2-overview-stock-heading-actions">
+              <div className="v2-overview-grouping" role="group" aria-label="概览分类方式">
+                <button type="button" className={overviewGrouping === "product" ? "active" : ""} aria-pressed={overviewGrouping === "product"} onClick={() => setOverviewGrouping("product")}>按商品</button>
+                <button type="button" className={overviewGrouping === "supplier" ? "active" : ""} aria-pressed={overviewGrouping === "supplier"} onClick={() => setOverviewGrouping("supplier")}>按供应商</button>
+              </div>
+              <span>{overviewGrouping === "product" ? `${products.length} 种商品` : `${supplierGroups.length} 个供应商`} · {onHandUnits} 件</span>
             </div>
-            <aside className="v2-overview-supplier-detail" aria-live="polite">
-              {selectedProduct ? <>
-                <header><div><span>供应商分布</span><h4>{selectedProduct.sku_code} · {selectedProduct.sku_name}</h4></div><strong>{selectedProduct.on_hand_units} 件</strong></header>
-                <div className="v2-overview-supplier-table-wrap"><table><thead><tr><th>供应商</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead><tbody>
-                  {selectedProduct.suppliers.map((supplier) => <tr key={supplier.supplier_party_id ?? supplier.supplier_name}><td>{supplier.supplier_name}</td><td><strong>{supplier.on_hand_units}</strong></td><td>{supplier.inventory.available}</td><td>{supplier.inventory.received}</td><td>{supplier.inventory.reserved}</td><td>{supplier.inventory.quarantined}</td></tr>)}
-                </tbody></table></div>
-              </> : <div className="v2-overview-stock-empty"><Boxes size={28} /><span>没有可显示的供应商库存</span></div>}
-            </aside>
-          </div>
+          </header>
+          {overviewGrouping === "product" ? (
+            <div className="v2-overview-stock-layout">
+              <div className="v2-overview-product-table-wrap">
+                <table className="v2-overview-product-table">
+                  <thead><tr><th>商品</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead>
+                  <tbody>
+                    {!dashboardLoading && products.length === 0 && <tr><td className="v2-table-empty" colSpan={6}>当前没有在库商品</td></tr>}
+                    {products.map((product) => <tr className={selectedProduct?.sku_id === product.sku_id ? "selected" : ""} key={product.sku_id}>
+                      <td><button className="v2-overview-product-select" type="button" onClick={() => setSelectedOverviewSkuId(product.sku_id)} aria-pressed={selectedProduct?.sku_id === product.sku_id}><strong>{product.sku_code}</strong><span>{product.sku_name}</span></button></td>
+                      <td><strong>{product.on_hand_units}</strong></td>
+                      <td>{product.inventory.available}</td>
+                      <td>{product.inventory.received}</td>
+                      <td>{product.inventory.reserved}</td>
+                      <td>{product.inventory.quarantined}</td>
+                    </tr>)}
+                  </tbody>
+                </table>
+              </div>
+              <aside className="v2-overview-supplier-detail" aria-live="polite">
+                {selectedProduct ? <>
+                  <header><div><span>供应商分布</span><h4>{selectedProduct.sku_code} · {selectedProduct.sku_name}</h4></div><strong>{selectedProduct.on_hand_units} 件</strong></header>
+                  <div className="v2-overview-supplier-table-wrap"><table><thead><tr><th>供应商</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead><tbody>
+                    {selectedProduct.suppliers.map((supplier) => <tr key={supplier.supplier_party_id ?? supplier.supplier_name}><td>{supplier.supplier_name}</td><td><strong>{supplier.on_hand_units}</strong></td><td>{supplier.inventory.available}</td><td>{supplier.inventory.received}</td><td>{supplier.inventory.reserved}</td><td>{supplier.inventory.quarantined}</td></tr>)}
+                  </tbody></table></div>
+                </> : <div className="v2-overview-stock-empty"><Boxes size={28} /><span>没有可显示的供应商库存</span></div>}
+              </aside>
+            </div>
+          ) : (
+            <div className="v2-overview-stock-layout">
+              <div className="v2-overview-product-table-wrap">
+                <table className="v2-overview-product-table">
+                  <thead><tr><th>供应商</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead>
+                  <tbody>
+                    {!dashboardLoading && supplierGroups.length === 0 && <tr><td className="v2-table-empty" colSpan={6}>当前没有供应商库存</td></tr>}
+                    {supplierGroups.map((supplier) => <tr className={overviewSelectedSupplier?.key === supplier.key ? "selected" : ""} key={supplier.key}>
+                      <td><button className="v2-overview-product-select" type="button" onClick={() => setSelectedOverviewSupplierKey(supplier.key)} aria-pressed={overviewSelectedSupplier?.key === supplier.key}><strong>{supplier.supplier_name}</strong><span>{supplier.products.length} 种商品</span></button></td>
+                      <td><strong>{supplier.on_hand_units}</strong></td>
+                      <td>{supplier.inventory.available}</td>
+                      <td>{supplier.inventory.received}</td>
+                      <td>{supplier.inventory.reserved}</td>
+                      <td>{supplier.inventory.quarantined}</td>
+                    </tr>)}
+                  </tbody>
+                </table>
+              </div>
+              <aside className="v2-overview-supplier-detail" aria-live="polite">
+                {overviewSelectedSupplier ? <>
+                  <header><div><span>商品分布</span><h4>{overviewSelectedSupplier.supplier_name}</h4></div><strong>{overviewSelectedSupplier.on_hand_units} 件</strong></header>
+                  <div className="v2-overview-supplier-table-wrap"><table><thead><tr><th>商品</th><th>在库</th><th>可用</th><th>待检</th><th>预留</th><th>隔离</th></tr></thead><tbody>
+                    {overviewSelectedSupplier.products.map((product) => <tr key={product.sku_id}><td><strong>{product.sku_code}</strong><small>{product.sku_name}</small></td><td><strong>{product.on_hand_units}</strong></td><td>{product.inventory.available}</td><td>{product.inventory.received}</td><td>{product.inventory.reserved}</td><td>{product.inventory.quarantined}</td></tr>)}
+                  </tbody></table></div>
+                </> : <div className="v2-overview-stock-empty"><Boxes size={28} /><span>没有可显示的商品库存</span></div>}
+              </aside>
+            </div>
+          )}
         </section>
         <div className="v2-summary-grid">
           <article className="v2-panel">
@@ -4140,21 +4358,47 @@ export default function InventoryWorkspace({
 
   function renderRecords() {
     const mutationDisabled = mode === "offline" && !offlineActivated;
+    const recordBusy = recordLoading || recordExportLoading;
+    const selectableRecordIds = recordTab === "receipt"
+      ? receiptRecords.map((record) => record.receipt_id)
+      : outboundRecords.filter(canExportOutboundRecord).map((record) => record.order_id);
+    const selectedRecordIds = recordTab === "receipt" ? selectedReceiptRecordIds : selectedOutboundRecordIds;
+    const selectedRecordCount = selectableRecordIds.filter((id) => selectedRecordIds.has(id)).length;
+    const allVisibleRecordsSelected = selectableRecordIds.length > 0 && selectedRecordCount === selectableRecordIds.length;
     return (
       <section className="v2-page" aria-labelledby="v2-records-title">
-        <div className="v2-page-heading"><div><span className="v2-eyebrow">库存与数据</span><h2 id="v2-records-title">单据查询</h2><p>按订单号、客户、供应商或 SN 查询历史单据。</p></div><button className="v2-button" type="button" onClick={() => void refreshRecords()} disabled={recordLoading}><RefreshCw size={16} className={recordLoading ? "v2-spin" : ""} /> 刷新</button></div>
-        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void submitRecordsSearch(); }}><label className="v2-search"><Search size={17} /><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!recordLoading) void submitRecordsSearch(true); } }} placeholder="订单号、出库单号、客户、供应商或 SN" /></label><button className="v2-button primary" type="submit" disabled={recordLoading}>查询</button></form>
+        <div className="v2-page-heading"><div><span className="v2-eyebrow">库存与数据</span><h2 id="v2-records-title">单据查询</h2><p>按订单号、客户、供应商或 SN 查询历史单据。</p></div><button className="v2-button" type="button" onClick={() => void refreshRecords()} disabled={recordBusy}><RefreshCw size={16} className={recordLoading ? "v2-spin" : ""} /> 刷新</button></div>
+        <form className="v2-panel v2-filters" onSubmit={(event) => { event.preventDefault(); void submitRecordsSearch(); }}><label className="v2-search"><Search size={17} /><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); if (!recordBusy) void submitRecordsSearch(true); } }} placeholder="订单号、出库单号、客户、供应商或 SN" disabled={recordBusy} /></label><button className="v2-button primary" type="submit" disabled={recordBusy}>查询</button></form>
         {recordNotice && <div className={`v2-notice ${recordNotice.type}`}>{recordNotice.text}</div>}
-        <div className="v2-record-tabs" role="tablist"><button type="button" className={recordTab === "outbound" ? "active" : ""} onClick={() => setRecordTab("outbound")}><Truck size={16} /> 出库订单 <span>{outboundRecords.length}</span></button><button type="button" className={recordTab === "receipt" ? "active" : ""} onClick={() => setRecordTab("receipt")}><PackagePlus size={16} /> 收货单 <span>{receiptRecords.length}</span></button></div>
+        <div className="v2-record-tabs" role="tablist"><button type="button" className={recordTab === "outbound" ? "active" : ""} onClick={() => setRecordTab("outbound")} disabled={recordExportLoading}><Truck size={16} /> 出库订单 <span>{outboundRecords.length}</span></button><button type="button" className={recordTab === "receipt" ? "active" : ""} onClick={() => setRecordTab("receipt")} disabled={recordExportLoading}><PackagePlus size={16} /> 收货单 <span>{receiptRecords.length}</span></button></div>
+        <div className="v2-record-batch-toolbar">
+          <div>
+            <strong>已选择 {selectedRecordCount} 张{recordTab === "receipt" ? "收货单" : "出库单"}</strong>
+            <small>仅导出当前查询已加载的记录，最多 200 张。{recordTab === "outbound" ? "未出库且未作废的订单需完成出库后才能勾选。" : ""}</small>
+          </div>
+          <div className="v2-record-batch-actions">
+            {recordTab === "outbound" && <label className="v2-record-after-sales-option"><input type="checkbox" checked={includeBatchAfterSales} onChange={(event) => setIncludeBatchAfterSales(event.target.checked)} disabled={recordBusy} /><span>包含售后记录</span></label>}
+            <button className="v2-button" type="button" onClick={() => toggleAllVisibleRecords(false)} disabled={recordBusy || selectedRecordCount === 0}>清除选择</button>
+            <button className="v2-button primary" type="button" onClick={() => void exportSelectedBusinessDocuments()} disabled={recordBusy || selectedRecordCount === 0}><Download size={16} /> {recordExportLoading ? "正在导出…" : "批量导出"}</button>
+          </div>
+        </div>
         {recordTab === "outbound" ? (
-          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>订单编号</th><th>客户</th><th>最近出库</th><th>数量</th><th>售后</th><th>状态</th><th /></tr></thead><tbody>
-            {outboundRecords.length === 0 && !recordLoading && <tr><td colSpan={7} className="v2-table-empty">暂无匹配出库订单</td></tr>}
-            {outboundRecords.map((record) => <tr key={record.order_id}><td><strong className="v2-mono">{record.order_no}</strong><small>{formatDateTime(record.created_at)}</small></td><td>{record.receiver_name}</td><td><strong>{record.latest_shipment_no ?? "未出库"}</strong><small>{record.latest_shipped_at ? formatDateTime(record.latest_shipped_at) : ""}</small></td><td>{record.item_count} 件</td><td>{record.returned_count > 0 ? <span className="v2-badge inventory-quarantined">退货 {record.returned_count}</span> : "—"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openOutboundDocument(record.order_id)} title="查看订单详情" aria-label="查看订单详情"><Search size={16} /></button></td></tr>)}
+          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th className="v2-record-selection-cell"><input type="checkbox" checked={allVisibleRecordsSelected} onChange={(event) => toggleAllVisibleRecords(event.target.checked)} disabled={recordBusy || selectableRecordIds.length === 0} aria-label="勾选当前已加载的全部可导出出库订单" title="勾选当前已加载的全部可导出出库订单" /></th><th>订单编号</th><th>客户</th><th>最近出库</th><th>数量</th><th>售后</th><th>状态</th><th /></tr></thead><tbody>
+            {outboundRecords.length === 0 && !recordLoading && <tr><td colSpan={8} className="v2-table-empty">暂无匹配出库订单</td></tr>}
+            {outboundRecords.map((record) => {
+              const exportable = canExportOutboundRecord(record);
+              const selected = selectedOutboundRecordIds.has(record.order_id) && exportable;
+              const unavailableReason = "该订单尚无已出库商品，不能批量导出出库单";
+              return <tr className={selected ? "v2-record-selected" : ""} key={record.order_id}><td className="v2-record-selection-cell" title={exportable ? "勾选此出库订单" : unavailableReason}><input type="checkbox" checked={selected} onChange={(event) => toggleRecordSelection("outbound", record.order_id, event.target.checked)} disabled={recordBusy || !exportable} aria-label={exportable ? `勾选出库订单 ${record.order_no}` : `${record.order_no}：${unavailableReason}`} /></td><td><strong className="v2-mono">{record.order_no}</strong><small>{formatDateTime(record.created_at)}</small></td><td>{record.receiver_name}</td><td><strong>{record.latest_shipment_no ?? "未出库"}</strong><small>{record.latest_shipped_at ? formatDateTime(record.latest_shipped_at) : (!exportable ? "尚无出库商品，不能勾选" : "")}</small></td><td>{record.item_count} 件</td><td>{record.returned_count > 0 ? <span className="v2-badge inventory-quarantined">退货 {record.returned_count}</span> : "—"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openOutboundDocument(record.order_id)} disabled={recordBusy} title="查看订单详情" aria-label="查看订单详情"><Search size={16} /></button></td></tr>;
+            })}
           </tbody></table></div></div>
         ) : (
-          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th>收货单号</th><th>供应商</th><th>货主</th><th>入库时间</th><th>数量</th><th>质保</th><th>状态</th><th /></tr></thead><tbody>
-            {receiptRecords.length === 0 && !recordLoading && <tr><td colSpan={8} className="v2-table-empty">暂无匹配收货单</td></tr>}
-            {receiptRecords.map((record) => <tr key={record.receipt_id}><td><strong className="v2-mono">{record.receipt_no}</strong><small>{record.source_reference ?? "无来源单号"}</small></td><td>{record.supplier_name ?? "未记录"}</td><td>{record.owner_name}</td><td>{formatDateTime(record.received_at)}</td><td>{record.item_count} 件</td><td>{record.warranty ? record.warranty.label_snapshot : "无质保"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openReceiptDocument(record.receipt_id)} title="查看收货单详情" aria-label="查看收货单详情"><Search size={16} /></button></td></tr>)}
+          <div className="v2-panel v2-table-panel"><div className="v2-table-wrap"><table><thead><tr><th className="v2-record-selection-cell"><input type="checkbox" checked={allVisibleRecordsSelected} onChange={(event) => toggleAllVisibleRecords(event.target.checked)} disabled={recordBusy || selectableRecordIds.length === 0} aria-label="勾选当前已加载的全部收货单" title="勾选当前已加载的全部收货单" /></th><th>收货单号</th><th>供应商</th><th>货主</th><th>入库时间</th><th>数量</th><th>质保</th><th>状态</th><th /></tr></thead><tbody>
+            {receiptRecords.length === 0 && !recordLoading && <tr><td colSpan={9} className="v2-table-empty">暂无匹配收货单</td></tr>}
+            {receiptRecords.map((record) => {
+              const selected = selectedReceiptRecordIds.has(record.receipt_id);
+              return <tr className={selected ? "v2-record-selected" : ""} key={record.receipt_id}><td className="v2-record-selection-cell"><input type="checkbox" checked={selected} onChange={(event) => toggleRecordSelection("receipt", record.receipt_id, event.target.checked)} disabled={recordBusy} aria-label={`勾选收货单 ${record.receipt_no}`} /></td><td><strong className="v2-mono">{record.receipt_no}</strong><small>{record.source_reference ?? "无来源单号"}</small></td><td>{record.supplier_name ?? "未记录"}</td><td>{record.owner_name}</td><td>{formatDateTime(record.received_at)}</td><td>{record.item_count} 件</td><td>{record.warranty ? record.warranty.label_snapshot : "无质保"}</td><td><span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span></td><td><button className="v2-icon-button" type="button" onClick={() => void openReceiptDocument(record.receipt_id)} disabled={recordBusy} title="查看收货单详情" aria-label="查看收货单详情"><Search size={16} /></button></td></tr>;
+            })}
           </tbody></table></div></div>
         )}
         {selectedOutboundDocument && <section className="v2-panel v2-record-detail">

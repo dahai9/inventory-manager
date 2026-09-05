@@ -129,7 +129,11 @@ body:has(.v2-workspace) { min-width: 320px; }
 .v2-overview-stock-heading { min-height: 62px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 14px; background: #f8fafc; border-bottom: 1px solid #e4e7ec; }
 .v2-overview-stock-heading h3 { margin: 0 0 2px; }
 .v2-overview-stock-heading small { display: block; color: #667085; font-size: 11px; }
-.v2-overview-stock-heading > span { flex: 0 0 auto; color: #344054; font-size: 12px; font-weight: 700; }
+.v2-overview-stock-heading-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; }
+.v2-overview-stock-heading-actions > span { color: #344054; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.v2-overview-grouping { display: inline-flex; padding: 2px; background: #eaecf0; border-radius: 6px; }
+.v2-overview-grouping button { min-height: 30px; padding: 0 10px; color: #667085; background: transparent; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 700; }
+.v2-overview-grouping button.active { color: #174bd2; background: #fff; box-shadow: 0 1px 2px rgba(16, 24, 40, .12); }
 .v2-overview-stock-layout { min-height: 330px; display: grid; grid-template-columns: minmax(440px, 1.12fr) minmax(380px, .88fr); }
 .v2-overview-product-table-wrap, .v2-overview-supplier-table-wrap { min-width: 0; overflow: auto; }
 .v2-overview-product-table-wrap { border-right: 1px solid #e4e7ec; }
@@ -152,6 +156,8 @@ body:has(.v2-workspace) { min-width: 320px; }
 .v2-overview-supplier-detail > header span { display: block; color: #175cd3; font-size: 10px; font-weight: 800; }
 .v2-overview-supplier-detail > header h4 { margin: 3px 0 0; color: #182230; overflow-wrap: anywhere; font-size: 13px; }
 .v2-overview-supplier-detail > header > strong { flex: 0 0 auto; color: #101828; font-size: 18px; }
+.v2-overview-supplier-table-wrap td:first-child strong, .v2-overview-supplier-table-wrap td:first-child small { display: block; }
+.v2-overview-supplier-table-wrap td:first-child small { margin-top: 2px; color: #98a2b3; }
 .v2-overview-stock-empty { min-height: 260px; display: grid; place-items: center; align-content: center; gap: 8px; color: #98a2b3; font-size: 12px; }
 
 .v2-shortcut-modal { width: min(700px, 100%); }
@@ -675,7 +681,8 @@ body:has(.v2-workspace) { min-width: 320px; }
   .v2-overview-shortcut-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .v2-overview-shortcut-list > button { min-height: 54px; border-bottom: 1px solid #eaecf0; }
   .v2-overview-shortcut-list > button:nth-child(2n) { border-right: 0; }
-  .v2-overview-stock-heading { align-items: flex-start; }
+  .v2-overview-stock-heading { align-items: stretch; flex-direction: column; }
+  .v2-overview-stock-heading-actions { justify-content: space-between; }
   .v2-overview-stock-layout { min-height: 0; grid-template-columns: 1fr; }
   .v2-overview-product-table-wrap { border-right: 0; border-bottom: 1px solid #e4e7ec; }
   .v2-overview-supplier-detail { min-height: 240px; }
@@ -797,7 +804,19 @@ body:has(.v2-workspace) { min-width: 320px; }
 .v2-record-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--v2-border, #d8e1dc); margin-top: 18px; }
 .v2-record-tabs button { border: 0; background: transparent; padding: 11px 15px; display: inline-flex; align-items: center; gap: 7px; color: var(--v2-muted, #68766f); cursor: pointer; border-bottom: 2px solid transparent; }
 .v2-record-tabs button.active { color: #1f5e4c; border-bottom-color: #26715c; font-weight: 700; }
+.v2-record-tabs button:disabled { color: #98a2b3; cursor: not-allowed; }
 .v2-record-tabs span { background: #e9f0ec; border-radius: 999px; padding: 1px 7px; font-size: .75rem; }
+.v2-record-batch-toolbar { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 12px; background: #f8fafc; border: 1px solid var(--v2-border, #d8e1dc); border-top: 0; }
+.v2-record-batch-toolbar > div:first-child { min-width: 0; display: grid; gap: 3px; }
+.v2-record-batch-toolbar strong { color: #344054; font-size: 13px; }
+.v2-record-batch-toolbar small { color: #667085; font-size: 11px; }
+.v2-record-batch-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.v2-record-after-sales-option { min-height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 9px; color: #344054; background: #fff; border: 1px solid #d8dee8; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.v2-record-after-sales-option input, .v2-record-selection-cell input { width: 16px; height: 16px; margin: 0; accent-color: var(--v2-blue, #1f5eff); cursor: pointer; }
+.v2-record-after-sales-option:has(input:disabled) { color: #98a2b3; background: #eef2f6; cursor: not-allowed; }
+.v2-table-wrap th.v2-record-selection-cell, .v2-table-wrap td.v2-record-selection-cell { width: 42px; padding-right: 6px; text-align: center; }
+.v2-record-selection-cell input:disabled { cursor: not-allowed; opacity: .45; }
+.v2-table-wrap tbody tr.v2-record-selected, .v2-table-wrap tbody tr.v2-record-selected:hover { background: #f2f6ff; box-shadow: inset 3px 0 var(--v2-blue, #1f5eff); }
 .v2-record-detail { margin-top: 16px; display: grid; gap: 16px; }
 .v2-record-detail header, .v2-return-confirm header { display: flex; justify-content: space-between; align-items: flex-start; gap: 15px; }
 .v2-record-detail header h3, .v2-return-confirm header h3 { margin: 4px 0 0; }
@@ -827,6 +846,10 @@ body:has(.v2-workspace) { min-width: 320px; }
   .v2-warranty-heading, .v2-record-detail header, .v2-return-confirm header, .v2-return-batch-heading { align-items: flex-start; flex-direction: column; }
   .v2-detail-actions { width: 100%; justify-content: space-between; }
   .v2-warranty-controls > * { width: 100%; }
+  .v2-record-batch-toolbar { align-items: stretch; flex-direction: column; }
+  .v2-record-batch-actions { width: 100%; flex-wrap: wrap; }
+  .v2-record-after-sales-option { flex: 1 1 100%; justify-content: center; }
+  .v2-record-batch-actions .v2-button { flex: 1; justify-content: center; }
   .v2-return-batch-item { grid-template-columns: 26px minmax(0, 1fr) 32px; }
   .v2-return-batch-item > small { grid-column: 2; }
   .v2-return-batch-items.compact .v2-return-batch-item { grid-template-columns: 26px minmax(0, 1fr); }
