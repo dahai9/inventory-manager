@@ -1335,6 +1335,7 @@ export default function InventoryWorkspace({
   const [scannerInput, setScannerInput] = useState("");
   const [receiptBulkInput, setReceiptBulkInput] = useState("");
   const [scannedBarcodes, setScannedBarcodes] = useState<string[]>([]);
+  const receiptProductInputRef = useRef<HTMLInputElement>(null);
   const scannerInputRef = useRef<HTMLInputElement>(null);
   const barcodeCompositionRef = useRef(false);
   const scanCheckingRef = useRef(false);
@@ -1491,8 +1492,27 @@ export default function InventoryWorkspace({
     const query = receiptProductInput.trim().toLocaleLowerCase();
     const products = catalog?.products ?? [];
     if (!query) return products.slice(0, 8);
+    const tokens = query.split(/\s+/).filter(Boolean);
     return products
-      .filter((product) => `${product.code} ${product.name}`.toLocaleLowerCase().includes(query))
+      .filter((product) => {
+        const searchable = `${product.code} ${product.name}`.toLocaleLowerCase();
+        return tokens.every((token) => searchable.includes(token));
+      })
+      .sort((left, right) => {
+        const leftCode = left.code.toLocaleLowerCase();
+        const rightCode = right.code.toLocaleLowerCase();
+        const leftName = left.name.toLocaleLowerCase();
+        const rightName = right.name.toLocaleLowerCase();
+        const score = (code: string, name: string) => code === query ? 0
+          : code.startsWith(query) ? 1
+            : code.includes(query) ? 2
+              : name === query ? 3
+                : name.startsWith(query) ? 4
+                  : name.includes(query) ? 5
+                    : 6;
+        return score(leftCode, leftName) - score(rightCode, rightName)
+          || leftCode.localeCompare(rightCode, "zh-CN");
+      })
       .slice(0, 8);
   }, [catalog, receiptProductInput]);
   const receiptSupplierSuggestions = useMemo(() => {
@@ -2306,6 +2326,12 @@ export default function InventoryWorkspace({
     let focusFrame: number | null = null;
     if (page === "receipt" && receiptStep === 1 && !catalogLoading && !receiptLoading && !scanChecking) {
       focusFrame = window.requestAnimationFrame(() => scannerInputRef.current?.focus());
+    } else if (page === "receipt" && receiptStep === 2 && !catalogLoading && !receiptLoading && !scanChecking) {
+      focusFrame = window.requestAnimationFrame(() => {
+        const input = receiptProductInputRef.current;
+        input?.focus();
+        if (input && selectedProduct && input.value.trim().toLocaleLowerCase() === selectedProduct.code.toLocaleLowerCase()) input.select();
+      });
     } else if (page === "quality" && qualityStep === 1 && !qualityLoading && !qualityScanChecking) {
       focusFrame = window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
     } else if (page === "outbound" && outboundStep === 1 && !outboundLoading && !outboundScanChecking && !outboundShipment) {
@@ -2477,16 +2503,39 @@ export default function InventoryWorkspace({
   }
 
   function updateReceiptProductInput(value: string) {
-    setReceiptProductInput(value);
     const normalized = value.trim().toLocaleLowerCase();
     const matched = (catalog?.products ?? []).find((product) => (
       product.code.toLocaleLowerCase() === normalized
       || product.name.toLocaleLowerCase() === normalized
     ));
-    setSelectedProductId(matched?.sku_id ?? "");
-    setReceiptProductSuggestionsOpen(true);
+    if (matched && matched.code.toLocaleLowerCase() === normalized) {
+      setReceiptProductInput(matched.code);
+      setSelectedProductId(matched.sku_id);
+      setReceiptProductSuggestionsOpen(false);
+    } else {
+      setReceiptProductInput(value);
+      setSelectedProductId(matched?.sku_id ?? "");
+      setReceiptProductSuggestionsOpen(true);
+    }
     setScannerInput("");
     setReceiptNotice(null);
+  }
+
+  function handleReceiptProductKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Escape") {
+      setReceiptProductSuggestionsOpen(false);
+      return;
+    }
+    if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+    const normalized = receiptProductInput.trim().toLocaleLowerCase();
+    const exact = (catalog?.products ?? []).find((product) => (
+      product.code.toLocaleLowerCase() === normalized
+      || product.name.toLocaleLowerCase() === normalized
+    ));
+    const candidate = exact ?? receiptProductSuggestions[0];
+    if (!candidate) return;
+    event.preventDefault();
+    chooseReceiptProduct(candidate);
   }
 
   function chooseReceiptSupplier(party: CatalogParty) {
@@ -4149,18 +4198,12 @@ export default function InventoryWorkspace({
             {!catalogLoading && catalog && missingCatalogEntries.length > 0 && <div className="v2-notice warning v2-receipt-prerequisite" role="alert"><span>缺少基础资料：{missingCatalogEntries.join("、")}。新增后返回本步骤继续。</span><button className="v2-button" type="button" onClick={() => openCatalogCreateFromReceipt(firstMissingCatalogTab)}><Plus size={16} /> 新增{missingCatalogEntries[0]}</button></div>}
             <div className="v2-form-grid">
             <label className="v2-receipt-autocomplete"><span>商品 *</span><div className="v2-receipt-autocomplete-control">
-              <input value={receiptProductInput} onChange={(event) => updateReceiptProductInput(event.target.value)} onFocus={() => setReceiptProductSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptProductSuggestionsOpen(false), 120)} onKeyDown={(event) => {
-                if (event.key === "Escape") setReceiptProductSuggestionsOpen(false);
-                if (event.key === "Enter" && receiptProductSuggestionsOpen && receiptProductSuggestions.length > 0) {
-                  event.preventDefault();
-                  chooseReceiptProduct(receiptProductSuggestions[0]);
-                }
-              }} placeholder={catalogLoading ? "正在读取商品…" : "输入编码或名称查找"} required disabled={catalogLoading || scanChecking || products.length === 0} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={receiptProductSuggestionsOpen} aria-controls="v2-receipt-product-suggestions" />
+              <input ref={receiptProductInputRef} value={receiptProductInput} onChange={(event) => updateReceiptProductInput(event.target.value)} onFocus={(event) => { if (selectedProduct && event.currentTarget.value.trim().toLocaleLowerCase() === selectedProduct.code.toLocaleLowerCase()) event.currentTarget.select(); setReceiptProductSuggestionsOpen(true); }} onBlur={() => window.setTimeout(() => setReceiptProductSuggestionsOpen(false), 120)} onKeyDown={handleReceiptProductKeyDown} placeholder={catalogLoading ? "正在读取商品…" : "扫描商品条码，或输入编码/名称模糊搜索"} required disabled={catalogLoading || scanChecking || products.length === 0} autoComplete="off" autoCapitalize="characters" spellCheck={false} role="combobox" aria-autocomplete="list" aria-expanded={receiptProductSuggestionsOpen} aria-controls="v2-receipt-product-suggestions" />
               {receiptProductSuggestionsOpen && <div id="v2-receipt-product-suggestions" className="v2-receipt-autocomplete-suggestions" role="listbox">
                 {receiptProductSuggestions.map((product) => <button key={product.sku_id} type="button" role="option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReceiptProduct(product)}><strong>{product.code}</strong><small>{product.name}</small></button>)}
                 {!catalogLoading && receiptProductSuggestions.length === 0 && <div className="v2-receipt-autocomplete-empty">没有匹配的商品</div>}
               </div>}
-            </div>{selectedProduct && <small>已绑定目录商品：{selectedProduct.code} · {selectedProduct.name}</small>}</label>
+            </div>{selectedProduct ? <small>已绑定目录商品：{selectedProduct.code} · {selectedProduct.name}</small> : <small>支持扫描商品条码自动选择；输入编码或名称可模糊搜索。</small>}</label>
             <label className="v2-receipt-autocomplete"><span>供应商 *</span><div className="v2-receipt-autocomplete-control">
               <input value={supplierName} onChange={(event) => updateReceiptSupplierInput(event.target.value)} onFocus={() => setReceiptSupplierSuggestionsOpen(true)} onBlur={() => window.setTimeout(() => setReceiptSupplierSuggestionsOpen(false), 120)} onKeyDown={(event) => {
                 if (event.key === "Escape") setReceiptSupplierSuggestionsOpen(false);
