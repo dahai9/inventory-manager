@@ -1406,6 +1406,11 @@ export default function InventoryWorkspace({
   const outboundScannerInputRef = useRef<HTMLInputElement>(null);
   const outboundScanCheckingRef = useRef(false);
   const [outboundScanChecking, setOutboundScanChecking] = useState(false);
+  const [recentReceiptPickerOpen, setRecentReceiptPickerOpen] = useState(false);
+  const [recentReceiptPickerLoading, setRecentReceiptPickerLoading] = useState(false);
+  const [recentReceiptPickerNotice, setRecentReceiptPickerNotice] = useState<Notice | null>(null);
+  const [recentReceiptRecords, setRecentReceiptRecords] = useState<ReceiptRecord[]>([]);
+  const [selectedRecentReceiptIds, setSelectedRecentReceiptIds] = useState<Set<string>>(() => new Set());
   const [outboundShipmentNo, setOutboundShipmentNo] = useState("");
   const [outboundConfirmationCode, setOutboundConfirmationCode] = useState("");
   const [outboundNotice, setOutboundNotice] = useState<Notice | null>(null);
@@ -2413,6 +2418,11 @@ export default function InventoryWorkspace({
     setOutboundScanNotice(null);
     setOutboundNotice(null);
     setOutboundStep(1);
+    setRecentReceiptPickerOpen(false);
+    setRecentReceiptPickerLoading(false);
+    setRecentReceiptPickerNotice(null);
+    setRecentReceiptRecords([]);
+    setSelectedRecentReceiptIds(new Set());
   }
 
   function canOpenOutboundStep(step: OutboundStep): boolean {
@@ -3261,35 +3271,95 @@ export default function InventoryWorkspace({
     setOutboundStep(2);
   }
 
-  async function fillOutboundFromRecentReceipt() {
-    if (outboundLoading || outboundScanChecking || outboundShipment) return;
-    setOutboundScanChecking(true);
-    setOutboundScanNotice(null);
+  async function openRecentReceiptPicker() {
+    if (outboundLoading || outboundScanChecking || outboundShipment || recentReceiptPickerLoading) return;
+    setRecentReceiptPickerOpen(true);
+    setRecentReceiptPickerLoading(true);
+    setRecentReceiptPickerNotice(null);
+    setRecentReceiptRecords([]);
+    setSelectedRecentReceiptIds(new Set());
     try {
       const listCommand = mode === "network" ? "v2_network_list_receipt_records" : "v2_list_receipt_records";
       const records = await invoke<ReceiptRecord[]>(listCommand, { query: { search: null, limit: 10 } });
-      const record = records[0];
-      if (!record) throw new Error("暂无可用入库单");
+      setRecentReceiptRecords(records.slice(0, 10));
+      if (records.length === 0) {
+        setRecentReceiptPickerNotice({ type: "warning", text: "暂无可选择的入库单。" });
+      }
+    } catch (error) {
+      setRecentReceiptPickerNotice({ type: "error", text: `读取最近入库单失败：${displayError(error)}` });
+    } finally {
+      setRecentReceiptPickerLoading(false);
+    }
+  }
+
+  function closeRecentReceiptPicker() {
+    if (recentReceiptPickerLoading) return;
+    setRecentReceiptPickerOpen(false);
+    setRecentReceiptPickerNotice(null);
+    setSelectedRecentReceiptIds(new Set());
+  }
+
+  function toggleRecentReceiptSelection(receiptId: string, checked: boolean) {
+    setSelectedRecentReceiptIds((current) => {
+      const next = new Set(current);
+      if (checked) next.add(receiptId);
+      else next.delete(receiptId);
+      return next;
+    });
+  }
+
+  async function fillOutboundFromSelectedReceipts() {
+    if (outboundLoading || outboundScanChecking || outboundShipment || recentReceiptPickerLoading) return;
+    const selectedRecords = recentReceiptRecords.filter((record) => selectedRecentReceiptIds.has(record.receipt_id));
+    if (selectedRecords.length === 0) {
+      setRecentReceiptPickerNotice({ type: "error", text: "请至少勾选一张入库单。" });
+      return;
+    }
+    setRecentReceiptPickerLoading(true);
+    setRecentReceiptPickerNotice(null);
+    setOutboundScanChecking(true);
+    setOutboundScanNotice(null);
+    try {
       const detailCommand = mode === "network" ? "v2_network_receipt_document" : "v2_receipt_document";
-      const document = await invoke<ReceiptDocument>(detailCommand, { receiptId: record.receipt_id });
       const known = new Set(outboundScannedItems.map((item) => item.barcode));
       const accepted: OutboundScannedItem[] = [];
       let skipped = 0;
-      for (const item of document.items) {
-        if (known.has(item.barcode)) { skipped += 1; continue; }
+      const failedDocuments: string[] = [];
+      for (const record of selectedRecords) {
+        let document: ReceiptDocument;
         try {
-          const loaded = await loadOutboundScanItem(item.barcode);
-          known.add(loaded.barcode);
-          accepted.push(loaded);
-        } catch { skipped += 1; }
+          document = await invoke<ReceiptDocument>(detailCommand, { receiptId: record.receipt_id });
+        } catch {
+          failedDocuments.push(record.receipt_no);
+          continue;
+        }
+        for (const item of document.items) {
+          if (known.has(item.barcode)) { skipped += 1; continue; }
+          try {
+            const loaded = await loadOutboundScanItem(item.barcode);
+            known.add(loaded.barcode);
+            accepted.push(loaded);
+          } catch { skipped += 1; }
+        }
       }
-      if (accepted.length === 0) throw new Error(`最近入库单 ${record.receipt_no} 没有当前可出库库存`);
+      if (accepted.length === 0) {
+        const suffix = failedDocuments.length > 0 ? `（读取失败：${failedDocuments.join("、")}）` : "";
+        throw new Error(`所选入库单没有当前可出库库存${suffix}`);
+      }
       setOutboundScannedItems((items) => [...items, ...accepted]);
-      setOutboundScanNotice({ type: "success", text: `已从最近入库单 ${record.receipt_no} 填充 ${accepted.length} 件${skipped ? `，跳过 ${skipped} 件不可出库库存` : ""}。` });
+      const documentLabel = selectedRecords.length === 1
+        ? selectedRecords[0].receipt_no
+        : `${selectedRecords.length} 张入库单`;
+      const failureNote = failedDocuments.length > 0 ? `，读取失败 ${failedDocuments.length} 张` : "";
+      setOutboundScanNotice({ type: "success", text: `已从${documentLabel}填充 ${accepted.length} 件${skipped ? `，跳过 ${skipped} 件不可出库库存` : ""}${failureNote}。` });
+      setRecentReceiptPickerOpen(false);
+      setSelectedRecentReceiptIds(new Set());
     } catch (error) {
+      setRecentReceiptPickerNotice({ type: "error", text: `一键填充失败：${displayError(error)}` });
       setOutboundScanNotice({ type: "error", text: `一键填充失败：${displayError(error)}` });
       await playScannerAlert();
     } finally {
+      setRecentReceiptPickerLoading(false);
       setOutboundScanChecking(false);
       outboundScannerInputRef.current?.focus();
     }
@@ -4500,31 +4570,39 @@ export default function InventoryWorkspace({
             })}
           </tbody></table></div></div>
         )}
-        {selectedOutboundDocument && <section className="v2-panel v2-record-detail">
-          <header><div><span className="v2-eyebrow">出库订单详情</span><h3>{selectedOutboundDocument.order_no} · {selectedOutboundDocument.receiver_name}</h3></div><div className="v2-detail-actions">
+        {selectedOutboundDocument && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedOutboundDocument(null); }} onKeyDown={(event) => { if (event.key === "Escape") setSelectedOutboundDocument(null); }}>
+          <section className="v2-catalog-modal v2-record-detail-modal" role="dialog" aria-modal="true" aria-labelledby="v2-outbound-document-title" tabIndex={-1}>
+          <header><div><span className="v2-eyebrow">出库订单详情</span><h3 id="v2-outbound-document-title">{selectedOutboundDocument.order_no} · {selectedOutboundDocument.receiver_name}</h3></div><div className="v2-detail-actions">
             {selectedOutboundDocument.status !== "voided" && <button className="v2-button" type="button" onClick={() => openRenameOutboundDialog(selectedOutboundDocument)} disabled={recordLoading || mutationDisabled}><Pencil size={16} /> 修改客户名称</button>}
             <button className="v2-button danger" type="button" disabled={!selectedOutboundDocument.void_eligibility.can_void || recordLoading} title={selectedOutboundDocument.void_eligibility.blockers.join("；") || "作废出库订单"} onClick={() => openVoidDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length, selectedOutboundDocument.void_eligibility)}><Ban size={16} /> 作废单据</button>
             <button className="v2-button" type="button" onClick={() => openSnCopyDialog("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no, selectedOutboundDocument.items.length)} disabled={recordLoading}><Copy size={16} /> 复制整单 SN</button>
             <button className="v2-button" type="button" onClick={() => void exportBusinessDocument("outbound", selectedOutboundDocument.order_id, selectedOutboundDocument.order_no)}><Download size={16} /> 导出出库单</button>
             <button className="v2-icon-button" type="button" onClick={() => setSelectedOutboundDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button>
           </div></header>
+          <div className="v2-record-detail-body">
           <div className="v2-record-detail-meta"><span>订单状态 <strong>{documentStatusLabel(selectedOutboundDocument.status)}</strong></span><span>最近出库 <strong>{selectedOutboundDocument.latest_shipment_no ?? "未出库"}</strong></span><span>客户质保 <strong>{selectedOutboundDocument.items.find((item) => item.warranty)?.warranty?.label_snapshot ?? "无质保"}</strong></span></div>
           {selectedOutboundDocument.void_info && <div className="v2-void-fact"><Ban size={18} /><div><strong>该出库订单已作废</strong><span>{formatDateTime(selectedOutboundDocument.void_info.voided_at)} · {selectedOutboundDocument.void_info.actor_id}</span><p>{selectedOutboundDocument.void_info.reason}</p></div></div>}
           {!selectedOutboundDocument.void_eligibility.can_void && !selectedOutboundDocument.void_info && <div className="v2-void-blockers"><ShieldAlert size={18} /><div><strong>当前不能作废</strong>{selectedOutboundDocument.void_eligibility.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div></div>}
           <div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>库存状态</th><th>出库单</th><th>质保</th><th>售后</th></tr></thead><tbody>{selectedOutboundDocument.items.map((item) => <tr key={`${item.barcode}-${item.shipment_line_id ?? "allocation"}`}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td><td>{item.shipment_no ?? "未出库"}</td><td>{item.warranty ? item.warranty.label_snapshot : "无质保"}</td><td>{item.return_no ? `${item.return_no} · ${formatDateTime(item.returned_at ?? "")}` : "—"}</td></tr>)}</tbody></table></div>
-        </section>}
-        {selectedReceiptDocument && <section className="v2-panel v2-record-detail">
-          <header><div><span className="v2-eyebrow">收货单详情</span><h3>{selectedReceiptDocument.receipt_no} · {selectedReceiptDocument.supplier_name ?? "未记录供应商"}</h3></div><div className="v2-detail-actions">
+          </div>
+          </section>
+        </div>}
+        {selectedReceiptDocument && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedReceiptDocument(null); }} onKeyDown={(event) => { if (event.key === "Escape") setSelectedReceiptDocument(null); }}>
+          <section className="v2-catalog-modal v2-record-detail-modal" role="dialog" aria-modal="true" aria-labelledby="v2-receipt-document-title" tabIndex={-1}>
+          <header><div><span className="v2-eyebrow">收货单详情</span><h3 id="v2-receipt-document-title">{selectedReceiptDocument.receipt_no} · {selectedReceiptDocument.supplier_name ?? "未记录供应商"}</h3></div><div className="v2-detail-actions">
             <button className="v2-button danger" type="button" disabled={!selectedReceiptDocument.void_eligibility.can_void || recordLoading} title={selectedReceiptDocument.void_eligibility.blockers.join("；") || "作废收货单"} onClick={() => openVoidDialog("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no, selectedReceiptDocument.items.length, selectedReceiptDocument.void_eligibility)}><Ban size={16} /> 作废单据</button>
             <button className="v2-button" type="button" onClick={() => openSnCopyDialog("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no, selectedReceiptDocument.items.length)} disabled={recordLoading}><Copy size={16} /> 复制整单 SN</button>
             <button className="v2-button" type="button" onClick={() => void exportBusinessDocument("receipt", selectedReceiptDocument.receipt_id, selectedReceiptDocument.receipt_no)}><Download size={16} /> 导出收货单</button>
             <button className="v2-icon-button" type="button" onClick={() => setSelectedReceiptDocument(null)} aria-label="关闭详情" title="关闭"><X size={18} /></button>
           </div></header>
+          <div className="v2-record-detail-body">
           <div className="v2-record-detail-meta"><span>单据状态 <strong>{documentStatusLabel(selectedReceiptDocument.status)}</strong></span><span>货主 <strong>{selectedReceiptDocument.owner_name}</strong></span><span>入库时间 <strong>{formatDateTime(selectedReceiptDocument.received_at)}</strong></span><span>质保 <strong>{selectedReceiptDocument.warranty ? selectedReceiptDocument.warranty.label_snapshot : "无质保"}</strong></span></div>
           {selectedReceiptDocument.void_info && <div className="v2-void-fact"><Ban size={18} /><div><strong>该收货单已作废</strong><span>{formatDateTime(selectedReceiptDocument.void_info.voided_at)} · {selectedReceiptDocument.void_info.actor_id}</span><p>{selectedReceiptDocument.void_info.reason}</p></div></div>}
           {!selectedReceiptDocument.void_eligibility.can_void && !selectedReceiptDocument.void_info && <div className="v2-void-blockers"><ShieldAlert size={18} /><div><strong>当前不能作废</strong>{selectedReceiptDocument.void_eligibility.blockers.map((blocker) => <span key={blocker}>{blocker}</span>)}</div></div>}
           <div className="v2-table-wrap"><table><thead><tr><th>SKU</th><th>商品名称</th><th>SN</th><th>库存状态</th><th>货主</th></tr></thead><tbody>{selectedReceiptDocument.items.map((item) => <tr key={item.barcode}><td>{item.sku_code}</td><td>{item.sku_name}</td><td className="v2-mono">{item.barcode}</td><td><span className={`v2-badge inventory-${item.inventory_status}`}>{inventoryStatusLabels[item.inventory_status]}</span></td><td>{item.owner_name}</td></tr>)}</tbody></table></div>
-        </section>}
+          </div>
+          </section>
+        </div>}
         {renameOutboundDialog && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeRenameOutboundDialog(); }} onKeyDown={(event) => { if (event.key === "Escape") closeRenameOutboundDialog(); }}>
           <section className="v2-catalog-modal v2-rename-outbound-modal" role="dialog" aria-modal="true" aria-labelledby="v2-rename-outbound-modal-title">
             <header><div><span>单据更正</span><h3 id="v2-rename-outbound-modal-title">修改 {renameOutboundDialog.orderNo} 的客户名称</h3></div><button className="v2-icon-button" type="button" onClick={closeRenameOutboundDialog} disabled={renameOutboundLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>
@@ -4637,7 +4715,7 @@ export default function InventoryWorkspace({
               <strong>{outboundScannedItems.length}<small> 件已扫描</small></strong>
             </div>
             <div className="v2-scan-context"><span><strong>扫描原则</strong>只按实际 SN 出货</span><span><strong>数量确定</strong>结束扫码时以当前件数为准</span></div>
-            <div className="v2-workflow-actions"><button className="v2-button" type="button" onClick={() => void fillOutboundFromRecentReceipt()} disabled={outboundScanChecking || outboundLoading || Boolean(outboundShipment) || mutationDisabled}>从最近入库单一键填充可出库库存</button></div>
+            <div className="v2-workflow-actions"><button className="v2-button" type="button" onClick={() => void openRecentReceiptPicker()} disabled={outboundScanChecking || outboundLoading || Boolean(outboundShipment) || mutationDisabled}><ClipboardCheck size={16} /> 选择最近入库单填充库存</button></div>
             {!outboundShipment && <label className="v2-scan-field">
                 <span>扫码枪输入 *</span>
                 <div className="v2-scanner-control">
@@ -4708,6 +4786,33 @@ export default function InventoryWorkspace({
           </section>}
         </div>
         {outboundNotice && <div className={`v2-notice ${outboundNotice.type}`}>{outboundNotice.text}</div>}
+        {recentReceiptPickerOpen && <div className="v2-catalog-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeRecentReceiptPicker(); }} onKeyDown={(event) => { if (event.key === "Escape") closeRecentReceiptPicker(); }}>
+          <section className="v2-catalog-modal v2-recent-receipt-modal" role="dialog" aria-modal="true" aria-labelledby="v2-recent-receipt-modal-title" tabIndex={-1}>
+            <header><div><span>快捷填充库存</span><h3 id="v2-recent-receipt-modal-title">选择最近 10 次入库</h3></div><button className="v2-icon-button" type="button" onClick={closeRecentReceiptPicker} disabled={recentReceiptPickerLoading} aria-label="关闭" title="关闭"><X size={18} /></button></header>
+            <div className="v2-recent-receipt-picker-body">
+              <div className="v2-recent-receipt-picker-heading"><span>勾选入库单后，系统会合并其中当前可出库的库存。</span><strong>{selectedRecentReceiptIds.size} / {recentReceiptRecords.length} 已选择</strong></div>
+              {recentReceiptPickerLoading && <div className="v2-empty"><RefreshCw className="v2-spin" size={22} /> 正在读取最近入库单</div>}
+              {recentReceiptPickerNotice && <div className={`v2-notice ${recentReceiptPickerNotice.type}`} role={recentReceiptPickerNotice.type === "error" ? "alert" : "status"}>{recentReceiptPickerNotice.text}</div>}
+              {!recentReceiptPickerLoading && recentReceiptRecords.length > 0 && <>
+                <div className="v2-recent-receipt-picker-actions">
+                  <button className="v2-button" type="button" onClick={() => setSelectedRecentReceiptIds(new Set(recentReceiptRecords.map((record) => record.receipt_id)))} disabled={recentReceiptPickerLoading || selectedRecentReceiptIds.size === recentReceiptRecords.length}>全选 10 次入库</button>
+                  <button className="v2-button" type="button" onClick={() => setSelectedRecentReceiptIds(new Set())} disabled={recentReceiptPickerLoading || selectedRecentReceiptIds.size === 0}>清除选择</button>
+                </div>
+                <div className="v2-recent-receipt-list" role="group" aria-label="最近入库单列表">
+                  {recentReceiptRecords.map((record, index) => <label className={`v2-recent-receipt-option${selectedRecentReceiptIds.has(record.receipt_id) ? " selected" : ""}`} key={record.receipt_id}>
+                    <input type="checkbox" checked={selectedRecentReceiptIds.has(record.receipt_id)} onChange={(event) => toggleRecentReceiptSelection(record.receipt_id, event.target.checked)} disabled={recentReceiptPickerLoading} />
+                    <span className="v2-recent-receipt-rank">{index + 1}</span>
+                    <span className="v2-recent-receipt-info"><strong>{record.receipt_no}</strong><small>{record.supplier_name ?? "未记录供应商"} · 货主：{record.owner_name}</small></span>
+                    <span className="v2-recent-receipt-meta"><strong>{record.item_count} 件</strong><small>{formatDateTime(record.received_at)}</small></span>
+                    <span className={`v2-badge ${record.status === "voided" ? "inventory-voided" : ""}`}>{documentStatusLabel(record.status)}</span>
+                  </label>)}
+                </div>
+              </>}
+              {!recentReceiptPickerLoading && recentReceiptRecords.length === 0 && !recentReceiptPickerNotice && <div className="v2-empty"><PackagePlus size={28} /> 暂无入库单</div>}
+              <div className="v2-form-actions"><button className="v2-button" type="button" onClick={closeRecentReceiptPicker} disabled={recentReceiptPickerLoading}>取消</button><button className="v2-button primary" type="button" onClick={() => void fillOutboundFromSelectedReceipts()} disabled={recentReceiptPickerLoading || selectedRecentReceiptIds.size === 0}><ClipboardCheck size={16} />{recentReceiptPickerLoading ? "正在填充…" : `填充已选库存（${selectedRecentReceiptIds.size} 张）`}</button></div>
+            </div>
+          </section>
+        </div>}
       </section>
     );
   }
