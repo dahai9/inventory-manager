@@ -9,6 +9,7 @@ pub mod network_client;
 pub mod network_ops;
 pub mod outbound;
 pub mod postgres;
+mod quality_confirmation;
 pub mod records;
 pub mod sqlite;
 pub mod traceability;

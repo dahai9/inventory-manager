@@ -142,6 +142,8 @@ pub struct NetworkReturnOutboundShipmentRequest {
     pub return_no: String,
     pub returned_at: String,
     pub reason: String,
+    #[serde(default)]
+    pub release_reason: Option<String>,
 }
 
 impl NetworkService {
@@ -178,7 +180,6 @@ impl NetworkService {
         let device_id = identity.device_id;
         let session_id = identity.session_id;
         let transaction = authorized.sqlx_transaction();
-
         if let Some(mut replay) = claim_idempotency::<CompleteInspectionResponse>(
             transaction,
             tenant_id,
@@ -1475,12 +1476,28 @@ impl NetworkService {
             .database()
             .begin_authorized_request(tenant_id, session_token, PERMISSION_RETURN_WRITE)
             .await?;
-        let identity = authorized.session();
+        let identity = authorized.session().clone();
         let actor_id = identity.identity.user_id;
         let membership_id = identity.identity.membership_id;
         let device_id = identity.device_id;
         let session_id = identity.session_id;
         let transaction = authorized.sqlx_transaction();
+        if request.release_reason.is_some() {
+            match super::auth::authorize_in_transaction(
+                transaction,
+                &identity.identity,
+                PERMISSION_QUALITY_WRITE,
+            )
+            .await?
+            {
+                super::auth::AuthorizationDecision::Allowed => {}
+                super::auth::AuthorizationDecision::Denied { reason } => {
+                    return Err(NetworkServiceError::Auth(
+                        super::auth::AuthError::AccessDenied(reason),
+                    ))
+                }
+            }
+        }
         if let Some(mut replay) = claim_idempotency::<ReturnOutboundShipmentResponse>(
             transaction,
             tenant_id,
@@ -1565,16 +1582,24 @@ impl NetworkService {
                     key: row.allocation_id.to_string(),
                 });
             }
+            let released = request.release_reason.is_some();
+            let storage_location = if released {
+                Some(location_for_kind(transaction, tenant_id, "storage").await?)
+            } else {
+                None
+            };
             let updated = sqlx::query(
                 r#"
                 UPDATE inventory_units
-                   SET inventory_status = 'quarantined', location_id = $1,
+                   SET inventory_status = $1, quality_status = $2, location_id = $3,
                        version = version + 1, updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = $2 AND id = $3 AND version = $4
+                 WHERE tenant_id = $4 AND id = $5 AND version = $6
                    AND inventory_status IN ('shipped', 'delivered')
                 "#,
             )
-            .bind(quarantine_location)
+            .bind(if released { "available" } else { "quarantined" })
+            .bind("passed")
+            .bind(storage_location.unwrap_or(quarantine_location))
             .bind(tenant_id)
             .bind(row.unit_id)
             .bind(row.version)
@@ -1592,7 +1617,7 @@ impl NetworkService {
                 row.unit_id,
                 "returned",
                 None,
-                Some(quarantine_location),
+                Some(storage_location.unwrap_or(quarantine_location)),
                 "outbound_return_batch",
                 batch_id,
                 actor_id,
@@ -1603,8 +1628,17 @@ impl NetworkService {
         let response = ReturnOutboundShipmentResponse {
             return_batch_id: batch_id.to_string(),
             return_no: request.return_no.clone(),
-            quarantined_count: rows.len() as u32,
+            quarantined_count: if request.release_reason.is_some() {
+                0
+            } else {
+                rows.len() as u32
+            },
             idempotent_replay: false,
+            released_count: if request.release_reason.is_some() {
+                rows.len() as u32
+            } else {
+                0
+            },
         };
         insert_audit(
             transaction,
@@ -1616,7 +1650,7 @@ impl NetworkService {
             "outbound_return.created",
             batch_id,
             &request.request_id,
-            json!({"return_no": request.return_no, "quarantined_count": response.quarantined_count}),
+            json!({"return_no": request.return_no, "quarantined_count": response.quarantined_count, "released_count": response.released_count, "release_reason": request.release_reason}),
             &now,
         )
         .await?;
@@ -1911,6 +1945,10 @@ fn normalize_return(
     request.return_no = required("return_no", request.return_no)?.to_uppercase();
     request.returned_at = required("returned_at", request.returned_at)?;
     request.reason = required("reason", request.reason)?;
+    request.release_reason = request
+        .release_reason
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     Ok(request)
 }
 
@@ -2984,6 +3022,8 @@ mod tests {
                     barcodes: vec![barcode.clone()],
                     notes: None,
                     warranty: None,
+                    quality_prechecked: false,
+                    quality_precheck_notes: None,
                 },
             )
             .await
@@ -3107,6 +3147,7 @@ mod tests {
                     return_no: format!("OPS-RET-{suffix}"),
                     returned_at: "2026-08-03T05:00:00Z".to_owned(),
                     reason: "customer return".to_owned(),
+                    release_reason: None,
                 },
             )
             .await

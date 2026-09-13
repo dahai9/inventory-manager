@@ -107,6 +107,8 @@ interface PostReceiptRequest {
   barcodes: string[];
   notes: string | null;
   warranty: WarrantyInput | null;
+  quality_prechecked: boolean;
+  quality_precheck_notes: string | null;
 }
 
 interface NetworkPostReceiptRequest {
@@ -123,6 +125,8 @@ interface NetworkPostReceiptRequest {
   barcodes: string[];
   notes: string | null;
   warranty: WarrantyInput | null;
+  quality_prechecked: boolean;
+  quality_precheck_notes: string | null;
 }
 
 interface ReceiptUnitDto {
@@ -139,6 +143,7 @@ interface PostReceiptResponse {
   received_count: number;
   units: ReceiptUnitDto[];
   idempotent_replay: boolean;
+  quality_prechecked?: boolean;
 }
 
 interface CatalogProduct {
@@ -511,6 +516,7 @@ interface NetworkReturnOutboundShipmentRequest {
   return_no: string;
   returned_at: string;
   reason: string;
+  release_reason?: string | null;
 }
 
 interface CreateOutboundOrderResponse {
@@ -591,6 +597,7 @@ interface ReturnOutboundShipmentResponse {
   return_no: string;
   quarantined_count: number;
   idempotent_replay: boolean;
+  released_count?: number;
 }
 
 interface ReceiptRecord {
@@ -1245,6 +1252,10 @@ function parseBarcodeLines(value: string): string[] {
     .filter(Boolean);
 }
 
+function hasNonEnglishBarcodeInput(value: string): boolean {
+  return /[^\x00-\x7F]/.test(value) || /[Ａ-Ｚａ-ｚ０-９]/.test(value);
+}
+
 function isInspectionEligible(
   item: Pick<InventoryListItem, "inventory_status" | "quality_status">,
   kind: InspectionKind,
@@ -1325,6 +1336,7 @@ export default function InventoryWorkspace({
   const [receiptBulkInput, setReceiptBulkInput] = useState("");
   const [scannedBarcodes, setScannedBarcodes] = useState<string[]>([]);
   const scannerInputRef = useRef<HTMLInputElement>(null);
+  const barcodeCompositionRef = useRef(false);
   const scanCheckingRef = useRef(false);
   const [scanChecking, setScanChecking] = useState(false);
   const [receiptLoading, setReceiptLoading] = useState(false);
@@ -1335,6 +1347,8 @@ export default function InventoryWorkspace({
   const [receiptWarrantyCustomDays, setReceiptWarrantyCustomDays] = useState("");
   const [receiptWarrantyManualStart, setReceiptWarrantyManualStart] = useState(false);
   const [receiptWarrantyStartsAt, setReceiptWarrantyStartsAt] = useState(getLocalDateTimeValue);
+  const [receiptQualityPrechecked, setReceiptQualityPrechecked] = useState(false);
+  const [receiptQualityPrecheckNotes, setReceiptQualityPrecheckNotes] = useState("");
 
   const [qualityItems, setQualityItems] = useState<InventoryListItem[]>([]);
   const [qualityLoading, setQualityLoading] = useState(false);
@@ -1440,9 +1454,13 @@ export default function InventoryWorkspace({
   const [returnCandidates, setReturnCandidates] = useState<ReturnCandidate[]>([]);
   const [returnStep, setReturnStep] = useState<ReturnStep>("scan");
   const [returnReason, setReturnReason] = useState("");
+  const [returnBulkInput, setReturnBulkInput] = useState("");
+  const [returnReleaseReason, setReturnReleaseReason] = useState("");
+  const [returnReleasePassword, setReturnReleasePassword] = useState("");
   const [returnLoading, setReturnLoading] = useState(false);
   const [returnNotice, setReturnNotice] = useState<Notice | null>(null);
   const returnScannerRef = useRef<HTMLInputElement>(null);
+  const returnBarcodeCompositionRef = useRef(false);
   returnBarcodeRef.current = returnBarcode;
 
   const [dataOperationLoading, setDataOperationLoading] = useState(false);
@@ -2076,6 +2094,7 @@ export default function InventoryWorkspace({
 
   async function lookupReturnBarcode(event?: FormEvent<HTMLFormElement>, fromEnter = false) {
     event?.preventDefault();
+    if (returnBarcodeCompositionRef.current) return;
     const barcode = returnBarcode.trim().toUpperCase();
     if (!barcode) return;
     setReturnLoading(true);
@@ -2107,6 +2126,39 @@ export default function InventoryWorkspace({
     }
   }
 
+  async function importReturnBarcodes() {
+    const candidates = parseBarcodeLines(returnBulkInput);
+    if (candidates.length === 0 || returnLoading) return;
+    setReturnLoading(true);
+    setReturnNotice(null);
+    const accepted: ReturnCandidate[] = [];
+    const known = new Set(returnCandidates.map((item) => item.barcode.toUpperCase()));
+    const batchShipmentId = returnCandidates[0]?.shipment_id;
+    const errors: string[] = [];
+    try {
+      for (const barcode of candidates) {
+        if (known.has(barcode)) { errors.push(`${barcode} 已在本批`); continue; }
+        try {
+          const command = mode === "network" ? "v2_network_lookup_return_candidate" : "v2_lookup_return_candidate";
+          const candidate = await invoke<ReturnCandidate>(command, { barcode });
+          const expectedShipmentId = batchShipmentId ?? accepted[0]?.shipment_id;
+          if (expectedShipmentId && expectedShipmentId !== candidate.shipment_id) {
+            errors.push(`${barcode} 不属于当前出库单`);
+            continue;
+          }
+          known.add(barcode);
+          accepted.push(candidate);
+        } catch (error) { errors.push(`${barcode}：${displayError(error)}`); }
+      }
+      if (accepted.length) setReturnCandidates((items) => [...items, ...accepted]);
+      setReturnBulkInput("");
+      setReturnNotice({ type: errors.length ? "warning" : "success", text: `已加入 ${accepted.length} 件退货 SN${errors.length ? `，${errors.length} 项被拒绝` : ""}。${errors.slice(0, 3).join("；")}` });
+    } finally {
+      setReturnLoading(false);
+      returnScannerRef.current?.focus();
+    }
+  }
+
   async function commitScannedReturn() {
     const batch = returnCandidates;
     if (batch.length === 0 || !returnReason.trim()) {
@@ -2125,15 +2177,18 @@ export default function InventoryWorkspace({
         return_no: makeDocumentNumber("TH"),
         returned_at: new Date().toISOString(),
         reason: returnReason.trim(),
+        release_reason: returnReleaseReason.trim() || null,
       };
       const command = mode === "network" ? "v2_network_return_outbound_shipment" : "v2_return_outbound_shipment";
-      const input = mode === "network" ? (common satisfies NetworkReturnOutboundShipmentRequest) : { ...common, actor_id: resolvedActorId };
+      const input = mode === "network" ? (common satisfies NetworkReturnOutboundShipmentRequest) : { ...common, actor_id: resolvedActorId, operation_password: returnReleaseReason.trim() ? returnReleasePassword : null };
       const response = await invoke<ReturnOutboundShipmentResponse>(command, { input });
-      setReturnNotice({ type: "success", text: `${response.return_no} 已批量退回 ${response.quarantined_count} 件，商品已进入隔离区` });
+      setReturnNotice({ type: "success", text: response.released_count ? `${response.return_no} 已批量退回并直接放行 ${response.released_count} 件，商品已恢复可出库` : `${response.return_no} 已批量退回 ${response.quarantined_count} 件，商品已进入隔离区` });
       setReturnCandidates([]);
       setReturnStep("scan");
       setReturnBarcode("");
       setReturnReason("");
+      setReturnReleaseReason("");
+      setReturnReleasePassword("");
       void refreshDashboard();
     } catch (error) {
       setReturnNotice({ type: "error", text: `登记退货失败：${displayError(error)}` });
@@ -2398,6 +2453,8 @@ export default function InventoryWorkspace({
     setReceiptWarrantyCustomDays("");
     setReceiptWarrantyManualStart(false);
     setReceiptWarrantyStartsAt(getLocalDateTimeValue());
+    setReceiptQualityPrechecked(false);
+    setReceiptQualityPrecheckNotes("");
     setReceiptStep(1);
   }
 
@@ -2956,6 +3013,8 @@ export default function InventoryWorkspace({
         barcodes,
         notes: null,
         warranty,
+        quality_prechecked: receiptQualityPrechecked,
+        quality_precheck_notes: receiptQualityPrecheckNotes.trim() || null,
       };
       let response: PostReceiptResponse;
       if (mode === "network") {
@@ -2974,7 +3033,7 @@ export default function InventoryWorkspace({
         type: "success",
         text: `${response.receipt_no} 已原子入库 ${response.received_count} 件${
           response.idempotent_replay ? "（幂等回放）" : ""
-        }。新入库单件默认标记为未测试。`,
+        }。${response.quality_prechecked ? "本批已按入库质检结果直接放行。" : "新入库单件默认标记为未测试。"}`,
       });
       setReceiptCompleted(response);
       setScannerInput("");
@@ -3200,6 +3259,40 @@ export default function InventoryWorkspace({
     }
     setOutboundNotice(null);
     setOutboundStep(2);
+  }
+
+  async function fillOutboundFromRecentReceipt() {
+    if (outboundLoading || outboundScanChecking || outboundShipment) return;
+    setOutboundScanChecking(true);
+    setOutboundScanNotice(null);
+    try {
+      const listCommand = mode === "network" ? "v2_network_list_receipt_records" : "v2_list_receipt_records";
+      const records = await invoke<ReceiptRecord[]>(listCommand, { query: { search: null, limit: 10 } });
+      const record = records[0];
+      if (!record) throw new Error("暂无可用入库单");
+      const detailCommand = mode === "network" ? "v2_network_receipt_document" : "v2_receipt_document";
+      const document = await invoke<ReceiptDocument>(detailCommand, { receiptId: record.receipt_id });
+      const known = new Set(outboundScannedItems.map((item) => item.barcode));
+      const accepted: OutboundScannedItem[] = [];
+      let skipped = 0;
+      for (const item of document.items) {
+        if (known.has(item.barcode)) { skipped += 1; continue; }
+        try {
+          const loaded = await loadOutboundScanItem(item.barcode);
+          known.add(loaded.barcode);
+          accepted.push(loaded);
+        } catch { skipped += 1; }
+      }
+      if (accepted.length === 0) throw new Error(`最近入库单 ${record.receipt_no} 没有当前可出库库存`);
+      setOutboundScannedItems((items) => [...items, ...accepted]);
+      setOutboundScanNotice({ type: "success", text: `已从最近入库单 ${record.receipt_no} 填充 ${accepted.length} 件${skipped ? `，跳过 ${skipped} 件不可出库库存` : ""}。` });
+    } catch (error) {
+      setOutboundScanNotice({ type: "error", text: `一键填充失败：${displayError(error)}` });
+      await playScannerAlert();
+    } finally {
+      setOutboundScanChecking(false);
+      outboundScannerInputRef.current?.focus();
+    }
   }
 
   async function loadOutboundScanItem(barcode: string): Promise<OutboundScannedItem> {
@@ -4022,6 +4115,10 @@ export default function InventoryWorkspace({
             </select>{networkWarehousesError && <small className="v2-field-error">仓库读取失败：{networkWarehousesError}</small>}</label>}
             <label className="v2-span-two"><span>来源单号 / 备注</span><input value={sourceReference} onChange={(event) => setSourceReference(event.target.value)} placeholder="可选，例如供应商送货单号" autoComplete="off" /></label>
             <div className="v2-warranty-editor v2-span-two">
+              <label className="v2-inline-check"><input type="checkbox" checked={receiptQualityPrechecked} onChange={(event) => setReceiptQualityPrechecked(event.target.checked)} /><span><strong>本批已完成质检，直接放行</strong><small>勾选后入库即标记为“已通过 / 可出库”，无需再次扫描质检。</small></span></label>
+              {receiptQualityPrechecked && <input value={receiptQualityPrecheckNotes} onChange={(event) => setReceiptQualityPrecheckNotes(event.target.value)} placeholder="质检依据或备注（可选）" aria-label="入库即质检备注" />}
+            </div>
+            <div className="v2-warranty-editor v2-span-two">
               <div className="v2-warranty-heading"><span>供应方质保（可选）</span><small>保存到本批次所有 SN 的来源记录</small></div>
               <div className="v2-warranty-controls">
                 <select value={receiptWarrantyPreset} onChange={(event) => setReceiptWarrantyPreset(event.target.value)} aria-label="供应方质保期限">
@@ -4052,9 +4149,10 @@ export default function InventoryWorkspace({
               <span>扫码枪输入 *</span>
               <div className="v2-scanner-control">
                 <Bell size={21} aria-hidden="true" />
-                <input ref={scannerInputRef} value={scannerInput} onChange={(event) => setScannerInput(event.target.value)} onKeyDown={(event) => {
+                <input ref={scannerInputRef} value={scannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setReceiptNotice({ type: "error", text: "检测到当前输入法为中文/拼音，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReceiptNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN，请切换英文后重新扫描。" }); setScannerInput(""); return; } setScannerInput(event.target.value); }} onKeyDown={(event) => {
                   if (event.key === "Enter") {
                     event.preventDefault();
+                    if (barcodeCompositionRef.current) return;
                     void addScannedBarcode();
                   }
                 }} placeholder="请扫描 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
@@ -4097,14 +4195,14 @@ export default function InventoryWorkspace({
               <div className="v2-receipt-confirm-summary">
                 <span><small>商品</small><strong>{selectedProduct?.code ?? "—"}</strong></span>
                 <span><small>供应商</small><strong>{supplierName || "—"}</strong></span>
-                <span><small>数量</small><strong>{barcodes.length} 件</strong></span>
+                <span><small>数量</small><strong>{barcodes.length} 件</strong></span><span><small>质检</small><strong>{receiptQualityPrechecked ? "入库即通过" : "入库后质检"}</strong></span>
               </div>
               <div className="v2-workflow-actions">
                 <button className="v2-button" type="button" onClick={() => navigateReceiptStep(2)} disabled={receiptLoading || scanChecking}>上一步</button>
                 <button className="v2-button primary v2-receipt-submit" type="submit" disabled={receiptLoading || scanChecking || mutationDisabled || !receiptReady}>{receiptLoading ? "正在原子入库…" : `确认入库 ${barcodes.length} 件`}</button>
               </div>
             </> : <>
-              <div className="v2-inline-success"><CheckCircle2 size={18} /><span>{receiptCompleted.receipt_no} 已完成入库 {receiptCompleted.received_count} 件。新入库单件默认标记为未测试。</span></div>
+              <div className="v2-inline-success"><CheckCircle2 size={18} /><span>{receiptCompleted.receipt_no} 已完成入库 {receiptCompleted.received_count} 件。{receiptCompleted.quality_prechecked ? "本批已按入库质检结果直接放行，可出库。" : "新入库单件默认标记为未测试。"}</span></div>
               <div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={startNextReceiptBatch}>开始下一批 <ArrowRight size={16} /></button></div>
             </>}
           </section>}
@@ -4153,9 +4251,10 @@ export default function InventoryWorkspace({
                 <span>扫码枪输入 *</span>
                 <div className="v2-scanner-control">
                   <Bell size={21} aria-hidden="true" />
-                  <input ref={qualityScannerInputRef} value={qualityScannerInput} onChange={(event) => setQualityScannerInput(event.target.value)} onKeyDown={(event) => {
+                  <input ref={qualityScannerInputRef} value={qualityScannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setQualityScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setQualityScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setQualityScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setQualityScannerInput(""); return; } setQualityScannerInput(event.target.value); }} onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
+                      if (barcodeCompositionRef.current) return;
                       void addQualityScannedBarcode();
                     }
                   }} placeholder="请扫描待检 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={qualityScanChecking || qualityLoading || mutationDisabled} />
@@ -4468,11 +4567,12 @@ export default function InventoryWorkspace({
       <section className="v2-page" aria-labelledby="v2-returns-title">
         <div className="v2-page-heading"><div><span className="v2-eyebrow">售后处理</span><h2 id="v2-returns-title">扫码退货</h2><p>先连续扫描同一出库单的退货 SN，结束扫描后为整批填写一次原因。</p></div></div>
         {returnStep === "scan" && <>
-          <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onChange={(event) => setReturnBarcode(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(undefined, true); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "加入本批"}</button></form>
+          <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onCompositionStart={() => { returnBarcodeCompositionRef.current = true; setReturnNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { returnBarcodeCompositionRef.current = false; setReturnBarcode(""); }} onChange={(event) => { if (returnBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReturnNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setReturnBarcode(""); return; } setReturnBarcode(event.target.value); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (returnBarcodeCompositionRef.current || event.nativeEvent.isComposing) return; if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(undefined, true); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "加入本批"}</button></form>
+          <details className="v2-alternative-entry"><summary><span>批量粘贴退货 SN</span><small>每行一个 SN，系统会逐条定位和校验</small><ChevronDown size={16} /></summary><div className="v2-alternative-content"><label><span>每行一个 SN</span><textarea value={returnBulkInput} onChange={(event) => setReturnBulkInput(event.target.value)} placeholder={"SN0001\nSN0002"} disabled={returnLoading} /></label><button className="v2-button" type="button" onClick={() => void importReturnBarcodes()} disabled={!returnBulkInput.trim() || returnLoading}>校验并加入本批</button></div></details>
           {returnCandidates.length > 0 && <section className="v2-panel v2-return-batch"><header className="v2-return-batch-heading"><div><span className="v2-eyebrow">当前退货批次</span><h3>{firstCandidate?.shipment_no}</h3></div><strong>{returnCandidates.length}<small> 件</small></strong></header><div className="v2-return-batch-meta"><span><small>客户</small><strong>{firstCandidate?.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate?.order_no}</strong></span><span><small>本批规则</small><strong>同一出库单</strong></span></div><div className="v2-return-batch-items">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong><small>{formatDateTime(candidate.shipped_at)}</small><button className="v2-icon-button" type="button" onClick={() => setReturnCandidates((items) => items.filter((item) => item.shipment_line_id !== candidate.shipment_line_id))} disabled={returnLoading} aria-label={`移除 ${candidate.barcode}`} title="从本批移除"><X size={16} /></button></div>)}</div><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => { setReturnNotice(null); setReturnStep("confirm"); }} disabled={returnLoading || returnCandidates.length === 0}>结束扫描，填写统一原因 <ArrowRight size={16} /></button><button className="v2-button" type="button" onClick={() => { setReturnCandidates([]); setReturnBarcode(""); setReturnNotice(null); }} disabled={returnLoading}>清空本批</button></div></section>}
         </>}
         {returnNotice && <div className={`v2-notice ${returnNotice.type}`}>{returnNotice.text}</div>}
-        {returnStep === "confirm" && firstCandidate && <section className="v2-panel v2-return-confirm"><header><div><span className="v2-eyebrow">批量退货确认</span><h3>{firstCandidate.shipment_no} · {returnCandidates.length} 件</h3></div>{status && <span className={`v2-warranty-status ${status.className}`}>{status.label}</span>}</header><div className="v2-return-context"><span><small>客户</small><strong>{firstCandidate.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate.order_no}</strong></span><span><small>出库单号</small><strong>{firstCandidate.shipment_no}</strong></span><span><small>出库时间</small><strong>{formatDateTime(firstCandidate.shipped_at)}</strong></span><span><small>客户质保</small><strong>{warrantyDescription(firstCandidate.warranty)}</strong></span></div><div className="v2-return-batch-items compact">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong></div>)}</div><label><span>本批统一退货原因 *</span><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} placeholder="例如：客户检测后无法点亮" disabled={returnLoading} autoFocus /></label><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => void commitScannedReturn()} disabled={returnLoading || !returnReason.trim()}>{returnLoading ? "正在登记…" : `确认退回并隔离 ${returnCandidates.length} 件`}</button><button className="v2-button" type="button" onClick={() => { setReturnStep("scan"); setReturnReason(""); setReturnNotice(null); }} disabled={returnLoading}>返回继续扫描</button></div></section>}
+        {returnStep === "confirm" && firstCandidate && <section className="v2-panel v2-return-confirm"><header><div><span className="v2-eyebrow">批量退货确认</span><h3>{firstCandidate.shipment_no} · {returnCandidates.length} 件</h3></div>{status && <span className={`v2-warranty-status ${status.className}`}>{status.label}</span>}</header><div className="v2-return-context"><span><small>客户</small><strong>{firstCandidate.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate.order_no}</strong></span><span><small>出库单号</small><strong>{firstCandidate.shipment_no}</strong></span><span><small>出库时间</small><strong>{formatDateTime(firstCandidate.shipped_at)}</strong></span><span><small>客户质保</small><strong>{warrantyDescription(firstCandidate.warranty)}</strong></span></div><div className="v2-return-batch-items compact">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong></div>)}</div><label><span>本批统一退货原因 *</span><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} placeholder="例如：客户检测后无法点亮" disabled={returnLoading} autoFocus /></label><label className="v2-inline-check"><input type="checkbox" checked={Boolean(returnReleaseReason)} onChange={(event) => setReturnReleaseReason(event.target.checked ? "客户已确认合格" : "")} disabled={returnLoading} /><span><strong>客户已确认合格，直接放行</strong><small>需要主管/质检权限；离线模式还需危险操作密码。</small></span></label>{returnReleaseReason && <input type="password" value={returnReleasePassword} onChange={(event) => setReturnReleasePassword(event.target.value)} placeholder="危险操作密码（离线模式必填）" autoComplete="current-password" disabled={returnLoading} /> }<div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => void commitScannedReturn()} disabled={returnLoading || !returnReason.trim() || (mode === "offline" && Boolean(returnReleaseReason) && !returnReleasePassword)}>{returnLoading ? "正在登记…" : returnReleaseReason ? `确认退回并直接放行 ${returnCandidates.length} 件` : `确认退回并隔离 ${returnCandidates.length} 件`}</button><button className="v2-button" type="button" onClick={() => { setReturnStep("scan"); setReturnReason(""); setReturnReleaseReason(""); setReturnReleasePassword(""); setReturnNotice(null); }} disabled={returnLoading}>返回继续扫描</button></div></section>}
       </section>
     );
   }
@@ -4537,13 +4637,15 @@ export default function InventoryWorkspace({
               <strong>{outboundScannedItems.length}<small> 件已扫描</small></strong>
             </div>
             <div className="v2-scan-context"><span><strong>扫描原则</strong>只按实际 SN 出货</span><span><strong>数量确定</strong>结束扫码时以当前件数为准</span></div>
+            <div className="v2-workflow-actions"><button className="v2-button" type="button" onClick={() => void fillOutboundFromRecentReceipt()} disabled={outboundScanChecking || outboundLoading || Boolean(outboundShipment) || mutationDisabled}>从最近入库单一键填充可出库库存</button></div>
             {!outboundShipment && <label className="v2-scan-field">
                 <span>扫码枪输入 *</span>
                 <div className="v2-scanner-control">
                   <Bell size={21} aria-hidden="true" />
-                  <input ref={outboundScannerInputRef} value={outboundScannerInput} onChange={(event) => setOutboundScannerInput(event.target.value)} onKeyDown={(event) => {
+                  <input ref={outboundScannerInputRef} value={outboundScannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setOutboundScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setOutboundScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setOutboundScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setOutboundScannerInput(""); return; } setOutboundScannerInput(event.target.value); }} onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
+                      if (barcodeCompositionRef.current) return;
                       void addOutboundScannedBarcode();
                     }
                   }} placeholder="请扫描实际出货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={outboundScanChecking || outboundLoading || mutationDisabled} />

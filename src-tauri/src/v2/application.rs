@@ -63,6 +63,10 @@ pub struct PostReceiptRequest {
     pub notes: Option<String>,
     #[serde(default)]
     pub warranty: Option<WarrantyInput>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quality_prechecked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_precheck_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +77,8 @@ pub struct ReceiptUnit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostReceiptResponse {
+    #[serde(default)]
+    pub quality_prechecked: bool,
     pub receipt_id: String,
     pub receipt_line_id: String,
     pub receipt_no: String,
@@ -583,7 +589,12 @@ impl OfflineDatabase {
                 inbound_receipt_line_id: receipt_line_id.clone(),
                 owner_party_id: owner_party_id.clone(),
                 sku_id: sku_id.clone(),
-                location_id: self.receiving_location_id().to_owned(),
+                location_id: if request.quality_prechecked {
+                    self.storage_location_id()
+                } else {
+                    self.receiving_location_id()
+                }
+                .to_owned(),
                 received_at: request.received_at.clone(),
             })?;
 
@@ -593,7 +604,7 @@ impl OfflineDatabase {
                     id, workspace_id, barcode, inbound_receipt_line_id, owner_party_id,
                     sku_id, location_id, inventory_status, quality_status, version,
                     received_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'received', 'untested', ?8, ?9, ?10)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 "#,
             )
             .bind(&unit.id)
@@ -603,6 +614,16 @@ impl OfflineDatabase {
             .bind(&unit.owner_party_id)
             .bind(&unit.sku_id)
             .bind(&unit.location_id)
+            .bind(if request.quality_prechecked {
+                "available"
+            } else {
+                "received"
+            })
+            .bind(if request.quality_prechecked {
+                "passed"
+            } else {
+                "untested"
+            })
             .bind(unit.version as i64)
             .bind(&unit.received_at)
             .bind(&now)
@@ -638,7 +659,28 @@ impl OfflineDatabase {
             });
         }
 
+        if request.quality_prechecked {
+            super::quality_confirmation::record_sqlite(
+                &mut transaction,
+                workspace_id,
+                &units
+                    .iter()
+                    .map(|unit| unit.inventory_unit_id.clone())
+                    .collect::<Vec<_>>(),
+                super::quality_confirmation::Confirmation {
+                    source: "receipt_prechecked",
+                    source_id: &receipt_id,
+                    actor: &request.actor_id,
+                    at: &now,
+                    request_id: &request.request_id,
+                    notes: request.quality_precheck_notes.as_deref(),
+                },
+            )
+            .await
+            .map_err(|error| storage("record receipt quality confirmation", error))?;
+        }
         let response = PostReceiptResponse {
+            quality_prechecked: request.quality_prechecked,
             receipt_id: receipt_id.clone(),
             receipt_line_id,
             receipt_no: request.receipt_no.clone(),
@@ -655,6 +697,9 @@ impl OfflineDatabase {
             "supplier_party_id": response.supplier_party_id,
             "sku_id": response.sku_id,
             "received_count": response.received_count,
+            "quality_prechecked": request.quality_prechecked,
+            "quality_precheck_notes": request.quality_precheck_notes,
+            "quality_source": if request.quality_prechecked { Some("receipt_prechecked") } else { None },
         });
         insert_audit(
             &mut transaction,
@@ -2096,11 +2141,22 @@ fn normalize_receipt_request(
     request.actor_id = required_text("actor_id", request.actor_id)?;
     request.source_reference = clean_optional(request.source_reference);
     request.notes = clean_optional(request.notes);
+    request.quality_precheck_notes = if request.quality_prechecked {
+        clean_optional(request.quality_precheck_notes)
+    } else {
+        None
+    };
     if request.barcodes.is_empty() {
         return Err(validation("barcodes", "at least one barcode is required"));
     }
     let mut unique = HashSet::with_capacity(request.barcodes.len());
     for (index, barcode) in request.barcodes.iter_mut().enumerate() {
+        if !barcode.is_ascii() || barcode.trim().bytes().any(|c| c.is_ascii_control()) {
+            return Err(validation(
+                "barcodes",
+                "SN 仅支持英文半角字符，请切换英文输入法后重新扫描",
+            ));
+        }
         *barcode =
             required_text(&format!("barcodes[{index}]"), std::mem::take(barcode))?.to_uppercase();
         if !unique.insert(barcode.clone()) {
@@ -2764,6 +2820,8 @@ mod tests {
             barcodes: barcodes.iter().map(|value| (*value).to_owned()).collect(),
             notes: None,
             warranty: None,
+            quality_prechecked: false,
+            quality_precheck_notes: None,
         }
     }
 
@@ -3699,6 +3757,60 @@ mod tests {
         assert_eq!(receipt_count, 1);
         assert_eq!(movement_count, 2);
         assert_eq!(audit_count, 1);
+        close_and_remove(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn prechecked_receipt_releases_units_and_records_quality_confirmation() {
+        let (database, path) = test_database_with_default_catalog().await;
+        let mut request = receipt_request(
+            "prechecked-request",
+            "prechecked-key",
+            "R-PRECHECKED",
+            &["PRECHECKED-1"],
+        );
+        request.quality_prechecked = true;
+        request.quality_precheck_notes = Some("供应商出货前已完成测试".to_owned());
+
+        let response = database
+            .post_receipt(request)
+            .await
+            .expect("post prechecked receipt");
+        assert!(response.quality_prechecked);
+
+        let row = sqlx::query(
+            "SELECT inventory_status, quality_status, location_id FROM inventory_units WHERE workspace_id = ?1 AND barcode = 'PRECHECKED-1'",
+        )
+        .bind(database.workspace_id())
+        .fetch_one(database.pool())
+        .await
+        .expect("load prechecked unit");
+        assert_eq!(row.get::<String, _>("inventory_status"), "available");
+        assert_eq!(row.get::<String, _>("quality_status"), "passed");
+        assert_eq!(
+            row.get::<String, _>("location_id"),
+            database.storage_location_id()
+        );
+
+        let inspection = sqlx::query(
+            "SELECT inspection_type, status, inspector_id FROM quality_inspections WHERE workspace_id = ?1",
+        )
+        .bind(database.workspace_id())
+        .fetch_one(database.pool())
+        .await
+        .expect("load prechecked inspection");
+        assert_eq!(inspection.get::<String, _>("inspection_type"), "initial");
+        assert_eq!(inspection.get::<String, _>("status"), "completed");
+        assert_eq!(inspection.get::<String, _>("inspector_id"), "operator-1");
+        let notes: String = sqlx::query_scalar(
+            "SELECT notes FROM quality_inspection_results WHERE workspace_id = ?1",
+        )
+        .bind(database.workspace_id())
+        .fetch_one(database.pool())
+        .await
+        .expect("load prechecked inspection result");
+        assert!(notes.contains("供应商出货前已完成测试"));
+
         close_and_remove(database, path).await;
     }
 

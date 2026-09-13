@@ -693,6 +693,8 @@ mod tests {
                 barcodes: vec!["sn-exact-001".to_owned()],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             })
             .await
             .expect("post receipt");
@@ -754,6 +756,8 @@ mod tests {
                 barcodes: vec!["SN-EXACT-001".to_owned()],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             })
             .await
             .expect("receive replacement barcode");

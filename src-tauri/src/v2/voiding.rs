@@ -1195,7 +1195,11 @@ fn request_digest(request: &VoidDocumentRequest, actor_id: &str) -> Result<Strin
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-async fn verify_offline_password(
+pub(crate) fn operation_password_service() -> Result<PasswordService, String> {
+    PasswordService::recommended().map_err(|error| error.to_string())
+}
+
+pub(crate) async fn verify_offline_password(
     transaction: &mut Transaction<'_, Sqlite>,
     passwords: &PasswordService,
     password: &str,
@@ -1429,6 +1433,8 @@ mod tests {
             barcodes: vec![barcode.to_owned()],
             notes: None,
             warranty: None,
+            quality_prechecked: false,
+            quality_precheck_notes: None,
         }
     }
 
@@ -1755,6 +1761,8 @@ mod tests {
                 return_no: "TH-005".to_owned(),
                 returned_at: "2026-08-15T03:00:00Z".to_owned(),
                 reason: "客户退回".to_owned(),
+                operation_password: None,
+                release_reason: None,
                 actor_id: "operator".to_owned(),
             })
             .await

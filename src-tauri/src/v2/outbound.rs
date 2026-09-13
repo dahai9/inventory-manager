@@ -7,6 +7,7 @@
 
 use super::domain::{InventoryStatus, InventoryUnit, OutboundOrderLine, QualityStatus};
 use super::sqlite::{now_utc, OfflineDatabase};
+use super::voiding::verify_offline_password;
 use super::warranty::{resolve_warranty, WarrantyInput};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,10 @@ pub struct ReturnOutboundShipmentRequest {
     pub returned_at: String,
     pub reason: String,
     pub actor_id: String,
+    #[serde(default, skip_serializing)]
+    pub operation_password: Option<String>,
+    #[serde(default)]
+    pub release_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +180,8 @@ pub struct ReturnOutboundShipmentResponse {
     pub return_no: String,
     pub quarantined_count: u32,
     pub idempotent_replay: bool,
+    #[serde(default)]
+    pub released_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1075,6 +1082,17 @@ impl OfflineDatabase {
         let workspace_id = self.workspace_id().to_owned();
         let now = now_utc().map_err(OutboundError::Storage)?;
         let mut tx = begin_write(self, &workspace_id).await?;
+        if request.release_reason.is_some() {
+            let password = request
+                .operation_password
+                .as_deref()
+                .ok_or_else(|| OutboundError::Conflict("直接放行需要操作密码".to_owned()))?;
+            let passwords =
+                super::voiding::operation_password_service().map_err(OutboundError::Conflict)?;
+            verify_offline_password(&mut tx, &passwords, password)
+                .await
+                .map_err(OutboundError::Conflict)?;
+        }
         if let Some(mut response) = load_idempotent::<ReturnOutboundShipmentResponse>(
             &mut tx,
             &workspace_id,
@@ -1123,23 +1141,57 @@ impl OfflineDatabase {
                     "returned allocation is not in shipped state".to_owned(),
                 ));
             }
-            let updated = sqlx::query("UPDATE inventory_units SET inventory_status = 'quarantined', location_id = ?1, version = version + 1, updated_at = ?2 WHERE workspace_id = ?3 AND id = ?4 AND version = ?5 AND inventory_status IN ('shipped', 'delivered')")
-                .bind(self.quarantine_location_id()).bind(&now).bind(&workspace_id).bind(&unit_id).bind(version).execute(&mut *tx).await.map_err(|error| storage("quarantine returned unit", error))?;
+            let released = request.release_reason.is_some();
+            let quality_status: String = row.try_get("quality_status").map_err(row_error)?;
+            let updated = sqlx::query("UPDATE inventory_units SET inventory_status = ?1, quality_status = ?2, location_id = ?3, version = version + 1, updated_at = ?4 WHERE workspace_id = ?5 AND id = ?6 AND version = ?7 AND inventory_status IN ('shipped', 'delivered')")
+                .bind(if released { "available" } else { "quarantined" })
+                .bind(if released { "passed" } else { quality_status.as_str() })
+                .bind(if released { self.storage_location_id() } else { self.quarantine_location_id() })
+                .bind(&now).bind(&workspace_id).bind(&unit_id).bind(version).execute(&mut *tx).await.map_err(|error| storage("update returned unit", error))?;
             if updated.rows_affected() != 1 {
                 return Err(OutboundError::Conflict(
                     "inventory changed during return".to_owned(),
                 ));
             }
             sqlx::query("INSERT INTO stock_movements (id, workspace_id, inventory_unit_id, movement_type, from_location_id, to_location_id, source_type, source_id, actor_id, occurred_at, created_at) VALUES (?1, ?2, ?3, 'returned', NULL, ?4, 'outbound_return_batch', ?5, ?6, ?7, ?8)")
-                .bind(new_id()).bind(&workspace_id).bind(&unit_id).bind(self.quarantine_location_id()).bind(&batch_id).bind(&request.actor_id).bind(&request.returned_at).bind(&now).execute(&mut *tx).await.map_err(|error| storage("insert return movement", error))?;
+                .bind(new_id()).bind(&workspace_id).bind(&unit_id).bind(if released { self.storage_location_id() } else { self.quarantine_location_id() }).bind(&batch_id).bind(&request.actor_id).bind(&request.returned_at).bind(&now).execute(&mut *tx).await.map_err(|error| storage("insert return movement", error))?;
         }
         let response = ReturnOutboundShipmentResponse {
             return_batch_id: batch_id.clone(),
             return_no: request.return_no.clone(),
-            quarantined_count: rows.len() as u32,
+            quarantined_count: if request.release_reason.is_some() {
+                0
+            } else {
+                rows.len() as u32
+            },
             idempotent_replay: false,
+            released_count: if request.release_reason.is_some() {
+                rows.len() as u32
+            } else {
+                0
+            },
         };
-        write_audit(&mut tx, &workspace_id, &request.actor_id, "outbound_return.created", "outbound_return_batch", &batch_id, &request.request_id, json!({"return_no": request.return_no, "quarantined_count": response.quarantined_count}), &now).await?;
+        if request.release_reason.is_some() {
+            super::quality_confirmation::record_sqlite(
+                &mut tx,
+                &workspace_id,
+                &rows
+                    .iter()
+                    .map(|row| row.try_get::<String, _>("unit_id").map_err(row_error))
+                    .collect::<Result<Vec<_>, _>>()?,
+                super::quality_confirmation::Confirmation {
+                    source: "return_prechecked",
+                    source_id: &batch_id,
+                    actor: &request.actor_id,
+                    at: &request.returned_at,
+                    request_id: &request.request_id,
+                    notes: request.release_reason.as_deref(),
+                },
+            )
+            .await
+            .map_err(|error| storage("record return quality confirmation", error))?;
+        }
+        write_audit(&mut tx, &workspace_id, &request.actor_id, "outbound_return.created", "outbound_return_batch", &batch_id, &request.request_id, json!({"return_no": request.return_no, "quarantined_count": response.quarantined_count, "released_count": response.released_count, "release_reason": request.release_reason}), &now).await?;
         save_idempotent(
             &mut tx,
             &workspace_id,
@@ -1240,7 +1292,7 @@ async fn load_shipment_lines(
     shipment_id: &str,
     selected: &[String],
 ) -> OutboundResult<Vec<sqlx::sqlite::SqliteRow>> {
-    let query = "SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, osl.outbound_allocation_id AS allocation_id, oa.outbound_order_line_id AS order_line_id, iu.inventory_status, iu.version FROM outbound_shipment_lines osl JOIN outbound_allocations oa ON oa.id = osl.outbound_allocation_id AND oa.workspace_id = osl.workspace_id JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status = 'shipped' AND NOT EXISTS (SELECT 1 FROM delivery_confirmation_lines dcl WHERE dcl.outbound_shipment_line_id = osl.id AND dcl.workspace_id = osl.workspace_id)";
+    let query = "SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, osl.outbound_allocation_id AS allocation_id, oa.outbound_order_line_id AS order_line_id, iu.inventory_status, iu.quality_status, iu.version FROM outbound_shipment_lines osl JOIN outbound_allocations oa ON oa.id = osl.outbound_allocation_id AND oa.workspace_id = osl.workspace_id JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status = 'shipped' AND NOT EXISTS (SELECT 1 FROM delivery_confirmation_lines dcl WHERE dcl.outbound_shipment_line_id = osl.id AND dcl.workspace_id = osl.workspace_id)";
     let rows = sqlx::query(query)
         .bind(workspace_id)
         .bind(shipment_id)
@@ -1273,7 +1325,7 @@ async fn load_returnable_lines(
     shipment_id: &str,
     selected: &[String],
 ) -> OutboundResult<Vec<sqlx::sqlite::SqliteRow>> {
-    let rows = sqlx::query("SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, osl.outbound_allocation_id AS allocation_id, iu.inventory_status, iu.version FROM outbound_shipment_lines osl JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status IN ('shipped', 'delivered') AND NOT EXISTS (SELECT 1 FROM outbound_return_lines rl WHERE rl.outbound_shipment_line_id = osl.id AND rl.workspace_id = osl.workspace_id)")
+    let rows = sqlx::query("SELECT osl.id AS shipment_line_id, osl.inventory_unit_id AS unit_id, osl.outbound_allocation_id AS allocation_id, iu.inventory_status, iu.quality_status, iu.version FROM outbound_shipment_lines osl JOIN inventory_units iu ON iu.id = osl.inventory_unit_id AND iu.workspace_id = osl.workspace_id WHERE osl.workspace_id = ?1 AND osl.outbound_shipment_id = ?2 AND iu.inventory_status IN ('shipped', 'delivered') AND NOT EXISTS (SELECT 1 FROM outbound_return_lines rl WHERE rl.outbound_shipment_line_id = osl.id AND rl.workspace_id = osl.workspace_id)")
         .bind(workspace_id).bind(shipment_id).fetch_all(&mut **tx).await.map_err(|error| storage("load returnable shipment lines", error))?;
     if selected.is_empty() {
         return Ok(rows);
@@ -1641,6 +1693,10 @@ fn normalize_return(
     request.returned_at = required_text("returned_at", request.returned_at)?;
     request.reason = required_text("reason", request.reason)?;
     request.actor_id = required_text("actor_id", request.actor_id)?;
+    request.release_reason = request
+        .release_reason
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     Ok(request)
 }
 
@@ -1676,6 +1732,8 @@ mod tests {
             barcodes: vec![barcode.to_owned()],
             notes: None,
             warranty: None,
+            quality_prechecked: false,
+            quality_precheck_notes: None,
         }
     }
 
@@ -1950,6 +2008,8 @@ mod tests {
                 return_no: "RT-1".to_owned(),
                 returned_at: "2026-08-01T01:04:00Z".to_owned(),
                 reason: "上游拒收".to_owned(),
+                operation_password: None,
+                release_reason: None,
                 actor_id: "operator".to_owned(),
             })
             .await

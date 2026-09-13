@@ -262,6 +262,13 @@ impl NetworkService {
         .execute(&mut **transaction)
         .await?;
 
+        let destination = if request.quality_prechecked {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM locations WHERE tenant_id = $1 AND warehouse_id = $2 AND kind = 'storage' ORDER BY id LIMIT 1")
+                .bind(tenant_id).bind(request.warehouse_id).fetch_optional(&mut **transaction).await?
+                .ok_or_else(|| NetworkServiceError::Invalid("入库仓库缺少可用库存库位".to_owned()))?
+        } else {
+            receiving_location_id
+        };
         let mut units = Vec::with_capacity(request.barcodes.len());
         for barcode in &request.barcodes {
             let unit_id = Uuid::now_v7();
@@ -271,8 +278,8 @@ impl NetworkService {
                     (tenant_id, id, barcode, inbound_receipt_line_id,
                      owner_party_id, sku_id, location_id, inventory_status,
                      quality_status, version, received_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'received', 'untested',
-                        1, $8::timestamptz)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                        1, $10::timestamptz)
                 "#,
             )
             .bind(tenant_id)
@@ -281,7 +288,17 @@ impl NetworkService {
             .bind(receipt_line_id)
             .bind(owner_id)
             .bind(sku_id)
-            .bind(receiving_location_id)
+            .bind(destination)
+            .bind(if request.quality_prechecked {
+                "available"
+            } else {
+                "received"
+            })
+            .bind(if request.quality_prechecked {
+                "passed"
+            } else {
+                "untested"
+            })
             .bind(&request.received_at)
             .execute(&mut **transaction)
             .await
@@ -299,7 +316,7 @@ impl NetworkService {
             .bind(tenant_id)
             .bind(Uuid::now_v7())
             .bind(unit_id)
-            .bind(receiving_location_id)
+            .bind(destination)
             .bind(receipt_id)
             .bind(actor_id)
             .bind(&request.received_at)
@@ -311,7 +328,29 @@ impl NetworkService {
             });
         }
 
+        if request.quality_prechecked {
+            let unit_ids = units
+                .iter()
+                .map(|u| Uuid::parse_str(&u.inventory_unit_id).expect("generated UUID"))
+                .collect::<Vec<_>>();
+            super::quality_confirmation::record_postgres(
+                transaction,
+                tenant_id,
+                &unit_ids,
+                super::quality_confirmation::Confirmation {
+                    source: "receipt_prechecked",
+                    source_id: &receipt_id.to_string(),
+                    actor: &actor_id.to_string(),
+                    at: &super::sqlite::now_utc().map_err(NetworkServiceError::Invalid)?,
+                    request_id: &request.request_id,
+                    notes: request.quality_precheck_notes.as_deref(),
+                },
+                actor_id,
+            )
+            .await?;
+        }
         let response = PostReceiptResponse {
+            quality_prechecked: request.quality_prechecked,
             receipt_id: receipt_id.to_string(),
             receipt_line_id: receipt_line_id.to_string(),
             receipt_no: request.receipt_no.clone(),
@@ -328,6 +367,9 @@ impl NetworkService {
             "owner_party_id": owner_id,
             "supplier_party_id": supplier_id,
             "sku_id": sku_id,
+            "quality_prechecked": request.quality_prechecked,
+            "quality_precheck_notes": request.quality_precheck_notes,
+            "quality_source": if request.quality_prechecked { Some("receipt_prechecked") } else { None },
         });
         sqlx::query(
             r#"
@@ -1395,6 +1437,10 @@ pub struct NetworkPostReceiptRequest {
     pub notes: Option<String>,
     #[serde(default)]
     pub warranty: Option<super::warranty::WarrantyInput>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quality_prechecked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_precheck_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1488,6 +1534,23 @@ fn normalize_receipt(
     if request.barcodes.is_empty() {
         return Err(NetworkServiceError::Invalid(
             "barcodes must not be empty".to_owned(),
+        ));
+    }
+    request.quality_precheck_notes = if request.quality_prechecked {
+        request
+            .quality_precheck_notes
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+    } else {
+        None
+    };
+    if request
+        .barcodes
+        .iter()
+        .any(|b| !b.is_ascii() || b.trim().bytes().any(|c| c.is_ascii_control()))
+    {
+        return Err(NetworkServiceError::Invalid(
+            "SN 仅支持英文半角字符，请切换英文输入法后重新扫描".to_owned(),
         ));
     }
     let mut seen = HashSet::new();
@@ -1970,6 +2033,8 @@ mod tests {
             barcodes: vec!["SN-1".to_owned(), "SN-1".to_owned()],
             notes: None,
             warranty: None,
+            quality_prechecked: false,
+            quality_precheck_notes: None,
         })
         .expect_err("duplicates must fail");
         assert!(

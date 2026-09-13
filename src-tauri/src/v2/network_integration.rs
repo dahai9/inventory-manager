@@ -195,6 +195,8 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
         barcodes: vec![format!("SN-{request_id}")],
         notes: None,
         warranty: None,
+        quality_prechecked: false,
+        quality_precheck_notes: None,
     };
     let receipt_barcode = request.barcodes[0].clone();
     let mut mismatched_name = request.clone();
@@ -336,6 +338,8 @@ async fn restricted_postgres_role_can_login_and_post_an_idempotent_receipt() {
                 barcodes: vec![format!("SN-after-logout-{}", Uuid::now_v7())],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             },
         )
         .await

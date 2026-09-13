@@ -4504,6 +4504,8 @@ mod tests {
                 barcodes: vec!["VOID-EXPORT-001".to_owned()],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             })
             .await
             .expect("post receipt");
@@ -5100,6 +5102,8 @@ mod tests {
                 barcodes: vec![source_barcode_a.clone()],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             })
             .await
             .expect("post source receipt A");
@@ -5118,6 +5122,8 @@ mod tests {
                 barcodes: vec![source_barcode_b.clone()],
                 notes: None,
                 warranty: None,
+                quality_prechecked: false,
+                quality_precheck_notes: None,
             })
             .await
             .expect("post source receipt B");
@@ -5239,6 +5245,8 @@ mod tests {
                 return_no: format!("UPGRADE-RT1-{}", tenant_id.simple()),
                 returned_at: "2026-08-03T01:30:00Z".to_owned(),
                 reason: "upstream rejected one unit".to_owned(),
+                operation_password: None,
+                release_reason: None,
                 actor_id: "offline-return-operator".to_owned(),
             })
             .await
