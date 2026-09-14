@@ -1256,6 +1256,30 @@ function hasNonEnglishBarcodeInput(value: string): boolean {
   return /[^\x00-\x7F]/.test(value) || /[Ａ-Ｚａ-ｚ０-９]/.test(value);
 }
 
+function isPrintableBarcodeKey(key: string): boolean {
+  return key.length === 1 && /^[\x00-\x7F]$/.test(key);
+}
+
+function recoverBarcodeComposition(
+  compositionRef: { current: boolean },
+  event: React.KeyboardEvent<HTMLInputElement>,
+): boolean {
+  if (event.nativeEvent.isComposing) return true;
+  // macOS WebKit can leave composition mode set after switching input sources
+  // without dispatching compositionend. An explicit ASCII key proves that the
+  // scanner/user is back in the English input source, so clear that stale bit.
+  if (compositionRef.current && isPrintableBarcodeKey(event.key)) compositionRef.current = false;
+  return compositionRef.current;
+}
+
+function recoverBarcodeCompositionFromPaste(
+  compositionRef: { current: boolean },
+  event: React.ClipboardEvent<HTMLInputElement>,
+): void {
+  const text = event.clipboardData.getData("text");
+  if (text && !hasNonEnglishBarcodeInput(text)) compositionRef.current = false;
+}
+
 function isInspectionEligible(
   item: Pick<InventoryListItem, "inventory_status" | "quality_status">,
   kind: InspectionKind,
@@ -1337,7 +1361,7 @@ export default function InventoryWorkspace({
   const [scannedBarcodes, setScannedBarcodes] = useState<string[]>([]);
   const receiptProductInputRef = useRef<HTMLInputElement>(null);
   const scannerInputRef = useRef<HTMLInputElement>(null);
-  const barcodeCompositionRef = useRef(false);
+  const receiptBarcodeCompositionRef = useRef(false);
   const scanCheckingRef = useRef(false);
   const [scanChecking, setScanChecking] = useState(false);
   const [receiptLoading, setReceiptLoading] = useState(false);
@@ -1371,6 +1395,7 @@ export default function InventoryWorkspace({
   const [qualityScanNotice, setQualityScanNotice] = useState<Notice | null>(null);
   const [qualityScanChecking, setQualityScanChecking] = useState(false);
   const qualityScannerInputRef = useRef<HTMLInputElement>(null);
+  const qualityBarcodeCompositionRef = useRef(false);
   const qualityScanCheckingRef = useRef(false);
   const [inspectionKind, setInspectionKind] = useState<InspectionKind>("initial");
   const [defectCode, setDefectCode] = useState("");
@@ -1405,6 +1430,7 @@ export default function InventoryWorkspace({
   const [outboundScannedItems, setOutboundScannedItems] = useState<OutboundScannedItem[]>([]);
   const [outboundScanNotice, setOutboundScanNotice] = useState<Notice | null>(null);
   const outboundScannerInputRef = useRef<HTMLInputElement>(null);
+  const outboundBarcodeCompositionRef = useRef(false);
   const outboundScanCheckingRef = useRef(false);
   const [outboundScanChecking, setOutboundScanChecking] = useState(false);
   const [recentReceiptPickerOpen, setRecentReceiptPickerOpen] = useState(false);
@@ -2321,6 +2347,16 @@ export default function InventoryWorkspace({
     setQualityNotice(null);
     window.requestAnimationFrame(() => qualityScannerInputRef.current?.focus());
   }, [inspectionKind]);
+
+  useEffect(() => {
+    // Do not carry an IME composition flag across pages or workflow steps.
+    // This also recovers when WebKit omits compositionend while the input view
+    // is being replaced during navigation.
+    receiptBarcodeCompositionRef.current = false;
+    qualityBarcodeCompositionRef.current = false;
+    outboundBarcodeCompositionRef.current = false;
+    returnBarcodeCompositionRef.current = false;
+  }, [page, receiptStep, qualityStep, outboundStep, returnStep]);
 
   useEffect(() => {
     let focusFrame: number | null = null;
@@ -4262,10 +4298,11 @@ export default function InventoryWorkspace({
               <span>扫码枪输入 *</span>
               <div className="v2-scanner-control">
                 <Bell size={21} aria-hidden="true" />
-                <input ref={scannerInputRef} value={scannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setReceiptNotice({ type: "error", text: "检测到当前输入法为中文/拼音，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReceiptNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN，请切换英文后重新扫描。" }); setScannerInput(""); return; } setScannerInput(event.target.value); }} onKeyDown={(event) => {
+                <input ref={scannerInputRef} value={scannerInput} onCompositionStart={() => { receiptBarcodeCompositionRef.current = true; setReceiptNotice({ type: "error", text: "检测到当前输入法为中文/拼音，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { receiptBarcodeCompositionRef.current = false; setScannerInput(""); }} onPaste={(event) => recoverBarcodeCompositionFromPaste(receiptBarcodeCompositionRef, event)} onChange={(event) => { if (receiptBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReceiptNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN，请切换英文后重新扫描。" }); setScannerInput(""); return; } setScannerInput(event.target.value); }} onKeyDown={(event) => {
+                  const composing = recoverBarcodeComposition(receiptBarcodeCompositionRef, event);
                   if (event.key === "Enter") {
                     event.preventDefault();
-                    if (barcodeCompositionRef.current) return;
+                    if (composing) return;
                     void addScannedBarcode();
                   }
                 }} placeholder="请扫描 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={scanChecking || receiptLoading || mutationDisabled || catalogLoading} />
@@ -4364,10 +4401,11 @@ export default function InventoryWorkspace({
                 <span>扫码枪输入 *</span>
                 <div className="v2-scanner-control">
                   <Bell size={21} aria-hidden="true" />
-                  <input ref={qualityScannerInputRef} value={qualityScannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setQualityScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setQualityScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setQualityScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setQualityScannerInput(""); return; } setQualityScannerInput(event.target.value); }} onKeyDown={(event) => {
+                  <input ref={qualityScannerInputRef} value={qualityScannerInput} onCompositionStart={() => { qualityBarcodeCompositionRef.current = true; setQualityScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { qualityBarcodeCompositionRef.current = false; setQualityScannerInput(""); }} onPaste={(event) => recoverBarcodeCompositionFromPaste(qualityBarcodeCompositionRef, event)} onChange={(event) => { if (qualityBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setQualityScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setQualityScannerInput(""); return; } setQualityScannerInput(event.target.value); }} onKeyDown={(event) => {
+                    const composing = recoverBarcodeComposition(qualityBarcodeCompositionRef, event);
                     if (event.key === "Enter") {
                       event.preventDefault();
-                      if (barcodeCompositionRef.current) return;
+                      if (composing) return;
                       void addQualityScannedBarcode();
                     }
                   }} placeholder="请扫描待检 SN（扫码枪自动回车）" autoFocus autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={qualityScanChecking || qualityLoading || mutationDisabled} />
@@ -4688,7 +4726,7 @@ export default function InventoryWorkspace({
       <section className="v2-page" aria-labelledby="v2-returns-title">
         <div className="v2-page-heading"><div><span className="v2-eyebrow">售后处理</span><h2 id="v2-returns-title">扫码退货</h2><p>先连续扫描同一出库单的退货 SN，结束扫描后为整批填写一次原因。</p></div></div>
         {returnStep === "scan" && <>
-          <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onCompositionStart={() => { returnBarcodeCompositionRef.current = true; setReturnNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { returnBarcodeCompositionRef.current = false; setReturnBarcode(""); }} onChange={(event) => { if (returnBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReturnNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setReturnBarcode(""); return; } setReturnBarcode(event.target.value); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (returnBarcodeCompositionRef.current || event.nativeEvent.isComposing) return; if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(undefined, true); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "加入本批"}</button></form>
+          <form className="v2-panel v2-return-scanner" onSubmit={(event) => void lookupReturnBarcode(event)}><label className="v2-search"><RotateCcw size={19} /><input ref={returnScannerRef} value={returnBarcode} onCompositionStart={() => { returnBarcodeCompositionRef.current = true; setReturnNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { returnBarcodeCompositionRef.current = false; setReturnBarcode(""); }} onPaste={(event) => recoverBarcodeCompositionFromPaste(returnBarcodeCompositionRef, event)} onChange={(event) => { if (returnBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setReturnNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setReturnBarcode(""); return; } setReturnBarcode(event.target.value); }} onKeyDown={(event) => { const composing = recoverBarcodeComposition(returnBarcodeCompositionRef, event); if (event.key === "Enter") { event.preventDefault(); if (composing) return; if (!returnLoading && returnBarcode.trim()) void lookupReturnBarcode(undefined, true); } }} placeholder="请扫描退货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} /></label><button className="v2-button primary" type="submit" disabled={returnLoading || !returnBarcode.trim()}>{returnLoading ? "正在定位…" : "加入本批"}</button></form>
           <details className="v2-alternative-entry"><summary><span>批量粘贴退货 SN</span><small>每行一个 SN，系统会逐条定位和校验</small><ChevronDown size={16} /></summary><div className="v2-alternative-content"><label><span>每行一个 SN</span><textarea value={returnBulkInput} onChange={(event) => setReturnBulkInput(event.target.value)} placeholder={"SN0001\nSN0002"} disabled={returnLoading} /></label><button className="v2-button" type="button" onClick={() => void importReturnBarcodes()} disabled={!returnBulkInput.trim() || returnLoading}>校验并加入本批</button></div></details>
           {returnCandidates.length > 0 && <section className="v2-panel v2-return-batch"><header className="v2-return-batch-heading"><div><span className="v2-eyebrow">当前退货批次</span><h3>{firstCandidate?.shipment_no}</h3></div><strong>{returnCandidates.length}<small> 件</small></strong></header><div className="v2-return-batch-meta"><span><small>客户</small><strong>{firstCandidate?.receiver_name}</strong></span><span><small>订单编号</small><strong>{firstCandidate?.order_no}</strong></span><span><small>本批规则</small><strong>同一出库单</strong></span></div><div className="v2-return-batch-items">{returnCandidates.map((candidate, index) => <div className="v2-return-batch-item" key={candidate.shipment_line_id}><span>{index + 1}</span><strong className="v2-mono">{candidate.barcode}</strong><small>{formatDateTime(candidate.shipped_at)}</small><button className="v2-icon-button" type="button" onClick={() => setReturnCandidates((items) => items.filter((item) => item.shipment_line_id !== candidate.shipment_line_id))} disabled={returnLoading} aria-label={`移除 ${candidate.barcode}`} title="从本批移除"><X size={16} /></button></div>)}</div><div className="v2-workflow-actions"><button className="v2-button primary" type="button" onClick={() => { setReturnNotice(null); setReturnStep("confirm"); }} disabled={returnLoading || returnCandidates.length === 0}>结束扫描，填写统一原因 <ArrowRight size={16} /></button><button className="v2-button" type="button" onClick={() => { setReturnCandidates([]); setReturnBarcode(""); setReturnNotice(null); }} disabled={returnLoading}>清空本批</button></div></section>}
         </>}
@@ -4763,10 +4801,11 @@ export default function InventoryWorkspace({
                 <span>扫码枪输入 *</span>
                 <div className="v2-scanner-control">
                   <Bell size={21} aria-hidden="true" />
-                  <input ref={outboundScannerInputRef} value={outboundScannerInput} onCompositionStart={() => { barcodeCompositionRef.current = true; setOutboundScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { barcodeCompositionRef.current = false; setOutboundScannerInput(""); }} onChange={(event) => { if (barcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setOutboundScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setOutboundScannerInput(""); return; } setOutboundScannerInput(event.target.value); }} onKeyDown={(event) => {
+                  <input ref={outboundScannerInputRef} value={outboundScannerInput} onCompositionStart={() => { outboundBarcodeCompositionRef.current = true; setOutboundScanNotice({ type: "error", text: "当前输入法不是英文，已禁止录入 SN，请切换英文后重新扫描。" }); }} onCompositionEnd={() => { outboundBarcodeCompositionRef.current = false; setOutboundScannerInput(""); }} onPaste={(event) => recoverBarcodeCompositionFromPaste(outboundBarcodeCompositionRef, event)} onChange={(event) => { if (outboundBarcodeCompositionRef.current || hasNonEnglishBarcodeInput(event.target.value)) { setOutboundScanNotice({ type: "error", text: "检测到非英文输入法内容，已禁止录入 SN。" }); setOutboundScannerInput(""); return; } setOutboundScannerInput(event.target.value); }} onKeyDown={(event) => {
+                    const composing = recoverBarcodeComposition(outboundBarcodeCompositionRef, event);
                     if (event.key === "Enter") {
                       event.preventDefault();
-                      if (barcodeCompositionRef.current) return;
+                      if (composing) return;
                       void addOutboundScannedBarcode();
                     }
                   }} placeholder="请扫描实际出货 SN（扫码枪自动回车）" autoComplete="off" autoCapitalize="characters" spellCheck={false} disabled={outboundScanChecking || outboundLoading || mutationDisabled} />
